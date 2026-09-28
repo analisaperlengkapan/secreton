@@ -196,6 +196,16 @@ impl SecretService {
         match reject_reserved_initialization_path(path) {
             Ok(()) => Ok(()),
             Err(e) => {
+                // A durable audit event is the primary record, but the audit device can be
+                // disabled by configuration; the attempt to write a seal artifact through the
+                // secret API must still be observable, so it is always logged as well.
+                warn!(
+                    path = %path,
+                    user = %user.id,
+                    action = %action,
+                    "Refused access to a reserved initialization path: {}",
+                    e
+                );
                 let _ = self
                     .audit
                     .log_event(SecurityEventType::SecretAccessDenied {

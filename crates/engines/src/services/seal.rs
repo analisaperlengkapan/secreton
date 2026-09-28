@@ -791,6 +791,33 @@ impl SealService {
                 if lost.load(Ordering::SeqCst) {
                     return;
                 }
+                // A lease that has already lapsed must not be revived by extending it. A
+                // renewal that lands after the record's own expiry but before a takeover
+                // would replace the dead record with a live one, and the expired attempt
+                // would keep initializing — exactly the overlap the lease exists to prevent,
+                // and a window in which a second replica that read the expiry notices the
+                // extension too late. Fail closed instead: the attempt's renewed window has
+                // already been exceeded, so it cannot prove it holds a live lease.
+                let expired = match storage.get_by_path(INIT_LEASE_PATH).await {
+                    Ok(Some(record)) => {
+                        match serde_json::from_slice::<InitLease>(&record.encrypted_data) {
+                            Ok(held) => held.is_expired(Utc::now().timestamp()),
+                            // A record we cannot parse cannot confirm a live lease.
+                            Err(_) => true,
+                        }
+                    }
+                    // Vanished, or unreadable: either way this attempt cannot confirm it
+                    // still holds a live lease.
+                    Ok(None) | Err(_) => true,
+                };
+                if expired {
+                    tracing::error!(
+                        "Initialization lease renewal found the lease already expired; \
+                         fencing this initialization so it cannot revive a lapsed lease."
+                    );
+                    lost.store(true, Ordering::SeqCst);
+                    return;
+                }
                 match storage
                     .compare_and_set(&lease_entry(&owner, ttl_secs), Expect::Owner(&owner))
                     .await
@@ -4625,6 +4652,12 @@ mod tests {
         /// fails once, injecting a storage fault in the window finding #1 is about.
         fail_staging_after_totp: std::sync::atomic::AtomicBool,
         staging_fault_fired: std::sync::atomic::AtomicBool,
+        /// When set, a read of the lease record reports it as already expired, so a test can
+        /// drive the renewal's lapsed-lease fail-closed path deterministically.
+        expire_lease_on_read: std::sync::atomic::AtomicBool,
+        /// Notified after each read of the lease record, so a test can wait for a renewal's
+        /// expiry check instead of sleeping a fixed interval.
+        lease_read: tokio::sync::Notify,
     }
 
     impl SharedCrossProcessBackend {
@@ -4639,6 +4672,8 @@ mod tests {
                 renewal_failed: tokio::sync::Notify::new(),
                 fail_staging_after_totp: std::sync::atomic::AtomicBool::new(false),
                 staging_fault_fired: std::sync::atomic::AtomicBool::new(false),
+                expire_lease_on_read: std::sync::atomic::AtomicBool::new(false),
+                lease_read: tokio::sync::Notify::new(),
             }
         }
 
@@ -4681,7 +4716,26 @@ mod tests {
             self.inner.get_by_id(id).await
         }
         async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
-            self.inner.get_by_path(path).await
+            let mut found = self.inner.get_by_path(path).await?;
+            if path == INIT_LEASE_PATH {
+                self.lease_read.notify_one();
+                if self
+                    .expire_lease_on_read
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && let Some(record) = found.as_mut()
+                {
+                    // Rewrite the body so the lease names an already-elapsed deadline, but
+                    // leave the record present. A renewal that checks the expiry must see it
+                    // lapsed and fence; a checkout of the record alone must not.
+                    if let Ok(mut held) =
+                        serde_json::from_slice::<InitLease>(&record.encrypted_data)
+                    {
+                        held.expires_at = Utc::now().timestamp() - 1;
+                        record.encrypted_data = serde_json::to_vec(&held).unwrap_or_default();
+                    }
+                }
+            }
+            Ok(found)
         }
         async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
             self.inner.update(entry).await
@@ -5481,6 +5535,78 @@ mod tests {
         assert_eq!(
             claims_of(&complete.root_token.expect("root credential"))["username"],
             "fenced-root"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_finds_the_lease_expired_fails_closed_instead_of_reviving_it() {
+        // Regression: renewal was an unconditional owner-conditional replace. If the lease
+        // had already lapsed and a renewal landed before any takeover, the expired record
+        // was simply overwritten with a fresh deadline — reviving a lease the attempt had
+        // already lost the right to hold, and letting an expired attempt keep initializing.
+        // The fix fences such a renewal: a lapsed lease cannot be extended.
+        //
+        // This forces the lapsed state deterministically through the backend's read hook,
+        // which reports the lease record with an elapsed deadline while leaving it present.
+        // The attempt is parked past staging, so the renewal runs mid-sequence. Without the
+        // fence, the owner-conditional replace would succeed against the (still-owned)
+        // record and the attempt would commit; with it, the renewal fences and the attempt
+        // fails closed.
+        let _env = crate::test_support::without_root_key();
+        let storage = Arc::new(SharedCrossProcessBackend::new(INIT_PATH));
+        let storage_dyn: Arc<dyn StorageBackend + Send + Sync> = storage.clone();
+        let vault =
+            Arc::new(sealed_vault_with_storage_and_lease_ttl(storage_dyn.clone(), Some(3)).await);
+
+        storage
+            .expire_lease_on_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let attempt = {
+            let vault = vault.clone();
+            tokio::spawn(async move {
+                vault
+                    .seal
+                    .init(3, 2, "lapsed-root", &vault.auth, &vault.mfa)
+                    .await
+            })
+        };
+
+        // Parked inside the root-key write, past staging and the init config, holding the
+        // lease. Wait for the renewal to read the lease and observe it lapsed. The renewal
+        // sets the loss flag synchronously right after that read, so a short settle is
+        // enough for the fence to be in place before the attempt is resumed.
+        storage.reached.notified().await;
+        storage.lease_read.notified().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        storage.resume.notify_one();
+
+        let outcome = attempt.await.expect("the attempt task must not panic");
+        assert!(
+            outcome.is_err(),
+            "a renewal that finds the lease already expired must fence the attempt, not \
+             revive the lapsed lease and let it commit"
+        );
+        assert!(
+            !vault.seal.is_initialized().await,
+            "a fenced attempt must not leave an initialised vault"
+        );
+
+        // The lapsed lease is genuinely gone: with the read hook cleared, a retry takes over
+        // and initialises.
+        storage
+            .expire_lease_on_read
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let retry = vault
+            .seal
+            .init(3, 2, "lapsed-root", &vault.auth, &vault.mfa)
+            .await
+            .expect("a retry after a lapsed attempt must be able to take over");
+        vault.seal.unseal(&retry.keys[0]).await.expect("share one");
+        let complete = vault.seal.unseal(&retry.keys[1]).await.expect("share two");
+        assert_eq!(
+            claims_of(&complete.root_token.expect("root credential"))["username"],
+            "lapsed-root"
         );
     }
 

@@ -430,15 +430,56 @@ impl StorageTransaction for MemoryTransaction {
     }
 
     async fn commit(self: Box<Self>) -> StorageResult<()> {
+        // Take both write guards once and evaluate the *whole* operation list against a
+        // scratch copy before publishing anything. The previous implementation applied each
+        // operation through `backend.store`/`update`/`delete_by_id`, so a later operation
+        // that failed — an `update` of a path that does not exist — left every earlier
+        // write published while the commit reported an error, and concurrent readers could
+        // observe that partial state. The transaction contract is that a failed commit
+        // publishes nothing, and for an in-memory backend the only way to keep it is to
+        // stage the result and swap it in once the list is known-good.
+        let mut data = self.backend.data.write();
+        let mut id_index = self.backend.id_index.write();
+
+        let mut staged_data = data.clone();
+        let mut staged_index = id_index.clone();
+
         for op in &self.pending {
             match op {
-                PendingOp::Store(entry) => self.backend.store(entry).await?,
-                PendingOp::Update(entry) => self.backend.update(entry).await?,
+                PendingOp::Store(entry) => {
+                    // A `store` replaces any record already at the path; retire the id it
+                    // superseded so it no longer resolves, exactly as `store` does.
+                    if let Some(old_id) = staged_data.get(&entry.path).map(|old| old.id)
+                        && old_id != entry.id
+                    {
+                        staged_index.remove(&old_id);
+                    }
+                    staged_index.insert(entry.id, entry.path.clone());
+                    staged_data.insert(entry.path.clone(), entry.as_ref().clone());
+                }
+                PendingOp::Update(entry) => {
+                    let Some(existing) = staged_data.get(&entry.path).map(|e| e.id) else {
+                        return Err(StorageError::NotFound {
+                            resource_type: "SecretEntry".to_string(),
+                            id: entry.id.to_string(),
+                        });
+                    };
+                    if existing != entry.id {
+                        staged_index.remove(&existing);
+                    }
+                    staged_index.insert(entry.id, entry.path.clone());
+                    staged_data.insert(entry.path.clone(), entry.as_ref().clone());
+                }
                 PendingOp::Delete(id) => {
-                    self.backend.delete_by_id(*id).await?;
+                    if let Some(path) = staged_index.remove(id) {
+                        staged_data.remove(&path);
+                    }
                 }
             }
         }
+
+        *data = staged_data;
+        *id_index = staged_index;
         Ok(())
     }
 
@@ -549,6 +590,38 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_transaction_commit_publishes_nothing() {
+        // Regression: `commit` applied each buffered operation through the backend's own
+        // `store`/`update`, so an operation that failed midway — here an `update` of a path
+        // that does not exist — left every earlier operation published while the commit
+        // reported an error. The transaction contract is all-or-nothing, so a failed commit
+        // must leave the store exactly as it was.
+        let backend = MemoryBackend::new();
+        let stored = entry("kv/tx/staged");
+        let missing = entry("kv/tx/never-existed");
+
+        let mut tx = backend.begin_transaction().await.unwrap();
+        tx.store(&stored).await.unwrap();
+        // The second operation cannot succeed: nothing was ever stored at this path.
+        tx.update(&missing).await.unwrap();
+
+        let outcome = tx.commit().await;
+        assert!(
+            outcome.is_err(),
+            "committing an update of a missing path must fail"
+        );
+
+        assert!(
+            backend.get_by_path("kv/tx/staged").await.unwrap().is_none(),
+            "a failed commit must not leave the earlier write published"
+        );
+        assert!(
+            backend.get_by_id(stored.id).await.unwrap().is_none(),
+            "a failed commit must not leave the earlier write reachable by id"
         );
     }
 

@@ -709,6 +709,18 @@ async fn redis_conditional_write_honours_an_elapsed_expiry() {
         "a record whose expiry has already elapsed must not be reachable; the pre-fix \
          bare `SET` made it immortal"
     );
+
+    // The counterpart property: the call must not report a write that was deliberately
+    // dropped. The script deleted the destination instead of storing the expired record, so
+    // telling the caller `Ok(true)` would claim a record exists that does not.
+    let written = storage
+        .compare_and_set(&entry, Expect::Absent)
+        .await
+        .expect("insert-if-absent with an elapsed expiry");
+    assert!(
+        !written,
+        "a conditional write whose deadline has already elapsed must not report success"
+    );
 }
 
 /// Regression: a fenced write must honour the record's expiry, exactly like the conditional
@@ -765,6 +777,20 @@ async fn redis_fenced_write_honours_an_elapsed_expiry() {
         storage.get_by_path(artifact).await.expect("read").is_none(),
         "a fenced artifact whose expiry has elapsed must not be reachable; the pre-fix bare \
          `SET` made it immortal"
+    );
+
+    // Same false-success property as the conditional write: the store dropped the artifact,
+    // so the call must not report that it landed.
+    let written = storage
+        .store_fenced(
+            &artifact_entry,
+            secreton_storage::StorageFence::new(lease, "holder"),
+        )
+        .await
+        .expect("fenced write with an elapsed expiry");
+    assert!(
+        !written,
+        "a fenced write whose deadline has already elapsed must not report success"
     );
 }
 

@@ -416,13 +416,14 @@ impl RedisBackend {
                     local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
                     if ttl <= 0 then
                         redis.call('DEL', key)
-                        return
+                        return 0
                     end
                     redis.call('SET', key, value)
                     redis.call('PEXPIRE', key, ttl * 1000)
-                else
-                    redis.call('SET', key, value)
+                    return 1
                 end
+                redis.call('SET', key, value)
+                return 1
             end
 
             -- Occupancy first: a live record at the path means another registration won,
@@ -446,8 +447,15 @@ impl RedisBackend {
                 return 0
             end
 
-            write('secreton:entry:' .. ARGV[2], ARGV[1])
-            write(KEYS[1], ARGV[2])
+            -- A write whose own deadline has already elapsed stores nothing; reporting 1
+            -- would tell the caller a record exists that the script deliberately dropped.
+            if write('secreton:entry:' .. ARGV[2], ARGV[1]) == 0 then
+                return 0
+            end
+            if write(KEYS[1], ARGV[2]) == 0 then
+                redis.call('DEL', 'secreton:entry:' .. ARGV[2])
+                return 0
+            end
             return 1
             ",
         );
@@ -693,13 +701,59 @@ impl StorageBackend for RedisBackend {
     }
 
     async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
-        // Resolve the path to an id under the connection lock, then delete by id, so the
-        // path mapping and the entry are removed together and this reports whether a
-        // record was actually there.
-        match self.get_by_path(path).await? {
-            Some(entry) => self.delete_by_id(entry.id).await,
-            None => Ok(false),
+        // Resolve the path, remove its record and remove the mapping in one server-side
+        // script, rather than `get_by_path` followed by `delete_by_id` over two separate
+        // connections.
+        //
+        // The two-step version was not atomic: between the read and the delete, another
+        // writer could move the same id to a different path (the mapping is keyed by path,
+        // the record by id). `delete_by_id` then re-read the id's *new* path and deleted the
+        // record and mapping there, so the original path still mapped to a now-missing id
+        // while an unrelated path lost its record. One script removes the record the mapping
+        // currently names and that mapping together, with no window in between.
+        if path.is_empty() {
+            return Ok(false);
         }
+        let path_key = format!("secreton:path:{}", path);
+        let mut conn = self.manager.lock().await;
+
+        // KEYS[1]=path key; ARGV[1]=the path being deleted. The script resolves the id from
+        // the mapping and removes both the mapping and the record — but only removes the
+        // record when that record still names *this* path. An id can be reachable from more
+        // than one mapping if it was stored under a new path without clearing the old one;
+        // deleting the record unconditionally would then erase it from the other path too.
+        // Removing only this path's mapping leaves the record for the path it actually
+        // names. A mapping that names a missing (or unreadable) record is removed either way.
+        let script = redis::Script::new(
+            r"
+            local id = redis.call('GET', KEYS[1])
+            if not id then
+                return 0
+            end
+            local entry_key = 'secreton:entry:' .. id
+            local current = redis.call('GET', entry_key)
+            local removed = 0
+            if current then
+                local ok, decoded = pcall(cjson.decode, current)
+                if ok and type(decoded) == 'table' and decoded.path == ARGV[1] then
+                    removed = redis.call('DEL', entry_key)
+                end
+            end
+            redis.call('DEL', KEYS[1])
+            return removed
+            ",
+        );
+
+        let removed: i64 = script
+            .key(&path_key)
+            .arg(path)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to delete entry by path: {}", e),
+            })?;
+
+        Ok(removed > 0)
     }
 
     async fn exists(&self, path: &str) -> StorageResult<bool> {
@@ -775,6 +829,12 @@ impl StorageBackend for RedisBackend {
         // still says `expires_at` has passed. `SETEX`/`PEXPIREAT` closes that. The deadline is
         // passed as an absolute Unix second so a retry after a "moved" signal cannot shorten
         // the TTL by the time already spent.
+        //
+        // Outcome 3 exists because a write whose deadline has already elapsed must not be
+        // reported as landing. The `write` helper drops an already-expired key and the script
+        // used to return 1 regardless, so a caller was told its record was present when the
+        // script had actually deleted the destination. The caller can now tell "the write
+        // happened" (1) from "nothing was written because the deadline had passed" (3).
         let script = redis::Script::new(
             r"
             local mode = ARGV[2]
@@ -787,21 +847,27 @@ impl StorageBackend for RedisBackend {
                     local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
                     if ttl <= 0 then
                         redis.call('DEL', key)
-                        return
+                        return 0
                     end
                     redis.call('SET', key, value)
                     redis.call('PEXPIRE', key, ttl * 1000)
-                else
-                    redis.call('SET', key, value)
+                    return 1
                 end
+                redis.call('SET', key, value)
+                return 1
             end
 
             if mode == 'absent' then
                 if mapping then
                     return 0
                 end
-                write('secreton:entry:' .. expected, ARGV[1])
-                write(KEYS[1], expected)
+                if write('secreton:entry:' .. expected, ARGV[1]) == 0 then
+                    return 3
+                end
+                if write(KEYS[1], expected) == 0 then
+                    redis.call('DEL', 'secreton:entry:' .. expected)
+                    return 3
+                end
                 return 1
             end
 
@@ -809,8 +875,13 @@ impl StorageBackend for RedisBackend {
                 if mode == 'owner' then
                     return 0
                 end
-                write('secreton:entry:' .. expected, ARGV[1])
-                write(KEYS[1], expected)
+                if write('secreton:entry:' .. expected, ARGV[1]) == 0 then
+                    return 3
+                end
+                if write(KEYS[1], expected) == 0 then
+                    redis.call('DEL', 'secreton:entry:' .. expected)
+                    return 3
+                end
                 return 1
             end
 
@@ -836,8 +907,13 @@ impl StorageBackend for RedisBackend {
                 end
             end
 
-            write('secreton:entry:' .. expected, ARGV[1])
-            write(KEYS[1], expected)
+            if write('secreton:entry:' .. expected, ARGV[1]) == 0 then
+                return 3
+            end
+            if write(KEYS[1], expected) == 0 then
+                redis.call('DEL', 'secreton:entry:' .. expected)
+                return 3
+            end
             -- A replacement whose identity moved off the old id leaves that id's record
             -- behind; drop it so a superseded record cannot outlive the path that named it.
             if mapping ~= expected then
@@ -904,6 +980,11 @@ impl StorageBackend for RedisBackend {
                 // The path's identity moved between the read and the script. Re-read and
                 // rebuild so the payload matches the record that is current at the write.
                 2 => continue,
+                // Nothing was written: the record's own deadline had already elapsed, so
+                // the script dropped the destination instead of storing an immortal record.
+                // Reporting `Ok(true)` would tell the caller its record is present when the
+                // write deliberately stored nothing.
+                3 => return Ok(false),
                 other => {
                     return Err(StorageError::QueryFailed {
                         message: format!("compare-and-set returned an unexpected outcome: {other}"),
@@ -1010,24 +1091,34 @@ impl StorageBackend for RedisBackend {
                     local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
                     if ttl <= 0 then
                         redis.call('DEL', key)
-                        return
+                        return 0
                     end
                     redis.call('SET', key, value)
                     redis.call('PEXPIRE', key, ttl * 1000)
-                else
-                    redis.call('SET', key, value)
+                    return 1
                 end
+                redis.call('SET', key, value)
+                return 1
             end
 
             -- The value and the path mapping must name the same id, so the mapping never
-            -- resolves to a record whose own id disagrees. A key left by the id this
-            -- replaces is removed so the rewrite does not leak it.
+            -- resolves to a record whose own id disagrees. The id this replaces is read
+            -- before the mapping is overwritten, and its key is removed once the new value
+            -- has actually landed so a failed write leaves it untouched.
             local existing_id = redis.call('GET', KEYS[2])
+            -- A write whose own deadline has already elapsed stores nothing; reporting a
+            -- success would tell the caller an artifact exists that the script deliberately
+            -- dropped.
+            if write('secreton:entry:' .. ARGV[3], ARGV[2]) == 0 then
+                return 0
+            end
+            if write(KEYS[2], ARGV[3]) == 0 then
+                redis.call('DEL', 'secreton:entry:' .. ARGV[3])
+                return 0
+            end
             if existing_id and existing_id ~= ARGV[3] then
                 redis.call('DEL', 'secreton:entry:' .. existing_id)
             end
-            write('secreton:entry:' .. ARGV[3], ARGV[2])
-            write(KEYS[2], ARGV[3])
             return 1
             ",
         );
