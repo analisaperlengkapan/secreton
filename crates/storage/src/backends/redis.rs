@@ -274,15 +274,20 @@ impl StorageTransaction for RedisTransaction {
         // One script invocation for the whole list, so every write, mapping update and
         // superseded-record removal either all happen or none do. The previous per-operation
         // invocations left earlier writes published when a later one failed.
+        //
+        // The keys and args must be accumulated on the *invocation*, not the `Script`:
+        // `Script::key`/`Script::arg` return a fresh `ScriptInvocation` each call, so
+        // dropping the result leaves the script with no keys or arguments and the commit
+        // runs `EVALSHA <sha> 0` against a nil operation count.
+        let mut invocation = script.prepare_invoke();
         for key in &keys {
-            script.key(key);
+            invocation.key(key);
         }
-        script.arg(args[0].clone());
-        for arg in &args[1..] {
-            script.arg(arg);
+        for arg in &args {
+            invocation.arg(arg);
         }
-        script
-            .invoke_async::<_, i64>(&mut *conn)
+        invocation
+            .invoke_async::<i64>(&mut *conn)
             .await
             .map_err(|e| StorageError::QueryFailed {
                 message: format!("Failed to execute transaction commit: {}", e),

@@ -109,7 +109,22 @@ impl StorageBackend for NamespacedRedis {
     ) -> secreton_storage::StorageResult<bool> {
         let mut scoped = entry.clone();
         scoped.path = self.scope(&entry.path);
-        self.inner.compare_and_set(&scoped, expect).await
+        // The fence inside `AbsentFenced` names the lease record, so it must be scoped the
+        // same way `store_fenced` scopes its fence — otherwise the backend looks for the
+        // lease outside the namespace, finds none, and reports a lost lease to an
+        // initialization that still holds it.
+        let scoped_fence_path;
+        let scoped_expect = match expect {
+            Expect::AbsentFenced(fence) => {
+                scoped_fence_path = self.scope(fence.path);
+                Expect::AbsentFenced(secreton_storage::StorageFence::new(
+                    &scoped_fence_path,
+                    fence.token,
+                ))
+            }
+            other => other,
+        };
+        self.inner.compare_and_set(&scoped, scoped_expect).await
     }
 
     async fn delete_owned(&self, path: &str, token: &str) -> secreton_storage::StorageResult<bool> {
