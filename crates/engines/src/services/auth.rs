@@ -40,6 +40,17 @@ const REVOKED_TOKEN_STORAGE_PREFIX: &str = "sys/auth/revoked-tokens/";
 /// two states are different: a reservation can still be released, a revocation cannot.
 const REFRESH_RESERVATION_STORAGE_PREFIX: &str = "sys/auth/refresh-reservations/";
 
+/// How long the initial single-use claim over a refresh token lasts.
+///
+/// The claim is taken before the exchange's fallible work and — on a successful exchange —
+/// extended to the token's own `exp` once, and only once, a new session is durable. If the
+/// exchange dies between the claim and the extension, the claim lapses after this window
+/// instead of occupying the slot for the token's whole (potentially multi-day) lifetime, so
+/// a later retry is not refused by an orphaned claim. It is deliberately short: the window
+/// only has to cover a single exchange's work, and a longer one re-creates the lockout the
+/// short TTL exists to avoid.
+const REFRESH_CLAIM_TTL_SECS: i64 = 120;
+
 /// How long a bootstrap credential stays valid: the token an unseal hands back, and the
 /// session record behind it.
 ///
@@ -216,6 +227,11 @@ pub struct AuthenticationService {
     /// Protected by an RwLock so concurrent auth calls can share the
     /// cached value; only one caller refreshes when the TTL expires.
     effective_config_cache: Arc<tokio::sync::RwLock<Option<CachedEffectiveConfig>>>,
+
+    /// Test-only override for [`REFRESH_CLAIM_TTL_SECS`], so a test can drive the claim past
+    /// its deadline without sleeping for the production two minutes.
+    #[cfg(test)]
+    refresh_claim_ttl_override: std::sync::atomic::AtomicI64,
 }
 
 /// TTL for the effective-config cache.  30 seconds is short enough that
@@ -497,6 +513,8 @@ impl AuthenticationService {
             mfa_service: None,
             crypto,
             effective_config_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            #[cfg(test)]
+            refresh_claim_ttl_override: std::sync::atomic::AtomicI64::new(REFRESH_CLAIM_TTL_SECS),
         })
     }
 
@@ -1598,6 +1616,26 @@ impl AuthenticationService {
                 // persists the revocation and invalidates the old session that carried this
                 // token, so a replay after a successful exchange is rejected by both the
                 // in-memory reservation and the durable record.
+                //
+                // The claim is extended to the token's own `exp` here, after the session
+                // exists and before the token is returned. Until this point the claim carried
+                // only the short `REFRESH_CLAIM_TTL_SECS` deadline, so an exchange that died
+                // mid-flight would stop locking the token out. The extension closes the
+                // single-use window: a subsequent claim must fail until the token's own
+                // expiry, not merely until the short claim lapses.
+                if !self
+                    .extend_refresh_claim(refresh_token, &reservation_owner, refresh_expiry)
+                    .await
+                {
+                    // The claim is no longer ours to extend — another attempt took the slot,
+                    // which means a concurrent rotation is in progress. Do not return a
+                    // second token: the whole point of the single-use claim is that only one
+                    // exchange can commit, and this one can no longer prove it holds the
+                    // slot. Fail closed and surface a token error.
+                    self.release_refresh_token_reservation(refresh_token, &reservation_owner)
+                        .await;
+                    return Err(AuthError::InvalidToken);
+                }
                 self.commit_refresh_token_rotation(refresh_token, refresh_expiry)
                     .await;
                 Ok(token)
@@ -1719,15 +1757,25 @@ impl AuthenticationService {
     /// available, so the in-process blacklist is the reservation — the same guarantee the
     /// service already had, and the honest one for a backend no second replica can share.
     ///
-    /// The reservation carries the refresh token's expiry so `delete_expired` reclaims it;
-    /// without that, a reservation left by a failed exchange would block the token forever.
+    /// The claim is written with a *short* deadline ([`REFRESH_CLAIM_TTL_SECS`], capped by
+    /// the token's own expiry) rather than the token's whole lifetime. The exchange extends
+    /// it to the token's `exp` only once a new session is durable (see
+    /// [`Self::commit_refresh_token_rotation`]). A claim that never reaches that point — the
+    /// exchange died, or its release failed — therefore lapses on its own and stops locking
+    /// the token out, instead of occupying the slot for days until `delete_expired` sweeps
+    /// it.
     async fn reserve_refresh_token(
         &self,
         refresh_token: &str,
         refresh_expiry: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<String>, AuthError> {
         // In-memory fast path and single-process authority. Check and insert under one
-        // write guard, so two tasks on this instance cannot both win.
+        // write guard, so two tasks on this instance cannot both win. The in-memory slot
+        // carries the *claim* TTL too, so a claim whose durable counterpart lapses is also
+        // claimable again on this instance after the same window.
+        let claim_ttl = self.refresh_claim_ttl();
+        let claim_expiry =
+            (chrono::Utc::now() + chrono::Duration::seconds(claim_ttl)).min(refresh_expiry);
         {
             let mut blacklist = self.token_blacklist.write().await;
             if let Some(expires_at) = blacklist.get(refresh_token)
@@ -1735,7 +1783,7 @@ impl AuthenticationService {
             {
                 return Ok(None);
             }
-            blacklist.insert(refresh_token.to_string(), refresh_expiry);
+            blacklist.insert(refresh_token.to_string(), claim_expiry);
         }
 
         // The owner token is unique to this claim, so a release can never remove a
@@ -1752,14 +1800,29 @@ impl AuthenticationService {
 
         let path = Self::refresh_reservation_path(refresh_token);
         let entry = SecretEntry::new(
-            path,
+            path.clone(),
             Vec::new(),
             EncryptionMetadata::default(),
             SecurityLevel::Internal,
             Uuid::nil(),
         )
         .owned_by(&owner)
-        .with_expiration(refresh_expiry);
+        .with_expiration(claim_expiry);
+
+        // A lapsed claim must not block a retry. `compare_and_set(Absent)` does not by
+        // itself reclaim a record at the path, and the reservation is deliberately *not*
+        // deleted on a successful exchange, so a claim whose short deadline passed — an
+        // exchange that died before it could be extended — would otherwise keep the slot
+        // occupied until `delete_expired` happened to sweep it. Deleting it here can only
+        // remove an already-expired record: a live claim (owner-conditional) is left alone,
+        // and `delete_owned` on a *stale* owner token is a no-op, so another holder's slot
+        // is never touched.
+        if let Ok(Some(existing)) = self.storage.get_by_path(&path).await
+            && existing.is_expired()
+            && let Some(existing_owner) = existing.owner_token().map(str::to_string)
+        {
+            let _ = self.storage.delete_owned(&path, &existing_owner).await;
+        }
 
         // Insert-if-absent is the atomic claim. A backend that reports cross-process
         // coordination but cannot perform it returns `Unsupported`, and this fails closed:
@@ -1795,20 +1858,20 @@ impl AuthenticationService {
     /// Drop the single-use reservation for a refresh token whose exchange failed.
     ///
     /// Only called when the exchange issued no session; a completed rotation never releases.
-    /// Both the in-memory slot and the durable reservation are removed — the latter through
-    /// the owner-conditional delete, so a reservation another attempt re-took after this
-    /// one's record expired is not destroyed. A durable revocation a racing attempt may have
-    /// written for this token is left in place: that is a completed rotation by someone
-    /// else, and releasing it would revive a token that was successfully exchanged.
+    /// Both the in-memory slot and the durable reservation are removed — the latter only
+    /// through the owner-conditional delete, so a reservation another attempt re-took after
+    /// this one's record expired is never destroyed. A durable revocation a racing attempt
+    /// may have written for this token is left in place: that is a completed rotation by
+    /// someone else, and releasing it would revive a token that was successfully exchanged.
     ///
-    /// The release is *verified*. The owner-conditional delete is the common path, but it
-    /// cannot be trusted on its own: a backend that arbitrates between processes but does not
-    /// implement `delete_owned` returns `Unsupported`, and a transient fault returns an
-    /// error, in both cases without removing anything. The in-memory slot is already gone, so
-    /// a durable record left behind makes the next attempt hit the insert-if-absent and
-    /// return `InvalidToken` — the token is neither usable nor exchangeable, for its whole
-    /// lifetime, from a single failed release. The readback below distinguishes "gone" from
-    /// "present and ours" and completes the removal, so the refund is not half-applied.
+    /// There is deliberately **no** read-then-unconditional-delete fallback. Reading the
+    /// record and then deleting by path reopens the exact window `delete_owned` closes: a
+    /// second replica can take the slot in between, and the unconditional delete removes
+    /// *its* reservation, letting the same token be exchanged twice. When the conditional
+    /// delete does not complete — an unsupported backend, or a transient fault — the record
+    /// is left in place and this logs the fact. That is not a lockout: the claim carries the
+    /// short [`REFRESH_CLAIM_TTL_SECS`] deadline, so it lapses on its own and the token
+    /// becomes claimable again. Logs never include token material.
     async fn release_refresh_token_reservation(&self, refresh_token: &str, owner: &str) {
         {
             let mut blacklist = self.token_blacklist.write().await;
@@ -1817,41 +1880,88 @@ impl AuthenticationService {
         let path = Self::refresh_reservation_path(refresh_token);
 
         match self.storage.delete_owned(&path, owner).await {
-            Ok(true) => return,
-            // Already gone, or the record belongs to another attempt — the readback decides.
-            Ok(false) => {}
-            // A backend that arbitrates between processes but cannot delete conditionally.
-            // Do not fall back blindly: verify ownership before removing anything.
-            Err(secreton_storage::StorageError::Unsupported { .. }) => {}
+            // Removed, or there was nothing of ours to remove.
+            Ok(_) => {}
+            Err(secreton_storage::StorageError::Unsupported { .. }) => {
+                tracing::warn!(
+                    "Backend cannot delete a refresh-token reservation conditionally; \
+                     leaving the claim in place to lapse on its own rather than risking \
+                     another attempt's reservation"
+                );
+            }
             Err(e) => {
                 tracing::error!(
                     "Failed to release the refresh-token reservation with an owner-conditional \
-                     delete, verifying instead: {e}"
+                     delete; leaving the claim in place to lapse on its own: {e}"
                 );
             }
         }
+    }
 
-        match self.storage.get_by_path(&path).await {
-            // The release completed (or there was nothing to release).
-            Ok(None) => {}
-            Ok(Some(record)) if record.has_owner(owner) => {
-                // Still ours and not removed. An unconditional delete is now safe: ownership
-                // was just verified, so this cannot delete a record another attempt re-took.
-                if let Err(e) = self.storage.delete_by_path(&path).await {
-                    tracing::error!(
-                        "Failed to release the refresh-token reservation after verifying \
-                         ownership: {e}"
-                    );
-                }
-            }
-            // Owned by another attempt: a completed rotation by someone else. Leaving it is
-            // what stops a failed exchange here from reviving a token that was successfully
-            // exchanged elsewhere.
-            Ok(Some(_)) => {}
+    /// The claim TTL in force: the production constant, or the test override.
+    fn refresh_claim_ttl(&self) -> i64 {
+        #[cfg(test)]
+        {
+            self.refresh_claim_ttl_override
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            REFRESH_CLAIM_TTL_SECS
+        }
+    }
+
+    /// Extend the single-use claim on a refresh token to the token's own expiry, once its
+    /// exchange has produced a durable session.
+    ///
+    /// The claim is taken with the short [`REFRESH_CLAIM_TTL_SECS`] window so a stalled
+    /// exchange cannot lock the token out for days. Once a new session exists, the claim
+    /// must last as long as the token it guards, or the same refresh token could be claimed
+    /// and exchanged *again* after the short window elapsed — the exact reuse the
+    /// reservation exists to prevent. The extension is owner-conditional
+    /// ([`secreton_storage::Expect::Owner`]), so a slot another attempt has taken over is
+    /// not rewritten and this reports `false` for the caller to fail closed on. Never logs
+    /// token material.
+    async fn extend_refresh_claim(
+        &self,
+        refresh_token: &str,
+        owner: &str,
+        refresh_expiry: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        // In-memory slot: the whole guarantee on a single-process backend, and the fast
+        // path on a shared one. Upgrade it to the token's expiry so it cannot lapse early.
+        {
+            let mut blacklist = self.token_blacklist.write().await;
+            blacklist.insert(refresh_token.to_string(), refresh_expiry);
+        }
+
+        if self.storage.coordination() == secreton_storage::Coordination::SingleProcess {
+            return true;
+        }
+
+        let path = Self::refresh_reservation_path(refresh_token);
+        let entry = SecretEntry::new(
+            path,
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by(owner)
+        .with_expiration(refresh_expiry);
+
+        match self
+            .storage
+            .compare_and_set(&entry, secreton_storage::Expect::Owner(owner))
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => false,
             Err(e) => {
                 tracing::error!(
-                    "Could not verify the release of the refresh-token reservation: {e}"
+                    "Failed to extend the refresh-token claim; refusing the exchange: {e}"
                 );
+                false
             }
         }
     }
@@ -3474,6 +3584,18 @@ mod tests {
         /// that coordinates across processes but cannot delete conditionally would. Used to
         /// prove the reservation refund is verified rather than trusted.
         fail_next_delete_owned: std::sync::atomic::AtomicBool,
+        /// Counts `delete_by_path` calls on a refresh-reservation path. The release must
+        /// never remove a reservation by path — that is the read-then-delete fallback which
+        /// can destroy another attempt's slot — so a non-zero count is the defect.
+        unconditional_reservation_deletes: std::sync::atomic::AtomicU64,
+        /// When planted, the next `get_by_path` for this path returns the planted (stale)
+        /// record instead of the live one. This models the TOCTOU window the rejected
+        /// fallback opened: a release reads the record, sees *its own* owner token, and is
+        /// preempted before the delete — in that window another replica takes the slot, and
+        /// the unconditional delete then destroys the new owner's reservation. The stale
+        /// read is what lets a test reproduce that interleaving deterministically instead of
+        /// hoping for the scheduling.
+        stale_readback: std::sync::Mutex<Option<(String, SecretEntry)>>,
     }
 
     impl FailingReservationBackend {
@@ -3483,7 +3605,21 @@ mod tests {
                 armed: std::sync::atomic::AtomicBool::new(false),
                 fired: std::sync::atomic::AtomicBool::new(false),
                 fail_next_delete_owned: std::sync::atomic::AtomicBool::new(false),
+                unconditional_reservation_deletes: std::sync::atomic::AtomicU64::new(0),
+                stale_readback: std::sync::Mutex::new(None),
             }
+        }
+
+        fn unconditional_reservation_deletes(&self) -> u64 {
+            self.unconditional_reservation_deletes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Make the next read of `path` report `entry`, as a replica that read before
+        /// another attempt took the slot would have seen.
+        fn plant_stale_readback(&self, path: &str, entry: SecretEntry) {
+            *self.stale_readback.lock().expect("stale readback lock") =
+                Some((path.to_string(), entry));
         }
     }
 
@@ -3496,6 +3632,15 @@ mod tests {
             self.inner.get_by_id(id).await
         }
         async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            if let Some((stale_path, entry)) = self
+                .stale_readback
+                .lock()
+                .expect("stale readback lock")
+                .take()
+                && stale_path == path
+            {
+                return Ok(Some(entry));
+            }
             self.inner.get_by_path(path).await
         }
         async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
@@ -3508,6 +3653,10 @@ mod tests {
             self.inner.delete_by_id(id).await
         }
         async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            if path.starts_with(REFRESH_RESERVATION_STORAGE_PREFIX) {
+                self.unconditional_reservation_deletes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.inner.delete_by_path(path).await
         }
         async fn compare_and_set(
@@ -3815,14 +3964,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reservation_release_that_cannot_delete_conditionally_still_frees_the_token() {
-        // Regression: `release_refresh_token_reservation` ignored the result of the
-        // owner-conditional delete. On a backend that coordinates across processes but does
-        // not implement `delete_owned`, the delete returned `Unsupported` and removed
-        // nothing, while the in-memory slot was already gone — so the next exchange found the
-        // durable reservation occupied and returned `InvalidToken`. A single failed release
-        // consumed the refresh token for its whole lifetime. The release must verify and
-        // complete the removal.
+    async fn a_failed_conditional_release_never_deletes_another_attempts_reservation() {
+        // Regression (Finding 2): `release_refresh_token_reservation` read the record's owner
+        // and then called an *unconditional* `delete_by_path`. A second replica can take the
+        // slot between those two calls, and the unconditional delete then removes *its*
+        // reservation — letting the same refresh token be exchanged twice, which is exactly
+        // what the single-use reservation exists to prevent. The fix removes the
+        // read-then-delete fallback entirely: only `delete_owned` may remove a reservation,
+        // and a failed release leaves the record in place (it lapses on its own via the short
+        // claim TTL; see `a_reservation_whose_release_failed_is_usable_again_after_the_claim_ttl`).
         let _env = crate::test_support::without_root_key();
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3857,19 +4007,181 @@ mod tests {
                 .get_by_path(&path)
                 .await
                 .expect("read reservation")
-                .is_none(),
-            "a release must not leave the durable reservation behind when the conditional \
-             delete is unsupported"
+                .is_some(),
+            "a failed conditional release must not fall back to an unconditional delete; the \
+             record is left to lapse rather than risk destroying another attempt's reservation"
+        );
+        assert_eq!(
+            backend.unconditional_reservation_deletes(),
+            0,
+            "the release must never delete a reservation by path: that read-then-delete \
+             fallback can remove a slot another attempt took in between, letting the same \
+             refresh token be exchanged twice"
         );
 
-        // The token is exchangeable again, which is the observable consequence.
+        // The token is still blocked while the (now unowned) claim is live, which is the
+        // correct fail-closed behaviour — the slot is not silently freed by an unconditional
+        // delete.
         assert!(
             service
                 .reserve_refresh_token(token, expiry)
                 .await
-                .expect("re-claim")
+                .expect("re-claim while the claim is live")
+                .is_none(),
+            "a live claim must keep the token single-use even after a failed release"
+        );
+    }
+
+    impl AuthenticationService {
+        /// Test-only: force the short refresh-claim window, so a test can drive a claim past
+        /// its deadline without sleeping for the production two minutes.
+        fn force_short_claim_ttl(&self) {
+            self.refresh_claim_ttl_override
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reservation_whose_release_failed_is_usable_again_after_the_claim_ttl() {
+        // Regression (Finding 3): when the durable release failed, the reservation occupied
+        // the slot for the refresh token's whole (potentially multi-day) lifetime, so a retry
+        // after storage recovered was refused by the insert-if-absent until `delete_expired`
+        // swept the record. The claim is now taken with a short TTL
+        // (`REFRESH_CLAIM_TTL_SECS`) and extended to the token's `exp` only once an exchange
+        // succeeds, so an orphaned claim lapses and the token is claimable again.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        // A one-second claim window stands in for the production two minutes.
+        let service = auth_with_storage(storage).await;
+        service.force_short_claim_ttl();
+
+        // The token's own expiry is far in the future, so only the claim TTL can free it.
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "orphaned-claim-refresh-token";
+        let owner = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // The release fails (storage is down / the backend cannot delete conditionally), so
+        // the durable claim is left behind — an orphan occupying the slot.
+        backend
+            .fail_next_delete_owned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .release_refresh_token_reservation(token, &owner)
+            .await;
+
+        // While the orphaned claim is live the token is single-use.
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim while the orphan is live")
+                .is_none(),
+            "an orphaned claim must keep the token single-use while it is within its window"
+        );
+
+        // Past the claim window the orphan lapses, and a retry must succeed rather than being
+        // locked out until the token's own expiry.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim after the orphan lapsed")
                 .is_some(),
-            "a released refresh token must be claimable again"
+            "a claim whose release failed must not lock the refresh token out past its claim TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_release_never_removes_a_new_owners_reservation() {
+        // Regression (Finding 2/3), the interleaving the fallback opened: owner A claims the
+        // token with a short window, its claim lapses, owner B takes the slot, and only then
+        // does A run a release that fails. A's release must not delete B's reservation — the
+        // record must still exist and still be owned by B — or the same token could be
+        // exchanged twice.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "stale-release-refresh-token";
+        let owner_a = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("A claims the token");
+        let path = AuthenticationService::refresh_reservation_path(token);
+
+        // A's claim lapses; B takes the now-free slot.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let owner_b = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("B re-claims the lapsed slot")
+            .expect("B wins the freed slot");
+        assert_ne!(owner_a, owner_b, "B must hold a fresh owner token");
+
+        // Reproduce the interleaving the fallback opens: A's release reads the record and is
+        // preempted *before* its delete, and in that window B takes the slot. The stale
+        // readback hands A the record as it looked while A still owned it, so the fallback's
+        // ownership check passes and its unconditional delete then removes B's live slot.
+        // Without the stale read, the readback would simply observe B's record and the
+        // fallback would (correctly) decline; the defect only bites in the window.
+        let stale_a_record = SecretEntry::new(
+            path.clone(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by(&owner_a)
+        .with_expiration(chrono::Utc::now() - chrono::Duration::seconds(1));
+        backend.plant_stale_readback(&path, stale_a_record);
+
+        // A's release runs late and its conditional delete fails. It must be a no-op against
+        // B's record.
+        backend
+            .fail_next_delete_owned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .release_refresh_token_reservation(token, &owner_a)
+            .await;
+
+        // Read ground truth through the inner backend: the injected stale readback models the
+        // read the *fallback* performs, and the fixed release performs none, so reading back
+        // through the wrapper would consume the injection and misreport B's live slot.
+        let record = backend
+            .inner
+            .get_by_path(&path)
+            .await
+            .expect("read reservation")
+            .expect("B's reservation must survive A's stale release");
+        assert!(
+            record.has_owner(&owner_b),
+            "the surviving reservation must still belong to B, not A"
+        );
+        assert_eq!(
+            backend.unconditional_reservation_deletes(),
+            0,
+            "a release must never remove a reservation by path — that read-then-delete \
+             fallback is exactly what lets a stale release destroy another attempt's slot"
         );
     }
 

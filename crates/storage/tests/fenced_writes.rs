@@ -36,12 +36,25 @@ fn entry(path: &str, owner: &str, payload: &[u8]) -> SecretEntry {
     .owned_by(owner)
 }
 
+/// A lease record carrying the deadline metadata a fence now requires.
+///
+/// `store_fenced` and `Expect::AbsentFenced` reject a lease whose recorded deadline has
+/// passed — or is missing, which fails closed — so a test that stores a lease directly must
+/// record one, exactly as `SealService`'s `lease_entry` does.
+fn lease_entry(path: &str, owner: &str) -> SecretEntry {
+    let expires_at = chrono::Utc::now().timestamp() + 300;
+    entry(path, owner, b"lease").add_metadata(
+        secreton_storage::LEASE_EXPIRES_AT_KEY.to_string(),
+        expires_at.to_string(),
+    )
+}
+
 async fn assert_fenced_contract(backend: &(dyn StorageBackend + Send + Sync), lease: &str) {
     let artifact = "artifact/root_key";
 
     // The holder of the lease acquires it, then publishes its artifact through the fence.
     backend
-        .store(&entry(lease, "winner", b"lease"))
+        .store(&lease_entry(lease, "winner"))
         .await
         .expect("store lease record");
     assert!(
@@ -125,7 +138,7 @@ async fn assert_absent_fenced_contract(backend: &(dyn StorageBackend + Send + Sy
     let artifact = "users/root";
 
     backend
-        .store(&entry(lease, "winner", b"lease"))
+        .store(&lease_entry(lease, "winner"))
         .await
         .expect("store lease record");
 
@@ -235,6 +248,100 @@ async fn cache_wrapper_preserves_the_fence_contract() {
         Duration::from_secs(60),
     ));
     assert_fenced_contract(storage.as_ref(), "sys/init_lease").await;
+}
+
+/// An expired lease must not authorise a write, even though no replacement has taken it
+/// over yet.
+///
+/// The fence used to compare only the owner token, so an attempt whose lease had lapsed but
+/// had not yet been superseded could still write — the lease's expiry was enforced only by
+/// the renewal task and the takeover path, both of which can lag. The deadline is now
+/// recorded in ordinary metadata that the backend can read and is evaluated in the same
+/// indivisible step as the owner check. A missing or malformed deadline fails closed, so a
+/// fence can never authorise a write it cannot prove is backed by a live lease.
+async fn assert_expired_lease_is_rejected(backend: &(dyn StorageBackend + Send + Sync)) {
+    let lease = "sys/init_lease";
+    let artifact = "artifact/root_key";
+    let account = "users/root";
+
+    // An owner-matching lease whose recorded deadline has already passed.
+    let expired = entry(lease, "holder", b"lease").add_metadata(
+        secreton_storage::LEASE_EXPIRES_AT_KEY.to_string(),
+        (chrono::Utc::now().timestamp() - 1).to_string(),
+    );
+    backend.store(&expired).await.expect("store expired lease");
+
+    assert!(
+        !backend
+            .store_fenced(
+                &entry(artifact, "holder", b"artifact"),
+                StorageFence::new(lease, "holder")
+            )
+            .await
+            .expect("fenced write under an expired lease"),
+        "an attempt whose lease has expired must not publish an artifact, even before a \
+         takeover"
+    );
+    assert!(
+        backend.get_by_path(artifact).await.expect("read").is_none(),
+        "a refused write under an expired lease must store nothing"
+    );
+
+    // The same for the bootstrap root account, which goes through `AbsentFenced`.
+    assert!(
+        !backend
+            .compare_and_set(
+                &entry(account, "holder", b"root"),
+                Expect::AbsentFenced(StorageFence::new(lease, "holder"))
+            )
+            .await
+            .expect("fenced insert under an expired lease"),
+        "an expired lease must not authorise creating the bootstrap root account"
+    );
+    assert!(
+        backend.get_by_path(account).await.expect("read").is_none(),
+        "a refused root-account insert must store nothing"
+    );
+
+    // A lease with no recorded deadline must fail closed rather than be treated as live.
+    backend
+        .store(&entry(lease, "holder", b"lease"))
+        .await
+        .expect("overwrite with a deadline-less lease");
+    assert!(
+        !backend
+            .store_fenced(
+                &entry(artifact, "holder", b"artifact"),
+                StorageFence::new(lease, "holder")
+            )
+            .await
+            .expect("fenced write under a lease with no recorded deadline"),
+        "a lease whose deadline cannot be read must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn memory_backend_rejects_an_expired_lease() {
+    assert_expired_lease_is_rejected(&MemoryBackend::new()).await;
+}
+
+#[tokio::test]
+async fn file_backend_rejects_an_expired_lease() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backend = FileBackend::new(dir.path().to_str().expect("utf8 path")).expect("file backend");
+    assert_expired_lease_is_rejected(&backend).await;
+}
+
+#[tokio::test]
+async fn cache_wrapper_rejects_an_expired_lease() {
+    use secreton_storage::cache::InMemoryCache;
+
+    let storage: Arc<dyn StorageBackend + Send + Sync> = Arc::new(CachedStorage::new(
+        MemoryBackend::new(),
+        InMemoryCache::new(),
+        Duration::from_secs(60),
+    ));
+    assert_expired_lease_is_rejected(storage.as_ref()).await;
 }
 
 /// The owner-conditional `compare_and_set` contract every backend must honour.

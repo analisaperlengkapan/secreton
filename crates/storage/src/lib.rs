@@ -175,6 +175,36 @@ impl SecretEntry {
 /// Metadata key under which [`SecretEntry::owned_by`] records its owner token.
 pub const OWNER_TOKEN_KEY: &str = "storage_owner";
 
+/// Metadata key under which a fenced record records its own absolute deadline, in Unix
+/// seconds.
+///
+/// A fence is evaluated as "the record still exists and still carries this token". That is
+/// not the whole of holding a lease: the lease also carries an expiry, and a holder whose
+/// deadline has passed no longer legitimately holds it even if no replacement has taken it
+/// over yet. The expiry lives in the record's *body* (which the caller encrypts), so a
+/// backend cannot read it and an owner-only fence would authorise a write from a lease that
+/// has already lapsed. Recording the deadline in this ordinary metadata key — persisted by
+/// every backend alongside the owner token — is what lets the fence reject it *in the same
+/// indivisible step* as the token check. See [`lease_has_not_expired`].
+pub const LEASE_EXPIRES_AT_KEY: &str = "lease_expires_at";
+
+/// Whether the fenced record's recorded lease deadline is still in the future at `now`
+/// (Unix seconds).
+///
+/// Fails closed: a record that records no deadline, or a value that does not parse as an
+/// integer, is treated as expired. A fence must never authorise a write it cannot prove is
+/// backed by a live lease, and "missing" is the absence of that proof, not permission.
+pub fn lease_has_not_expired(entry: &SecretEntry, now: i64) -> bool {
+    match entry
+        .metadata
+        .get(LEASE_EXPIRES_AT_KEY)
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        Some(expires_at) => expires_at > now,
+        None => false,
+    }
+}
+
 /// Precondition for [`StorageBackend::compare_and_set`].
 ///
 /// The variants are the whole contract: a caller states what must already be true at the

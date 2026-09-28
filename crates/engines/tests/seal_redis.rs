@@ -41,6 +41,26 @@ fn redis_url() -> Option<String> {
     }
 }
 
+/// A lease record carrying the deadline metadata a fence now requires, `ttl_secs` from now.
+///
+/// A fence rejects an expired or deadline-less lease, so a test that stores a lease directly
+/// must record one, exactly as `SealService`'s `lease_entry` does.
+fn lease_record(path: &str, owner: &str, ttl_secs: i64) -> SecretEntry {
+    let expires_at = chrono::Utc::now().timestamp() + ttl_secs;
+    SecretEntry::new(
+        path.to_string(),
+        b"lease".to_vec(),
+        secreton_storage::EncryptionMetadata::default(),
+        SecurityLevel::Internal,
+        uuid::Uuid::nil(),
+    )
+    .owned_by(owner)
+    .add_metadata(
+        secreton_storage::LEASE_EXPIRES_AT_KEY.to_string(),
+        expires_at.to_string(),
+    )
+}
+
 /// Namespace every path so two test runs against one server cannot collide, and so the
 /// `Coordination` the backend reports is not downgraded by the wrapper.
 #[derive(Debug)]
@@ -447,16 +467,7 @@ async fn redis_store_fenced_refuses_a_lost_lease_and_preserves_the_winner() {
 
     // The winner acquires the lease, then publishes its artifact through the fence.
     storage
-        .store(
-            &SecretEntry::new(
-                lease.to_string(),
-                b"winner".to_vec(),
-                secreton_storage::EncryptionMetadata::default(),
-                SecurityLevel::Internal,
-                uuid::Uuid::nil(),
-            )
-            .owned_by("winner"),
-        )
+        .store(&lease_record(lease, "winner", 300))
         .await
         .expect("store lease");
     assert!(
@@ -514,6 +525,88 @@ async fn redis_store_fenced_refuses_a_lost_lease_and_preserves_the_winner() {
             .await
             .expect("fenced write after the lease is gone"),
         "a fence with no lease record must refuse, not fail open"
+    );
+}
+
+/// An expired lease must not authorise a write on the real Redis backend, even though no
+/// replacement has taken it over.
+///
+/// `store_fenced` is a single Lua invocation, so the lease's recorded deadline is compared
+/// against the *server's* clock in the same indivisible step as the owner check. Before the
+/// fix the script matched only the owner token and read the deadline from the record body,
+/// which is encrypted and therefore unreadable to the script — so an attempt whose lease had
+/// lapsed but had not yet been superseded could still publish. The pre-fix script returns
+/// success here; the fixed one refuses.
+#[tokio::test]
+async fn redis_store_fenced_refuses_an_expired_lease() {
+    let Some(url) = redis_url() else {
+        return;
+    };
+    let backend = RedisBackend::new(&url).await.expect("connect");
+    let storage: Arc<NamespacedRedis> = Arc::new(NamespacedRedis {
+        inner: backend,
+        prefix: format!("it/{}", uuid::Uuid::new_v4()),
+    });
+
+    let lease = "sys/init_lease";
+    let artifact = "sys/root_key_enc";
+    // The lease's owner still matches, but its recorded deadline is already in the past.
+    storage
+        .store(&lease_record(lease, "holder", -1))
+        .await
+        .expect("store expired lease");
+
+    let artifact_entry = SecretEntry::new(
+        artifact.to_string(),
+        b"payload".to_vec(),
+        secreton_storage::EncryptionMetadata::default(),
+        SecurityLevel::TopSecret,
+        uuid::Uuid::nil(),
+    )
+    .owned_by("holder");
+
+    assert!(
+        !storage
+            .store_fenced(
+                &artifact_entry,
+                secreton_storage::StorageFence::new(lease, "holder")
+            )
+            .await
+            .expect("fenced write under an expired lease"),
+        "an attempt whose lease has expired must not publish an artifact, even before a \
+         takeover"
+    );
+    assert!(
+        storage.get_by_path(artifact).await.expect("read").is_none(),
+        "a refused write under an expired lease must store nothing"
+    );
+
+    // The same for the bootstrap root account, which goes through `AbsentFenced`.
+    let root = SecretEntry::new(
+        "users/root".to_string(),
+        b"root".to_vec(),
+        secreton_storage::EncryptionMetadata::default(),
+        SecurityLevel::TopSecret,
+        uuid::Uuid::nil(),
+    )
+    .owned_by("holder");
+    assert!(
+        !storage
+            .compare_and_set(
+                &root,
+                Expect::AbsentFenced(secreton_storage::StorageFence::new(lease, "holder"))
+            )
+            .await
+            .expect("fenced insert under an expired lease"),
+        "an expired lease must not authorise creating the bootstrap root account"
+    );
+    assert!(
+        storage
+            .get_by_path("users/root")
+            .await
+            .expect("read")
+            .is_none(),
+        "a refused root-account insert must store nothing"
     );
 }
 
@@ -742,16 +835,7 @@ async fn redis_fenced_write_honours_an_elapsed_expiry() {
     let lease = "sys/init_lease";
     let artifact = "sys/root_key_enc";
     storage
-        .store(
-            &SecretEntry::new(
-                lease.to_string(),
-                b"lease".to_vec(),
-                secreton_storage::EncryptionMetadata::default(),
-                SecurityLevel::Internal,
-                uuid::Uuid::nil(),
-            )
-            .owned_by("holder"),
-        )
+        .store(&lease_record(lease, "holder", 300))
         .await
         .expect("store lease");
 
@@ -868,4 +952,122 @@ async fn redis_list_does_not_report_superseded_records() {
         .expect("read")
         .expect("the current record is present");
     assert_eq!(resolved.id, listed[0].id);
+}
+
+/// A completed exchange must block reuse of the refresh token until the token's own expiry,
+/// across two replicas sharing one Redis.
+///
+/// The claim is now taken with the short `REFRESH_CLAIM_TTL_SECS` window so an interrupted
+/// exchange cannot lock the token out for days; a successful exchange extends it to the
+/// token's `exp` before returning. Without that extension the claim would lapse two minutes
+/// after the exchange, freeing the slot, and the same refresh token could be exchanged a
+/// *second* time — the reuse the reservation exists to prevent. This proves the window
+/// survives on the real Redis backend and that the second replica is refused.
+#[tokio::test]
+async fn redis_a_completed_exchange_blocks_reuse_across_replicas_until_expiry() {
+    let Some(url) = redis_url() else {
+        return;
+    };
+    let namespace = format!("it/{}", uuid::Uuid::new_v4());
+    let open = |url: &str| {
+        let url = url.to_string();
+        async move { RedisBackend::new(&url).await.expect("connect") }
+    };
+    let storage_a: Arc<dyn StorageBackend + Send + Sync> = Arc::new(NamespacedRedis {
+        inner: open(&url).await,
+        prefix: namespace.clone(),
+    });
+    let storage_b: Arc<dyn StorageBackend + Send + Sync> = Arc::new(NamespacedRedis {
+        inner: open(&url).await,
+        prefix: namespace.clone(),
+    });
+
+    // Two service graphs over the one backend, sharing the root key that encrypts the
+    // system's own records — what a real multi-replica deployment does.
+    let shared_root_key =
+        secreton_crypto::generate_key(secreton_crypto::AlgorithmId::Aes256Gcm).expect("root key");
+    let replica_with_key = |storage: Arc<dyn StorageBackend + Send + Sync>, root_key: Vec<u8>| async move {
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.expect("crypto"));
+        crypto
+            .set_root_key(root_key)
+            .await
+            .expect("install root key");
+        let mut config = AuthConfig::default();
+        // A fresh signing secret per run, never a literal that reads like a credential.
+        let mut jwt_secret = uuid::Uuid::new_v4().simple().to_string();
+        jwt_secret.push_str(&uuid::Uuid::new_v4().simple().to_string());
+        config.jwt.secret = Some(jwt_secret);
+        Arc::new(
+            AuthenticationService::new(storage, crypto, &config)
+                .await
+                .expect("auth"),
+        )
+    };
+    let auth_a = replica_with_key(storage_a.clone(), shared_root_key.clone()).await;
+    let auth_b = replica_with_key(storage_b, shared_root_key).await;
+
+    // A fresh, random password per run: never a literal that reads like a credential.
+    let password = uuid::Uuid::new_v4().simple().to_string();
+    use secreton_engines::services::auth::ApiLoginRequest;
+    auth_a
+        .register_user("reuse-user", &password, None, vec![], vec![])
+        .await
+        .expect("register user");
+    let login = auth_a
+        .login(
+            ApiLoginRequest {
+                username: "reuse-user".to_string(),
+                password,
+                mfa_code: None,
+            },
+            "192.0.2.1".to_string(),
+            "test".to_string(),
+        )
+        .await
+        .expect("login");
+    let refresh = login.token.refresh_token.clone();
+
+    // Replica A exchanges it once. A replay must be refused by both replicas for the token's
+    // whole lifetime, not merely for the short claim window.
+    auth_a
+        .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+        .await
+        .expect("the first exchange succeeds");
+    assert!(
+        auth_b
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await
+            .is_err(),
+        "a refresh token exchanged by one replica must not be exchangeable by another"
+    );
+    assert!(
+        auth_a
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await
+            .is_err(),
+        "a refresh token must not be exchangeable twice on the replica that exchanged it"
+    );
+
+    // The durable claim the exchange left behind reaches the token's own `exp`, not the short
+    // claim window: that extension is what makes the refusal last.
+    let reservations = storage_a
+        .list(&secreton_storage::QueryParams {
+            path_prefix: Some("sys/auth/refresh-reservations/".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("list reservations");
+    assert_eq!(
+        reservations.len(),
+        1,
+        "a successful exchange must leave exactly one durable reservation"
+    );
+    let recorded = reservations[0]
+        .expires_at
+        .expect("the reservation must expire");
+    assert!(
+        recorded > chrono::Utc::now() + chrono::Duration::days(1),
+        "the claim must be extended to the refresh token's own expiry, not left at the short \
+         claim window: recorded={recorded}"
+    );
 }

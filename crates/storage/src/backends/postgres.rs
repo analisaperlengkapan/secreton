@@ -681,10 +681,19 @@ impl StorageBackend for PostgresBackend {
         // constant, never interpolated input. `FOR SHARE` on the fence CTE is the lock that
         // makes the fence and the write one indivisible step; it is evaluated for both the
         // insert arm and the conflict arm.
+        //
+        // The lease's own deadline is evaluated in the same locked CTE, against the
+        // database's clock: an owner token that still matches is not enough if the lease
+        // has lapsed, and a record with no readable deadline fails closed. The regex guard
+        // keeps the `::bigint` cast from erroring on a malformed value rather than
+        // rejecting it.
         let query = format!(
             "WITH fence AS ( \
                  SELECT 1 FROM secreton_entries \
                  WHERE path = $13 AND metadata->>'{owner}' = $14 \
+                 AND metadata->>'lease_expires_at' IS NOT NULL \
+                 AND (metadata->>'lease_expires_at') ~ '^[0-9]+$' \
+                 AND (metadata->>'lease_expires_at')::bigint > EXTRACT(EPOCH FROM NOW())::bigint \
                  FOR SHARE \
              ), written AS ( \
                  INSERT INTO secreton_entries \
@@ -1190,8 +1199,17 @@ impl PostgresBackend {
         // the fence is gone the whole transaction is rolled back and the insert above is
         // discarded, so a stale attempt publishes nothing. The owner key is a compile-time
         // constant.
+        //
+        // The lease's own deadline is evaluated in the same locked statement against the
+        // database's clock: a matching owner token is not enough if the lease has lapsed,
+        // and a record with no readable deadline fails closed. The regex guard keeps the
+        // `::bigint` cast from erroring on a malformed value.
         let fence_query = format!(
-            "SELECT 1 FROM secreton_entries WHERE path = $1 AND metadata->>'{owner}' = $2 FOR SHARE",
+            "SELECT 1 FROM secreton_entries WHERE path = $1 AND metadata->>'{owner}' = $2 \
+             AND metadata->>'lease_expires_at' IS NOT NULL \
+             AND (metadata->>'lease_expires_at') ~ '^[0-9]+$' \
+             AND (metadata->>'lease_expires_at')::bigint > EXTRACT(EPOCH FROM NOW())::bigint \
+             FOR SHARE",
             owner = crate::OWNER_TOKEN_KEY
         );
         let fence_held = transaction

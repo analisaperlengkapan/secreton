@@ -235,11 +235,12 @@ impl InitLease {
 /// records; the record is an ordinary [`SecretEntry`] carrying the owner token in its
 /// metadata, which is what the ownership-conditional replace matches on.
 fn lease_entry(owner: &str, ttl_secs: u64) -> SecretEntry {
+    let expires_at = Utc::now().timestamp() + ttl_secs as i64;
     SecretEntry::new(
         INIT_LEASE_PATH.to_string(),
         serde_json::to_vec(&InitLease {
             owner: owner.to_string(),
-            expires_at: Utc::now().timestamp() + ttl_secs as i64,
+            expires_at,
         })
         .unwrap_or_default(),
         EncryptionMetadata::default(),
@@ -247,6 +248,15 @@ fn lease_entry(owner: &str, ttl_secs: u64) -> SecretEntry {
         Uuid::nil(),
     )
     .owned_by(owner)
+    // The deadline is also recorded in ordinary metadata, where a storage backend can read
+    // it, so a fenced write can reject a lease that has already lapsed *in the same
+    // indivisible step* as the owner check. The body above is encrypted by the caller and
+    // invisible to the backend; without this the fence would authorise a write from an
+    // expired lease until some other attempt happened to take it over.
+    .add_metadata(
+        secreton_storage::LEASE_EXPIRES_AT_KEY.to_string(),
+        expires_at.to_string(),
+    )
 }
 
 /// A held initialization lease: the owner token, the fence every durable write consults,
@@ -5307,7 +5317,13 @@ mod tests {
                 SecurityLevel::Internal,
                 Uuid::nil(),
             )
-            .owned_by(&owner);
+            .owned_by(&owner)
+            // The deadline is recorded in metadata too, matching `lease_entry`, so a fence
+            // sees the lease as lapsed for the same reason production code would.
+            .add_metadata(
+                secreton_storage::LEASE_EXPIRES_AT_KEY.to_string(),
+                (Utc::now().timestamp() - 1).to_string(),
+            );
             self.inner
                 .upsert(&expired)
                 .await

@@ -447,6 +447,17 @@ impl RedisBackend {
                 return 0
             end
 
+            -- An expired lease is not a held lease. The owner token alone is not enough:
+            -- the lease's own deadline may have passed before any takeover, and a write
+            -- authorised in that window is exactly what the expiry exists to prevent. The
+            -- deadline is compared against the server clock in this same script, so the
+            -- check is part of the same indivisible step as the write. A missing or
+            -- non-numeric deadline fails closed.
+            local fence_expires = tonumber(decoded.metadata['lease_expires_at'])
+            if not fence_expires or fence_expires <= tonumber(redis.call('TIME')[1]) then
+                return 0
+            end
+
             -- A write whose own deadline has already elapsed stores nothing; reporting 1
             -- would tell the caller a record exists that the script deliberately dropped.
             if write('secreton:entry:' .. ARGV[2], ARGV[1]) == 0 then
@@ -1082,6 +1093,17 @@ impl StorageBackend for RedisBackend {
             local ok, decoded = pcall(cjson.decode, fence)
             if not ok or type(decoded) ~= 'table' or type(decoded.metadata) ~= 'table'
                 or decoded.metadata['storage_owner'] ~= ARGV[1] then
+                return 0
+            end
+
+            -- An expired lease is not a held lease. The owner token alone is not enough:
+            -- the lease's own deadline may have passed before any takeover, and a write
+            -- authorised in that window is exactly what the expiry exists to prevent. The
+            -- deadline is compared against the server clock in this same script, so the
+            -- check is part of the same indivisible step as the write. A missing or
+            -- non-numeric deadline fails closed.
+            local fence_expires = tonumber(decoded.metadata['lease_expires_at'])
+            if not fence_expires or fence_expires <= tonumber(redis.call('TIME')[1]) then
                 return 0
             end
 

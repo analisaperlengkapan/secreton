@@ -1177,7 +1177,12 @@ mod round_trip_tests {
         let owner = "owner-token";
         crate::StorageBackend::store(
             &cached,
-            &sample_entry_with_path(lease, b"lease").owned_by(owner),
+            &sample_entry_with_path(lease, b"lease")
+                .owned_by(owner)
+                .add_metadata(
+                    crate::LEASE_EXPIRES_AT_KEY.to_string(),
+                    (chrono::Utc::now().timestamp() + 300).to_string(),
+                ),
         )
         .await
         .expect("lease");
@@ -1237,7 +1242,12 @@ mod round_trip_tests {
         let owner = "owner-token";
         crate::StorageBackend::store(
             &cached,
-            &sample_entry_with_path(lease, b"lease").owned_by(owner),
+            &sample_entry_with_path(lease, b"lease")
+                .owned_by(owner)
+                .add_metadata(
+                    crate::LEASE_EXPIRES_AT_KEY.to_string(),
+                    (chrono::Utc::now().timestamp() + 300).to_string(),
+                ),
         )
         .await
         .expect("lease");

@@ -161,9 +161,13 @@ impl StorageBackend for MemoryBackend {
 
         let holds = match expect {
             crate::Expect::Absent => existing.is_none(),
-            crate::Expect::AbsentFenced(fence) => data
-                .get(fence.path)
-                .is_some_and(|held| held.has_owner(fence.token)),
+            // An expired lease is not a held lease: reject it here, under the same write
+            // guard as the owner comparison, so a lapsed attempt cannot write before some
+            // other attempt takes the record over.
+            crate::Expect::AbsentFenced(fence) => data.get(fence.path).is_some_and(|held| {
+                held.has_owner(fence.token)
+                    && crate::lease_has_not_expired(held, Utc::now().timestamp())
+            }),
             crate::Expect::Owner(token) => existing.is_some_and(|e| e.has_owner(token)),
             crate::Expect::Any => true,
         };
@@ -214,10 +218,9 @@ impl StorageBackend for MemoryBackend {
         fence: StorageFence<'_>,
     ) -> StorageResult<bool> {
         let mut data = self.data.write();
-        if !data
-            .get(fence.path)
-            .is_some_and(|e| e.has_owner(fence.token))
-        {
+        if !data.get(fence.path).is_some_and(|e| {
+            e.has_owner(fence.token) && crate::lease_has_not_expired(e, Utc::now().timestamp())
+        }) {
             return Ok(false);
         }
 
