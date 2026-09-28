@@ -1800,13 +1800,60 @@ impl AuthenticationService {
     /// one's record expired is not destroyed. A durable revocation a racing attempt may have
     /// written for this token is left in place: that is a completed rotation by someone
     /// else, and releasing it would revive a token that was successfully exchanged.
+    ///
+    /// The release is *verified*. The owner-conditional delete is the common path, but it
+    /// cannot be trusted on its own: a backend that arbitrates between processes but does not
+    /// implement `delete_owned` returns `Unsupported`, and a transient fault returns an
+    /// error, in both cases without removing anything. The in-memory slot is already gone, so
+    /// a durable record left behind makes the next attempt hit the insert-if-absent and
+    /// return `InvalidToken` — the token is neither usable nor exchangeable, for its whole
+    /// lifetime, from a single failed release. The readback below distinguishes "gone" from
+    /// "present and ours" and completes the removal, so the refund is not half-applied.
     async fn release_refresh_token_reservation(&self, refresh_token: &str, owner: &str) {
         {
             let mut blacklist = self.token_blacklist.write().await;
             blacklist.remove(refresh_token);
         }
         let path = Self::refresh_reservation_path(refresh_token);
-        let _ = self.storage.delete_owned(&path, owner).await;
+
+        match self.storage.delete_owned(&path, owner).await {
+            Ok(true) => return,
+            // Already gone, or the record belongs to another attempt — the readback decides.
+            Ok(false) => {}
+            // A backend that arbitrates between processes but cannot delete conditionally.
+            // Do not fall back blindly: verify ownership before removing anything.
+            Err(secreton_storage::StorageError::Unsupported { .. }) => {}
+            Err(e) => {
+                tracing::error!(
+                    "Failed to release the refresh-token reservation with an owner-conditional \
+                     delete, verifying instead: {e}"
+                );
+            }
+        }
+
+        match self.storage.get_by_path(&path).await {
+            // The release completed (or there was nothing to release).
+            Ok(None) => {}
+            Ok(Some(record)) if record.has_owner(owner) => {
+                // Still ours and not removed. An unconditional delete is now safe: ownership
+                // was just verified, so this cannot delete a record another attempt re-took.
+                if let Err(e) = self.storage.delete_by_path(&path).await {
+                    tracing::error!(
+                        "Failed to release the refresh-token reservation after verifying \
+                         ownership: {e}"
+                    );
+                }
+            }
+            // Owned by another attempt: a completed rotation by someone else. Leaving it is
+            // what stops a failed exchange here from reviving a token that was successfully
+            // exchanged elsewhere.
+            Ok(Some(_)) => {}
+            Err(e) => {
+                tracing::error!(
+                    "Could not verify the release of the refresh-token reservation: {e}"
+                );
+            }
+        }
     }
 
     /// Register a new user
@@ -3423,6 +3470,10 @@ mod tests {
         inner: secreton_storage::FileBackend,
         armed: std::sync::atomic::AtomicBool,
         fired: std::sync::atomic::AtomicBool,
+        /// When set, the next owner-conditional delete reports `Unsupported`, as a backend
+        /// that coordinates across processes but cannot delete conditionally would. Used to
+        /// prove the reservation refund is verified rather than trusted.
+        fail_next_delete_owned: std::sync::atomic::AtomicBool,
     }
 
     impl FailingReservationBackend {
@@ -3431,6 +3482,7 @@ mod tests {
                 inner,
                 armed: std::sync::atomic::AtomicBool::new(false),
                 fired: std::sync::atomic::AtomicBool::new(false),
+                fail_next_delete_owned: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -3476,6 +3528,15 @@ mod tests {
             self.inner.compare_and_set(entry, expect).await
         }
         async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
+            if self
+                .fail_next_delete_owned
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(secreton_storage::StorageError::Unsupported {
+                    operation: "delete_owned".to_string(),
+                    backend: "fault-injected".to_string(),
+                });
+            }
             self.inner.delete_owned(path, token).await
         }
         async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>> {
@@ -3750,6 +3811,65 @@ mod tests {
         assert_eq!(
             winners, 1,
             "exactly one replica may hold the single-use reservation; got a={claim_a:?} b={claim_b:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reservation_release_that_cannot_delete_conditionally_still_frees_the_token() {
+        // Regression: `release_refresh_token_reservation` ignored the result of the
+        // owner-conditional delete. On a backend that coordinates across processes but does
+        // not implement `delete_owned`, the delete returned `Unsupported` and removed
+        // nothing, while the in-memory slot was already gone — so the next exchange found the
+        // durable reservation occupied and returned `InvalidToken`. A single failed release
+        // consumed the refresh token for its whole lifetime. The release must verify and
+        // complete the removal.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "release-me-refresh-token";
+        let owner = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // The owner-conditional delete is unavailable on this backend, exactly as it is on a
+        // backend that reports `CrossProcess` without implementing conditional deletion.
+        backend
+            .fail_next_delete_owned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .release_refresh_token_reservation(token, &owner)
+            .await;
+
+        let path = AuthenticationService::refresh_reservation_path(token);
+        assert!(
+            service
+                .storage
+                .get_by_path(&path)
+                .await
+                .expect("read reservation")
+                .is_none(),
+            "a release must not leave the durable reservation behind when the conditional \
+             delete is unsupported"
+        );
+
+        // The token is exchangeable again, which is the observable consequence.
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim")
+                .is_some(),
+            "a released refresh token must be claimable again"
         );
     }
 

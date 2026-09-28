@@ -1369,18 +1369,40 @@ impl SealService {
                     .remove_required(&totp_path, staging.owner.as_deref())
                     .await;
             }
-            // Only remove the user record when this attempt actually created it. A duplicate
-            // root username was refused by the insert-if-absent leaving the pre-existing
-            // account in place, and this attempt owns nothing there — removing it by name
-            // would delete an ordinary account. The marker still names the username so a
-            // retry can tell what happened; it just does not authorise the deletion. An
-            // absent field is a legacy marker and means the account was this attempt's.
-            if staging.root_account_created.unwrap_or(true) {
-                let user_path = format!(
-                    "{}{}",
-                    crate::services::auth::USER_STORAGE_PREFIX,
-                    staging.root_username
-                );
+            // Remove the user record when this attempt created it. Two facts can establish
+            // that, and either is sufficient:
+            //
+            // * `root_account_created` says so. It is `false` only on the marker written
+            //   *before* registration, and `None` on a legacy marker (which recorded an id
+            //   only after creating the account, so an absent field means "mine").
+            // * The record at the user path carries this attempt's staging owner token. That
+            //   token is unique to the attempt, so a record stamped with it was written by
+            //   this attempt. This is the case a crash between registration and the staging
+            //   update leaves behind: the account exists and is stamped with this attempt's
+            //   token, but the marker still says `root_account_created: false`. Without this
+            //   check recovery would skip the account and clear the marker, leaving a
+            //   privileged `root`/`admin` identity on a vault that never issued shares.
+            //
+            // A duplicate username is the case this must *not* delete: the pre-existing
+            // account is token-less (or owned by another attempt), so neither fact holds and
+            // it is left in place. `remove_required` re-checks ownership before deleting and
+            // preserves a record that is not this attempt's.
+            let user_path = format!(
+                "{}{}",
+                crate::services::auth::USER_STORAGE_PREFIX,
+                staging.root_username
+            );
+            let owned_by_this_attempt = match &staging.owner {
+                Some(owner) => self
+                    .storage
+                    .get_by_path(&user_path)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.has_owner(owner)),
+                None => false,
+            };
+            if staging.root_account_created.unwrap_or(true) || owned_by_this_attempt {
                 all_removed &= self
                     .remove_required(&user_path, staging.owner.as_deref())
                     .await;
@@ -2134,6 +2156,107 @@ mod tests {
             .decode(payload)
             .expect("payload is base64url");
         serde_json::from_slice(&bytes).expect("payload is JSON")
+    }
+
+    #[tokio::test]
+    async fn recovery_removes_a_root_account_left_by_a_crash_before_the_staging_update() {
+        // CWE-459 regression: `init` registers the root account and only then writes the
+        // account's id into the staging marker. A crash between those two steps left a marker
+        // whose `root_account_created` is still `false`, so cleanup skipped the user path —
+        // and cleared the marker — leaving a privileged `root`/`admin` account on a vault
+        // that never issued shares. The account is stamped with the attempt's owner token,
+        // and that is what recovery must key on.
+        let _env = crate::test_support::without_root_key();
+        let vault = sealed_vault().await;
+
+        const OWNER: &str = "crashed-attempt-owner";
+        const ROOT_USERNAME: &str = "crashed-root";
+
+        // The durable state the crash leaves: init config, root key, and the pre-registration
+        // marker, plus the account itself — owned by the attempt, and not yet named by the
+        // marker.
+        let storage_dyn: Arc<dyn StorageBackend + Send + Sync> = vault.storage.clone();
+        storage_dyn
+            .store(&SecretEntry::new(
+                INIT_PATH.to_string(),
+                serde_json::to_vec(&InitConfig {
+                    shares: 3,
+                    threshold: 2,
+                })
+                .expect("init config"),
+                EncryptionMetadata::default(),
+                SecurityLevel::Public,
+                Uuid::nil(),
+            ))
+            .await
+            .expect("partial init config");
+        storage_dyn
+            .store(&SecretEntry::new(
+                ROOT_KEY_PATH.to_string(),
+                b"encrypted-root-key".to_vec(),
+                EncryptionMetadata::default(),
+                SecurityLevel::TopSecret,
+                Uuid::nil(),
+            ))
+            .await
+            .expect("partial root key");
+        storage_dyn
+            .store(
+                &SecretEntry::new(
+                    format!("users/{ROOT_USERNAME}"),
+                    b"privileged-account".to_vec(),
+                    EncryptionMetadata::default(),
+                    SecurityLevel::Secret,
+                    Uuid::new_v4(),
+                )
+                .owned_by(OWNER),
+            )
+            .await
+            .expect("privileged account from the crashed attempt");
+        storage_dyn
+            .store(&SecretEntry::new(
+                INIT_STAGING_PATH.to_string(),
+                serde_json::to_vec(&InitStaging {
+                    root_username: ROOT_USERNAME.to_string(),
+                    root_entity_id: None,
+                    // The marker written before registration — the crash window.
+                    root_account_created: Some(false),
+                    committed: false,
+                    owner: Some(OWNER.to_string()),
+                })
+                .expect("staging"),
+                EncryptionMetadata::default(),
+                SecurityLevel::Internal,
+                Uuid::nil(),
+            ))
+            .await
+            .expect("staging marker");
+
+        let result = vault
+            .seal
+            .init(3, 2, "fresh-root", &vault.auth, &vault.mfa)
+            .await
+            .expect("recovery must clear the crashed attempt and let a fresh init proceed");
+
+        assert_eq!(result.keys.len(), 3);
+        assert!(
+            vault
+                .storage
+                .get_by_path(&format!("users/{ROOT_USERNAME}"))
+                .await
+                .expect("read crashed account")
+                .is_none(),
+            "a privileged account left by a crashed attempt must be removed, not orphaned"
+        );
+        assert!(
+            vault
+                .storage
+                .get_by_path("users/fresh-root")
+                .await
+                .expect("read new root")
+                .is_some(),
+            "the fresh initialization must register its own root account"
+        );
     }
 
     #[tokio::test]

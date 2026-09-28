@@ -1162,6 +1162,64 @@ mod round_trip_tests {
     }
 
     #[tokio::test]
+    async fn a_failed_readback_after_a_fenced_write_does_not_serve_the_stale_record() {
+        // Regression: `store_fenced` had the same failure path as `compare_and_set` — a
+        // committed fenced write whose canonical readback then failed returned early on `?`
+        // and left the pre-write record cached under the path key, so a later read served a
+        // value the backend no longer held. The readback failure must invalidate the key.
+        let backend = ReadbackFailsAfterConditionalWriteBackend {
+            inner: crate::backends::MemoryBackend::new(),
+            fail_next_get_by_path: std::sync::atomic::AtomicBool::new(false),
+        };
+        let cached = CachedStorage::new(backend, InMemoryCache::new(), Duration::from_secs(300));
+
+        let lease = "lease/init";
+        let owner = "owner-token";
+        crate::StorageBackend::store(
+            &cached,
+            &sample_entry_with_path(lease, b"lease").owned_by(owner),
+        )
+        .await
+        .expect("lease");
+
+        let path = "kv/fenced/target";
+        let seeded = sample_entry_with_path(path, b"v1");
+        crate::StorageBackend::store(&cached, &seeded)
+            .await
+            .expect("seed");
+        // Warm the cache under the path so the stale entry exists to be served.
+        assert_eq!(
+            crate::StorageBackend::get_by_path(&cached, path)
+                .await
+                .expect("warm the cache")
+                .expect("seeded")
+                .encrypted_data,
+            b"v1"
+        );
+
+        let replacement = sample_entry_with_path(path, b"v2");
+        let result = crate::StorageBackend::store_fenced(
+            &cached,
+            &replacement,
+            crate::StorageFence::new(lease, owner),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the canonical readback failed, so the call must report an error"
+        );
+
+        let read = crate::StorageBackend::get_by_path(&cached, path)
+            .await
+            .expect("cached read")
+            .expect("the committed record is present");
+        assert_eq!(
+            read.encrypted_data, b"v2",
+            "the cache must not keep serving the pre-write record after a committed fenced write"
+        );
+    }
+
+    #[tokio::test]
     async fn a_conditional_write_that_changes_the_id_retires_the_old_cached_id() {
         // Regression: after a conditional write that landed under a new id, the cache kept
         // the superseded record under `entry:id:<old>`. `get_by_id(old_id)` then answered from
