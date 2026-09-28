@@ -87,18 +87,19 @@ const NO_PATH_KEY: &str = "secreton:_no_path_";
 const TRANSACTION_SCRIPT: &str = r"
     local n = tonumber(ARGV[1])
 
-    local function set_maybe_expiring(key, value, expires)
+    local write = function(key, value, expires)
         if expires ~= '' then
             local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
             if ttl <= 0 then
                 redis.call('DEL', key)
-                return
+                return false
             end
             redis.call('SET', key, value)
             redis.call('PEXPIRE', key, ttl * 1000)
-        else
-            redis.call('SET', key, value)
+            return true
         end
+        redis.call('SET', key, value)
+        return true
     end
 
     for i = 1, n do
@@ -112,25 +113,50 @@ const TRANSACTION_SCRIPT: &str = r"
         local entry_key = KEYS[(i - 1) * 2 + 2]
 
         if mode == 'write' then
-            -- Resolve the superseded record here, not from a pre-read the caller did. The
-            -- mapping must currently name a different id for this path, and that id's record
-            -- must still name this path: a record moved to another path by a concurrent
-            -- writer must not be deleted out from under that path.
-            local mapping = redis.call('GET', path_key)
-            if mapping and mapping ~= id then
-                local superseded = redis.call('GET', 'secreton:entry:' .. mapping)
-                if superseded then
-                    local ok, decoded = pcall(cjson.decode, superseded)
-                    if ok and type(decoded) == 'table' and decoded.path == path then
-                        redis.call('DEL', 'secreton:entry:' .. mapping)
+            -- An already-expired write stores nothing. Resolving the destination first makes
+            -- the expiry decision part of the same atomic step, which is what lets an expired
+            -- write leave the destination — and any mapping already there — untouched.
+            local live = true
+            if expires ~= '' then
+                live = tonumber(expires) > tonumber(redis.call('TIME')[1])
+            end
+
+            if not live then
+                -- Do not delete the mapping here: it may belong to an unrelated, unexpired
+                -- record another id still owns. Remove this transaction's own record if it
+                -- exists, and, only when the destination still names it, its mapping. A
+                -- mapping that names a different id is left exactly as it was.
+                local existing = redis.call('GET', entry_key)
+                if existing then
+                    redis.call('DEL', entry_key)
+                    if path ~= '' then
+                        local mapped = redis.call('GET', path_key)
+                        if mapped == id then
+                            redis.call('DEL', path_key)
+                        end
                     end
                 end
-            end
-            set_maybe_expiring(entry_key, value, expires)
-            -- Guard on the path string, not the key: a pathless entry's key is the sentinel
-            -- and must never be written as though it were a mapping.
-            if path ~= '' then
-                set_maybe_expiring(path_key, id, expires)
+            else
+                -- Resolve the superseded record here, not from a pre-read the caller did. The
+                -- mapping must currently name a different id for this path, and that id's
+                -- record must still name this path: a record moved to another path by a
+                -- concurrent writer must not be deleted out from under that path.
+                local mapping = redis.call('GET', path_key)
+                if mapping and mapping ~= id then
+                    local superseded = redis.call('GET', 'secreton:entry:' .. mapping)
+                    if superseded then
+                        local ok, decoded = pcall(cjson.decode, superseded)
+                        if ok and type(decoded) == 'table' and decoded.path == path then
+                            redis.call('DEL', 'secreton:entry:' .. mapping)
+                        end
+                    end
+                end
+                write(entry_key, value, expires)
+                -- Guard on the path string, not the key: a pathless entry's key is the
+                -- sentinel and must never be written as though it were a mapping.
+                if path ~= '' then
+                    write(path_key, id, expires)
+                end
             end
         else
             local mapping = redis.call('GET', path_key)
@@ -527,6 +553,24 @@ impl StorageBackend for RedisBackend {
 
         let mut conn = self.manager.lock().await;
 
+        // Learn the path this id currently names *before* overwriting the record. Storing an
+        // existing id at a new path is a relocation, and it leaves the old path's mapping
+        // pointing at this id — an index entry for a path the record no longer names. That
+        // stale mapping is what lets a later fenced or conditional write at the old path
+        // resolve to this record and delete it, losing it from the path that now names it.
+        let previous_path: Option<String> = {
+            let stored: Option<String> =
+                conn.get(&key)
+                    .await
+                    .map_err(|e| StorageError::QueryFailed {
+                        message: format!("Failed to read entry before store: {}", e),
+                    })?;
+            stored
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<SecretEntry>(json).ok())
+                .map(|stored| stored.path)
+        };
+
         if let Some(expires_at) = entry.expires_at {
             let ttl = (expires_at - Utc::now()).num_seconds();
             if ttl > 0 {
@@ -581,6 +625,32 @@ impl StorageBackend for RedisBackend {
                         message: format!("Failed to store path mapping: {}", e),
                     })?;
             }
+        }
+
+        // A relocation leaves the old path's mapping behind. Remove it only while it still
+        // points at this id, so a concurrent writer that has already repointed the old path
+        // at its own record keeps that mapping.
+        if let Some(previous) = previous_path
+            && !previous.is_empty()
+            && previous != entry.path
+        {
+            let previous_key = format!("secreton:path:{}", previous);
+            let script = redis::Script::new(
+                r"
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    redis.call('DEL', KEYS[1])
+                end
+                return 1
+                ",
+            );
+            script
+                .key(&previous_key)
+                .arg(entry.id.to_string())
+                .invoke_async::<i64>(&mut *conn)
+                .await
+                .map_err(|e| StorageError::QueryFailed {
+                    message: format!("Failed to clear the relocated path mapping: {}", e),
+                })?;
         }
 
         Ok(())
@@ -950,7 +1020,17 @@ impl StorageBackend for RedisBackend {
         for _ in 0..CONDITIONAL_WRITE_MAX_ATTEMPTS {
             // The identity and creation time the path currently has are what the replacement
             // must keep, exactly as the memory and file backends do.
-            let existing = self.get_by_path(&entry.path).await?;
+            //
+            // Only a record whose *own* path field names this path may be normalized. A
+            // mapping left behind by a relocation (`store` of an existing id at a new path)
+            // resolves to a record that no longer names this path; keeping its id would make
+            // the replacement map this path to a record whose body says it lives elsewhere.
+            // Treat such a stale mapping as an absent record, so the replacement is written
+            // with the caller's own identity.
+            let existing = self
+                .get_by_path(&entry.path)
+                .await?
+                .filter(|record| record.path == entry.path);
             let to_write = plan_replacement(&existing, entry);
 
             let value =
@@ -1068,6 +1148,14 @@ impl StorageBackend for RedisBackend {
     /// it there: a fenced write that `SET` the artifact with no deadline would silently make
     /// an expiring record immortal, and Redis would then serve a record whose body already
     /// says it expired.
+    ///
+    /// The record the artifact path named is resolved *and its embedded path re-checked*
+    /// before it is deleted. An id can be named by more than one mapping: a `store` that
+    /// relocated an id to a new path left the old mapping behind, so a later fenced write at
+    /// the old path would otherwise read that stale mapping and delete a record another path
+    /// still names. Comparing the mapped record's own `path` field against the destination
+    /// keeps a relocated record intact; deleting that record's stale mapping (the one that
+    /// pointed at it from the old path) is what makes the relocation complete.
     async fn store_fenced(
         &self,
         entry: &SecretEntry,
@@ -1139,7 +1227,18 @@ impl StorageBackend for RedisBackend {
                 return 0
             end
             if existing_id and existing_id ~= ARGV[3] then
-                redis.call('DEL', 'secreton:entry:' .. existing_id)
+                local superseded = redis.call('GET', 'secreton:entry:' .. existing_id)
+                if superseded then
+                    local sok, sdecoded = pcall(cjson.decode, superseded)
+                    -- Only drop the record when it still names *this* path. If a `store`
+                    -- relocated the id to another path, this mapping (KEYS[2]) was the stale
+                    -- one — but it has just been repointed at the new write, so there is
+                    -- nothing left to clean here and the relocated record must be left
+                    -- intact rather than deleted out from under the path that now names it.
+                    if sok and type(sdecoded) == 'table' and sdecoded.path == ARGV[5] then
+                        redis.call('DEL', 'secreton:entry:' .. existing_id)
+                    end
+                end
             end
             return 1
             ",
@@ -1159,6 +1258,7 @@ impl StorageBackend for RedisBackend {
                 .arg(&value)
                 .arg(entry.id.to_string())
                 .arg(&expires_at)
+                .arg(&entry.path)
                 .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| StorageError::QueryFailed {
@@ -1319,6 +1419,14 @@ mod tests {
             EncryptionMetadata::default(),
             SecurityLevel::Internal,
             Uuid::nil(),
+        )
+    }
+
+    /// A lease record carrying the deadline `store_fenced` requires, as the seal service writes.
+    fn lease_entry(path: &str, owner: &str) -> SecretEntry {
+        entry_at(path, b"lease").owned_by(owner).add_metadata(
+            crate::LEASE_EXPIRES_AT_KEY.to_string(),
+            (Utc::now().timestamp() + 300).to_string(),
         )
     }
 
@@ -1955,6 +2063,161 @@ mod tests {
                 .expect("survivor")
                 .id,
             survivor_id
+        );
+    }
+
+    /// Regression: storing an existing id at a new path left the old path's mapping pointing
+    /// at that id. A fenced write at the old path then read the stale mapping and deleted the
+    /// record the new path still named, so `get_by_path(new)` returned nothing.
+    ///
+    /// The property: relocating an id, then fenced-writing at the old path, leaves the
+    /// relocated record reachable from its current path.
+    #[tokio::test]
+    async fn a_fenced_write_at_a_relocated_ids_old_path_does_not_erase_it() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let old_path = format!("{namespace}/relocate/old");
+        let new_path = format!("{namespace}/relocate/new");
+        let lease = format!("{namespace}/relocate/lease");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        backend
+            .store(&lease_entry(&lease, "owner"))
+            .await
+            .expect("store lease");
+
+        // One id, stored first at `old_path`, then relocated to `new_path`.
+        let relocated = entry_at(&old_path, b"relocated");
+        let relocated_id = relocated.id;
+        backend.store(&relocated).await.expect("store at old path");
+        let mut moved = relocated.clone();
+        moved.path = new_path.clone();
+        backend.store(&moved).await.expect("relocate to new path");
+        assert_eq!(
+            backend
+                .get_by_path(&new_path)
+                .await
+                .expect("read")
+                .expect("the relocated record must resolve at its new path")
+                .id,
+            relocated_id
+        );
+
+        // A fenced write at the old path must not erase the record the new path names.
+        assert!(
+            backend
+                .store_fenced(
+                    &entry_at(&old_path, b"fresh"),
+                    StorageFence::new(&lease, "owner")
+                )
+                .await
+                .expect("fenced write at the old path"),
+            "the fence holds, so the write must land"
+        );
+
+        let still_there = backend
+            .get_by_path(&new_path)
+            .await
+            .expect("read new path")
+            .expect("a fenced write at the old path must not erase the relocated record");
+        assert_eq!(still_there.id, relocated_id);
+        assert_eq!(still_there.encrypted_data, b"relocated");
+    }
+
+    /// The same stale-mapping assumption reached `compare_and_set`, which normalized its
+    /// input against the record a stale mapping returned. A conditional write at the old
+    /// path must not adopt the relocated record's identity, and must not delete it.
+    #[tokio::test]
+    async fn a_conditional_write_at_a_relocated_ids_old_path_does_not_erase_it() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let old_path = format!("{namespace}/cas-relocate/old");
+        let new_path = format!("{namespace}/cas-relocate/new");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let relocated = entry_at(&old_path, b"relocated");
+        let relocated_id = relocated.id;
+        backend.store(&relocated).await.expect("store at old path");
+        let mut moved = relocated.clone();
+        moved.path = new_path.clone();
+        backend.store(&moved).await.expect("relocate to new path");
+
+        let candidate = entry_at(&old_path, b"candidate");
+        let candidate_id = candidate.id;
+        assert_ne!(candidate_id, relocated_id);
+        assert!(
+            backend
+                .compare_and_set(&candidate, Expect::Any)
+                .await
+                .expect("conditional write at the old path"),
+            "an unconditional replacement must land"
+        );
+
+        // The relocated record must survive at its new path under its own identity.
+        let survived = backend
+            .get_by_path(&new_path)
+            .await
+            .expect("read new path")
+            .expect("the relocated record must survive a conditional write at the old path");
+        assert_eq!(
+            survived.id, relocated_id,
+            "the relocated record must keep its identity"
+        );
+        // And the conditional write must have adopted the caller's identity, not the stale
+        // mapping's, so the path is not mapped to a record whose body names another path.
+        let resolved = backend
+            .get_by_path(&old_path)
+            .await
+            .expect("read old path")
+            .expect("the conditional write must be present");
+        assert_eq!(resolved.id, candidate_id);
+        assert_eq!(resolved.path, old_path);
+    }
+
+    /// Regression: a transaction storing an already-expired record at a path occupied by an
+    /// unrelated live record deleted the path mapping. The live record stayed in storage but
+    /// became unreachable by path after the commit.
+    #[tokio::test]
+    async fn an_expired_transaction_write_does_not_unlink_the_live_record_at_the_path() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/expired-write/live");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let live = entry_at(&path, b"live");
+        let live_id = live.id;
+        backend.store(&live).await.expect("seed live record");
+
+        // A transaction stages an already-expired record under its own id at the same path.
+        let mut expired = entry_at(&path, b"expired");
+        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        assert_ne!(expired.id, live_id);
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&expired).await.expect("stage expired write");
+        tx.commit().await.expect("commit");
+
+        // The expired write stores nothing, so the live record must still resolve by path.
+        let resolved = backend
+            .get_by_path(&path)
+            .await
+            .expect("read by path")
+            .expect("an expired transaction write must not unlink the live record");
+        assert_eq!(resolved.id, live_id);
+        assert_eq!(resolved.encrypted_data, b"live");
+        // The expired record itself must not have been persisted.
+        assert!(
+            backend
+                .get_by_id(expired.id)
+                .await
+                .expect("by id")
+                .is_none(),
+            "an expired transaction write must not persist its record"
         );
     }
 }

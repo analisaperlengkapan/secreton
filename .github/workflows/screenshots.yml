@@ -211,19 +211,27 @@ jobs:
           if-no-files-found: warn
 
       # The capture rewrites `docs/screenshots/*.png`. A diff means the rendered frontend
-      # changed, which a human should look at — but the job does not fail on it and never
-      # commits it. The dashboard embeds the live secret count, which grows as sessions are
-      # recorded, so the pixels of that one view differ legitimately between runs; failing
-      # on it would be red for a reason that is not a regression. The gate is the assertion
-      # suite above (blank/overflow/tiny control/status/console error); this step surfaces
-      # visual drift for review through the artifact and an annotation.
-      - name: Note any change to the committed screenshots
+      # changed, which a human should look at. The dashboard embeds the live secret count,
+      # which grows as sessions are recorded, so the pixels of that one view differ
+      # legitimately between runs; the mobile dashboard inherits the same varying count.
+      # Every *other* view is deterministic, so drift there is a real signal and fails the
+      # job rather than warning — a warning on the assertion job cannot establish that the
+      # committed images still depict the current UI. The varying views are still surfaced
+      # through the artifact and the annotation.
+      - name: Check the committed screenshots against the capture
         if: always()
         run: |
-          if ! git diff --quiet -- docs/screenshots; then
-            echo "::warning::Screenshots differ from the committed images. Inspect the \
-            'screenshots' artifact, then either update them deliberately or fix the regression."
-            git --no-pager diff --stat -- docs/screenshots
+          if git diff --quiet -- docs/screenshots \
+              ':!docs/screenshots/dashboard.png' \
+              ':!docs/screenshots/mobile-dashboard.png'; then
+            echo "Deterministic screenshots match the committed images."
           else
-            echo "Screenshots match the committed images."
+            echo "::error::Committed screenshots differ from the capture for a deterministic view."
+            git --no-pager diff --stat -- docs/screenshots
+            exit 1
+          fi
+          if ! git diff --quiet -- docs/screenshots; then
+            echo "::warning::The dashboard views differ from the committed images (they embed \
+            the live secret count). Inspect the 'screenshots' artifact and refresh them \
+            deliberately if the change is intended."
           fi

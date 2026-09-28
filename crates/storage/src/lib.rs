@@ -730,7 +730,14 @@ pub trait StorageBackend: std::fmt::Debug + Send + Sync {
     /// List secreton entries with filtering
     async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>>;
 
-    /// Count secreton entries matching query
+    /// Count secreton entries matching query.
+    ///
+    /// This counts *what `list` would return for the same params*, pagination included: the
+    /// `limit` and `offset` are applied here exactly as they are there. Memory, file and Redis
+    /// already define `count` as `list(params).len()`, and the lifecycle sweep and session
+    /// churn checks depend on the two methods agreeing on the same page. A backend that
+    /// ignored pagination here would report a total the caller never receives, so a sweep
+    /// that sizes its work from `count` would over- or under-read.
     async fn count(&self, params: &QueryParams) -> StorageResult<u64>;
 
     /// Check if path exists

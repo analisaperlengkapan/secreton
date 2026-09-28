@@ -748,7 +748,10 @@ impl StorageBackend for PostgresBackend {
                 message: format!("Failed to get connection: {}", e),
             })?;
 
-        let mut query = "SELECT COUNT(*) FROM secreton_entries WHERE 1=1".to_string();
+        // The inner query selects a row per match; the outer `COUNT(*)` then counts the page
+        // the LIMIT/OFFSET below produces. Starting from `COUNT(*)` and wrapping it would count
+        // a single aggregate row instead.
+        let mut query = "SELECT 1 FROM secreton_entries WHERE 1=1".to_string();
         let mut bind_params: Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync>> = Vec::new();
         let mut param_count = 1;
 
@@ -807,6 +810,29 @@ impl StorageBackend for PostgresBackend {
         if !params.include_expired {
             query.push_str(" AND (expires_at IS NULL OR expires_at > NOW())");
         }
+
+        // `count` counts what `list` would return, so pagination is part of the count. The
+        // filtered, ordered page is built as a subquery and wrapped in `COUNT(*)`; memory, file
+        // and Redis define `count` as `list(params).len()`, and a bare `SELECT COUNT(*) ... LIMIT`
+        // would return the count of the *unpaginated* match set (the LIMIT applies to the single
+        // aggregate row and is inert). The default ordering is the same `created_at DESC, id DESC`
+        // `list` uses, so "the first N rows" is the same page in both methods.
+        let mut page = query;
+        page.push_str(" ORDER BY created_at DESC, id DESC");
+        if let Some(limit) = params.limit {
+            page.push_str(&format!(" LIMIT ${}", param_count));
+            bind_params.push(Box::new(limit as i64));
+            param_count += 1;
+        }
+
+        if let Some(offset) = params.offset
+            && offset > 0
+        {
+            page.push_str(&format!(" OFFSET ${}", param_count));
+            bind_params.push(Box::new(offset as i64));
+        }
+
+        let query = format!("SELECT COUNT(*) FROM ({}) AS page", page);
 
         let bind_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bind_params
             .iter()

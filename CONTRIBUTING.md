@@ -195,9 +195,11 @@ just capturing.
 CI runs the same suite in the [`Screenshots`](.github/workflows/screenshots.yml) workflow:
 it starts a server, creates an account with a password generated per run, captures every
 view and fails on any assertion. The job never commits the images. If the capture changes a
-committed PNG it warns and uploads the new ones as an artifact, so a human decides whether
-the change is intended — the dashboard embeds the live secret count, so that view's pixels
-move on their own. Regenerate and commit deliberately with the commands above.
+*deterministic* view (login, login-error, not-found, mobile-login) it fails the job, because
+a warning cannot establish that the committed images still depict the current UI. The
+dashboard views embed the live secret count and move on their own, so their drift warns and
+uploads the new images as an artifact for a human to judge. Regenerate and commit
+deliberately with the commands above.
 
 ## Commits and pull requests
 

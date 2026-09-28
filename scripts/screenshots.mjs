@@ -193,12 +193,31 @@ async function main() {
   page.on("pageerror", onDenialError);
   page.on("console", onDenialConsole);
 
+  // Record the *actual* HTTP status of the rejected sign-in's server-function POST. The
+  // result used to hard-code `200`, so the status assertion could not notice that request
+  // changing. Leptos answers a `ServerFnError` with a 500, which the console-error
+  // whitelist already keys on; capture it here so the result carries the real status and
+  // the assertion below is meaningful.
+  let denialStatus = null;
+  const onDenialResponse = (resp) => {
+    if (resp.url().includes("/api/") && resp.request().method() === "POST") {
+      denialStatus = resp.status();
+    }
+  };
+  page.on("response", onDenialResponse);
+
   await page.locator("form button").click();
   // The response is a server-function round trip, so the alert appears after a beat.
   await page.waitForSelector('[role="alert"]', { timeout: 20000 });
   await page.waitForTimeout(500);
   page.off("pageerror", onDenialError);
   page.off("console", onDenialConsole);
+  page.off("response", onDenialResponse);
+  if (denialStatus === null) {
+    throw new Error(
+      "the rejected sign-in did not produce an observable server-function response"
+    );
+  }
 
   // Measure the settled DOM, not a hard-coded "looks fine". The alert is on screen by now,
   // so an overflow or an undersized control introduced by the error state is caught here
@@ -215,8 +234,8 @@ async function main() {
   const alertText = (await page.locator('[role="alert"]').innerText()).trim();
   results.push({
     view: "login-error",
-    status: 200,
-    expectedStatus: 200,
+    status: denialStatus,
+    expectedStatus: 500,
     bytes: fs.statSync(errFile).size,
     overflowX: errProbe.overflowX,
     tinyTargets: errProbe.tinyControls,
@@ -224,7 +243,7 @@ async function main() {
     alertText,
     textLength: errProbe.text.length,
   });
-  console.log(`  login-error      HTTP 200  ${fs.statSync(errFile).size} bytes`);
+  console.log(`  login-error      HTTP ${denialStatus}  ${fs.statSync(errFile).size} bytes`);
 
   const nf = await anon.newPage();
   await shoot(nf, "not-found", "/no-such-page", 404);

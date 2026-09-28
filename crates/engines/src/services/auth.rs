@@ -806,6 +806,9 @@ impl AuthenticationService {
                 && let Ok(u) = serde_json::from_slice::<User>(&decrypted)
             {
                 stored_user = Some(u.clone());
+                // Republish the durable record so an account omitted by the capped startup
+                // hydration can still be verified by `UserPassAuthMethod`.
+                self.hydrate_userpass_identity(&u).await;
                 if let Some(locked_until) = u.locked_until
                     && locked_until > chrono::Utc::now()
                 {
@@ -2274,6 +2277,29 @@ impl AuthenticationService {
         Ok(())
     }
 
+    /// Ensure the in-memory userpass identity for `user` reflects its durable record.
+    ///
+    /// [`AuthenticationService::new`] hydrates `UserPassAuthMethod` from storage, but that
+    /// scan is capped (`USER_LOAD_MAX_ENTRIES`), so on a deployment with more accounts than
+    /// the cap the users beyond it are absent from the map. `UserPassAuthMethod` is the only
+    /// thing that verifies a password, so a stored account omitted at startup could never
+    /// sign in. The login paths already read the account's durable record for lockout and
+    /// status checks; re-publishing that same record into the map here makes authentication
+    /// independent of the startup cap.
+    async fn hydrate_userpass_identity(&self, user: &User) {
+        self.userpass_method
+            .add_user(
+                user.username.clone(),
+                user.password_hash.clone(),
+                user.id.clone(),
+                user.roles.clone(),
+                user.policies.clone(),
+                user.permissions.clone(),
+                user.password_login_disabled,
+            )
+            .await;
+    }
+
     /// Look up a user by username, decrypting the stored record.
     ///
     /// `Ok(None)` means the record is absent; an error means it exists but could not be
@@ -2756,6 +2782,12 @@ impl AuthenticationService {
         // The bootstrap root identity cannot password-authenticate. Checked against the
         // loaded record so the boundary follows the account, and answered with the same
         // generic error a wrong password gets.
+        //
+        // Republish the durable record first: the capped startup hydration may have omitted
+        // this account, and `UserPassAuthMethod` is what verifies its password.
+        if let Some(ref u) = pre_auth_user {
+            self.hydrate_userpass_identity(u).await;
+        }
         if let Some(ref u) = pre_auth_user
             && u.password_login_disabled
         {
@@ -3136,6 +3168,84 @@ mod tests {
 
         let auth_service = AuthenticationService::new(storage, crypto, &config).await;
         assert!(auth_service.is_ok());
+    }
+
+    /// A user absent from the capped startup hydration must still authenticate: the login
+    /// path re-publishes the durable record, so the `USER_LOAD_MAX_ENTRIES` scan cannot
+    /// exclude a valid account from password verification.
+    #[tokio::test]
+    async fn a_user_omitted_by_startup_hydration_can_still_authenticate() {
+        use secreton_storage::{EncryptionMetadata, SecurityLevel};
+        use uuid::Uuid;
+
+        let (storage, service, _root_key) = auth_with_open_barrier().await;
+
+        // Hash a password and persist a user record directly, without going through
+        // `register_user` — that would publish the in-memory identity and mask the bug.
+        let password = crate::test_support::generated_password();
+        let password_hash = service
+            .userpass_method
+            .hash_password(&password)
+            .expect("hash");
+        let user = User {
+            id: Uuid::new_v4().to_string(),
+            username: "beyond-the-cap".to_string(),
+            email: None,
+            password_hash,
+            password_login_disabled: false,
+            full_name: None,
+            is_active: true,
+            is_superuser: false,
+            roles: vec!["user".to_string()],
+            permissions: vec![],
+            policies: vec!["default".to_string()],
+            enabled: true,
+            disabled: false,
+            display_name: None,
+            mfa_enabled: false,
+            mfa_secret: None,
+            last_login: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: HashMap::new(),
+            failed_login_attempts: 0,
+            locked_until: None,
+        };
+        let path = format!("{}{}", USER_STORAGE_PREFIX, user.username);
+        let encrypted = service
+            .crypto
+            .encrypt_data(&serde_json::to_vec(&user).unwrap())
+            .await
+            .unwrap();
+        let entry = SecretEntry::new(
+            path,
+            encrypted,
+            EncryptionMetadata::default(),
+            SecurityLevel::Secret,
+            Uuid::new_v4(),
+        );
+        storage.store(&entry).await.unwrap();
+
+        // The service was constructed before the account existed, so its startup hydration
+        // never saw it — exactly the state of an account beyond `USER_LOAD_MAX_ENTRIES` on a
+        // fresh process. The durable record is readable by path but absent from the in-memory
+        // password map. Without on-demand hydration the password cannot be verified.
+        let result = service
+            .authenticate(
+                crate::services::auth::LoginRequest {
+                    username: user.username.clone(),
+                    password: password.to_string(),
+                    mfa_code: None,
+                    remember_me: Some(false),
+                },
+                "127.0.0.1".to_string(),
+                "test".to_string(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a stored account absent from the in-memory map must still authenticate: {result:?}"
+        );
     }
 
     #[tokio::test]

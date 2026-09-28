@@ -193,11 +193,17 @@ impl CacheBackend for InMemoryCache {
     }
 }
 
-/// Cached storage wrapper that adds caching to any storage backend
+/// Cached storage wrapper that adds caching to any storage backend.
+///
+/// The inner backend and cache live behind `Arc` so a transaction opened by this wrapper can
+/// hold a handle to both and reconcile the cache when it commits. `S` and `C` are cloneable
+/// (`MemoryBackend` clones share state; cache handles clone their map), so an alternative
+/// would be to clone them, but an `Arc` makes clear that the transaction and the wrapper
+/// address the same store and the same cache.
 #[derive(Debug)]
-pub struct CachedStorage<S: crate::StorageBackend, C: CacheBackend> {
-    storage: S,
-    cache: C,
+pub struct CachedStorage<S: crate::StorageBackend + 'static, C: CacheBackend + 'static> {
+    storage: std::sync::Arc<S>,
+    cache: std::sync::Arc<C>,
     default_ttl: Duration,
 }
 
@@ -208,8 +214,8 @@ where
 {
     pub fn new(storage: S, cache: C, default_ttl: Duration) -> Self {
         Self {
-            storage,
-            cache,
+            storage: std::sync::Arc::new(storage),
+            cache: std::sync::Arc::new(cache),
             default_ttl,
         }
     }
@@ -297,6 +303,132 @@ where
                 .delete(&Self::cache_key_for_id(previous.id))
                 .await;
         }
+    }
+}
+
+/// A transaction that keeps the cache coherent with what the wrapped transaction commits.
+///
+/// [`CachedStorage::begin_transaction`] previously returned the inner transaction directly,
+/// so a committed write or delete never touched the cache. A delete committed through a
+/// transaction left the path and id keys holding the record, and `get_by_path`/`get_by_id`
+/// kept serving a secret the backend had removed until its TTL expired — a deleted secret
+/// still readable. A store committed through a transaction left the pre-transaction record
+/// cached under the path key.
+///
+/// The wrapper exists because the cache wrapper's own surface (`store`/`delete_by_path`/…)
+/// is bypassed entirely by a transaction: the caller drives the inner transaction, so the
+/// reconciliation has to happen inside the commit. It records which paths and ids the
+/// transaction touched, then, only after the inner commit has succeeded, re-reads each
+/// touched path from the backend and caches the canonical record (or clears the key when
+/// the record is gone). A staged write that has not committed is deliberately invisible,
+/// because a rolled-back transaction must publish nothing.
+#[derive(Debug)]
+struct CachedTransaction<S, C>
+where
+    S: crate::StorageBackend,
+    C: CacheBackend,
+{
+    storage: std::sync::Arc<S>,
+    cache: std::sync::Arc<C>,
+    default_ttl: Duration,
+    inner: Box<dyn crate::StorageTransaction>,
+    /// Paths the transaction wrote or deleted from, plus the ids it wrote or removed.
+    touched_paths: Vec<String>,
+    touched_ids: Vec<Uuid>,
+}
+
+#[async_trait]
+impl<S, C> crate::StorageTransaction for CachedTransaction<S, C>
+where
+    S: crate::StorageBackend + 'static,
+    C: CacheBackend + 'static,
+{
+    async fn store(&mut self, entry: &SecretEntry) -> StorageResult<()> {
+        self.inner.store(entry).await?;
+        self.touched_paths.push(entry.path.clone());
+        self.touched_ids.push(entry.id);
+        Ok(())
+    }
+
+    async fn update(&mut self, entry: &SecretEntry) -> StorageResult<()> {
+        self.inner.update(entry).await?;
+        self.touched_paths.push(entry.path.clone());
+        self.touched_ids.push(entry.id);
+        Ok(())
+    }
+
+    async fn delete(&mut self, id: Uuid) -> StorageResult<bool> {
+        // Resolve the path *before* the delete. The record is what populated the path key,
+        // and after the commit it may already be gone, so it cannot be recovered then.
+        let previous = match self
+            .cache
+            .get(&CachedStorage::<S, C>::cache_key_for_id(id))
+            .await
+        {
+            Ok(Some(bytes)) => postcard::from_bytes::<SecretEntry>(&bytes).ok(),
+            _ => None,
+        }
+        .or(self.storage.get_by_id(id).await.unwrap_or_default());
+        let removed = self.inner.delete(id).await?;
+        if let Some(entry) = previous {
+            self.touched_paths.push(entry.path);
+        }
+        self.touched_ids.push(id);
+        Ok(removed)
+    }
+
+    async fn commit(self: Box<Self>) -> StorageResult<()> {
+        let CachedTransaction {
+            storage,
+            cache,
+            default_ttl,
+            touched_paths,
+            touched_ids,
+            inner,
+        } = *self;
+
+        // The inner transaction publishes everything or nothing; the cache is reconciled
+        // only once it has actually committed.
+        inner.commit().await?;
+
+        for path in &touched_paths {
+            let key = CachedStorage::<S, C>::cache_key_for_path(path);
+            match storage.get_by_path(path).await {
+                Ok(Some(canonical)) => {
+                    let serialized = postcard::to_stdvec(&canonical).unwrap_or_default();
+                    let _ = cache
+                        .set(
+                            &CachedStorage::<S, C>::cache_key_for_id(canonical.id),
+                            serialized.clone(),
+                            Some(default_ttl),
+                        )
+                        .await;
+                    let _ = cache.set(&key, serialized, Some(default_ttl)).await;
+                }
+                // Absent, or unreadable: clear the key so the next read misses and goes to
+                // the backend rather than serving a record that may have been removed.
+                Ok(None) | Err(_) => {
+                    let _ = cache.delete(&key).await;
+                }
+            }
+        }
+        for id in &touched_ids {
+            // A record still present (a write, possibly under a different path) has already
+            // had its id key refreshed above; a removed or superseded id has not.
+            if storage.get_by_id(*id).await.ok().flatten().is_none() {
+                let _ = cache
+                    .delete(&CachedStorage::<S, C>::cache_key_for_id(*id))
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn rollback(self: Box<Self>) -> StorageResult<()> {
+        // Nothing committed, so nothing was published to the cache; the inner transaction
+        // discards its buffer.
+        let CachedTransaction { inner, .. } = *self;
+        inner.rollback().await
     }
 }
 
@@ -497,19 +629,22 @@ where
             // Read back the canonical record. If the read fails or the record is
             // unexpectedly absent, do not cache the input: a stale or wrong cached identity
             // is worse than a cache miss, which the next read repairs.
-            let canonical = match self.storage.get_by_path(&entry.path).await {
-                Ok(canonical) => canonical,
-                Err(e) => {
-                    // The write landed; only the readback failed. Retire the keys it would
-                    // have refreshed so a later read cannot serve the pre-write record, then
-                    // report the readback failure without pretending the write did not happen.
+            match self.storage.get_by_path(&entry.path).await {
+                Ok(canonical) => {
+                    self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
+                        .await;
+                }
+                Err(_) => {
+                    // The write landed; only the immediate readback failed. The cache is
+                    // retired so a later read cannot serve the pre-write record, but the
+                    // result stays `Ok(true)`: the conditional write committed, and reporting
+                    // an error here would tell the caller a durable write failed. Registration
+                    // would refuse an account that exists, and initialization would leave its
+                    // lease held until expiry, both over a read that the next request repeats.
                     self.invalidate_after_failed_readback(&entry.path, previous.as_ref())
                         .await;
-                    return Err(e);
                 }
-            };
-            self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
-                .await;
+            }
         } else {
             // The inner write did not happen. A stale positive cache entry for this path
             // would make a subsequent read report a record the backend may not have — and
@@ -560,24 +695,36 @@ where
         let previous = self.storage.get_by_path(&entry.path).await.ok().flatten();
         let written = self.storage.store_fenced(entry, fence).await?;
         if written {
-            let canonical = match self.storage.get_by_path(&entry.path).await {
-                Ok(canonical) => canonical,
-                Err(e) => {
-                    // Same contract as `compare_and_set`: the write committed, only the
-                    // readback failed. Invalidate the cached keys so no later read reports
-                    // the superseded record, and surface the readback error unchanged.
+            match self.storage.get_by_path(&entry.path).await {
+                Ok(canonical) => {
+                    self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
+                        .await;
+                }
+                Err(_) => {
+                    // Same contract as `compare_and_set`: the fenced write committed, only the
+                    // readback failed. Retire the cached keys so no later read reports the
+                    // superseded record, but keep the success result — the write is durable,
+                    // and turning the readback failure into an error would report it as lost.
                     self.invalidate_after_failed_readback(&entry.path, previous.as_ref())
                         .await;
-                    return Err(e);
                 }
-            };
-            self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
-                .await;
+            }
         } else {
+            // The fence did not hold, so nothing was written. Clear both the path key and the
+            // id the path previously resolved to: another writer that took the fence can have
+            // replaced the record under a new id, and the old id key would otherwise keep
+            // serving the displaced record through `get_by_id` until its TTL expires. This is
+            // the same two-key retirement `compare_and_set` does on a lost race.
             let _ = self
                 .cache
                 .delete(&Self::cache_key_for_path(&entry.path))
                 .await;
+            if let Some(previous) = previous.as_ref() {
+                let _ = self
+                    .cache
+                    .delete(&Self::cache_key_for_id(previous.id))
+                    .await;
+            }
         }
         Ok(written)
     }
@@ -607,7 +754,18 @@ where
     }
 
     async fn begin_transaction(&self) -> StorageResult<Box<dyn crate::StorageTransaction>> {
-        self.storage.begin_transaction().await
+        // Wrap the backend transaction so the cache is reconciled when it commits. Returning
+        // the inner transaction directly is what let a committed delete leave a cached secret
+        // readable.
+        let inner = self.storage.begin_transaction().await?;
+        Ok(Box::new(CachedTransaction {
+            storage: std::sync::Arc::clone(&self.storage),
+            cache: std::sync::Arc::clone(&self.cache),
+            default_ttl: self.default_ttl,
+            inner,
+            touched_paths: Vec::new(),
+            touched_ids: Vec::new(),
+        }))
     }
 
     async fn health_check(&self) -> StorageResult<crate::HealthStatus> {
@@ -1119,6 +1277,10 @@ mod round_trip_tests {
         // the path key. A later `get_by_path` then served that superseded value from cache
         // rather than reporting the record the backend actually holds.
         //
+        // The readback failure also must not turn the committed write into a reported error:
+        // the caller would refuse an account that exists or hold an initialization lease it
+        // had already released. So the call is `Ok(true)`.
+        //
         // The property: once the conditional write has committed, a cached read must never
         // return the pre-write record — the failed readback invalidates the key, so the next
         // read misses and re-reads the canonical record.
@@ -1147,8 +1309,8 @@ mod round_trip_tests {
         let result =
             crate::StorageBackend::compare_and_set(&cached, &replacement, crate::Expect::Any).await;
         assert!(
-            result.is_err(),
-            "the canonical readback failed, so the call must report an error"
+            result.expect("the committed write must still be reported as success"),
+            "the conditional write committed, so the readback failure must not turn it into a failure"
         );
 
         let read = crate::StorageBackend::get_by_path(&cached, path)
@@ -1210,8 +1372,8 @@ mod round_trip_tests {
         )
         .await;
         assert!(
-            result.is_err(),
-            "the canonical readback failed, so the call must report an error"
+            result.expect("the committed fenced write must still be reported as success"),
+            "the fenced write committed, so the readback failure must not turn it into a failure"
         );
 
         let read = crate::StorageBackend::get_by_path(&cached, path)
@@ -1290,6 +1452,161 @@ mod round_trip_tests {
                 .expect("cached read")
                 .is_some(),
             "the new id must be readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_commit_retires_the_cached_deleted_secret() {
+        // Regression: `begin_transaction` returned the inner backend's transaction, so a
+        // delete committed through it never touched the cache. The path and id keys kept the
+        // record, and `get_by_path`/`get_by_id` served a secret the backend had removed until
+        // the TTL expired — a deleted secret still readable.
+        //
+        // The property: after a transaction delete commits, neither a path nor an id read
+        // returns the removed record.
+        let backend = crate::backends::MemoryBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let path = "kv/tx/delete-me";
+
+        let entry = sample_entry_with_path(path, b"payload");
+        let id = entry.id;
+        crate::StorageBackend::store(&cached, &entry)
+            .await
+            .expect("seed");
+        // Warm both keys, so a stale hit is what the test observes.
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, path)
+                .await
+                .expect("warm path")
+                .is_some()
+        );
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, id)
+                .await
+                .expect("warm id")
+                .is_some()
+        );
+
+        let mut tx = crate::StorageBackend::begin_transaction(&cached)
+            .await
+            .expect("begin");
+        tx.delete(id).await.expect("stage delete");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, path)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "a committed transaction delete must not leave the secret readable by path"
+        );
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, id)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "a committed transaction delete must not leave the secret readable by id"
+        );
+        // The same must hold against the backend itself, so the cache is not masking a real
+        // failure to delete.
+        assert!(
+            crate::StorageBackend::get_by_path(&backend, path)
+                .await
+                .expect("backend read")
+                .is_none(),
+            "the backend must have removed the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_rollback_leaves_the_cache_alone() {
+        // The mirror of the previous test: nothing was committed, so the cache must keep
+        // serving the record that is still there. A rollback that invalidated the cache would
+        // just be a spurious miss, but one that *replaced* a stale cached value with nothing
+        // would hide a live record.
+        let backend = crate::backends::MemoryBackend::new();
+        let cached = CachedStorage::new(backend, InMemoryCache::new(), Duration::from_secs(300));
+        let path = "kv/tx/rolled-back";
+
+        let entry = sample_entry_with_path(path, b"payload");
+        let id = entry.id;
+        crate::StorageBackend::store(&cached, &entry)
+            .await
+            .expect("seed");
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, path)
+                .await
+                .expect("warm")
+                .is_some()
+        );
+
+        let mut tx = crate::StorageBackend::begin_transaction(&cached)
+            .await
+            .expect("begin");
+        tx.delete(id).await.expect("stage delete");
+        tx.rollback().await.expect("rollback");
+
+        let read = crate::StorageBackend::get_by_path(&cached, path)
+            .await
+            .expect("cached read")
+            .expect("a rolled-back transaction must leave the record readable");
+        assert_eq!(read.id, id);
+    }
+
+    #[tokio::test]
+    async fn a_transaction_store_refreshes_the_cached_path() {
+        // Regression: a store committed through a transaction left the pre-transaction record
+        // cached under the path key, so a later cached read served the superseded payload.
+        let backend = crate::backends::MemoryBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let path = "kv/tx/rewrite";
+
+        let seeded = sample_entry_with_path(path, b"v1");
+        crate::StorageBackend::store(&cached, &seeded)
+            .await
+            .expect("seed");
+        assert_eq!(
+            crate::StorageBackend::get_by_path(&cached, path)
+                .await
+                .expect("warm")
+                .expect("seeded")
+                .encrypted_data,
+            b"v1"
+        );
+
+        // The transaction stages a replacement carrying a fresh id, as the backends keep the
+        // existing id only for `compare_and_set`/`store_fenced`; a plain transaction store
+        // writes the caller's record.
+        let replacement = sample_entry_with_path(path, b"v2");
+        let mut tx = crate::StorageBackend::begin_transaction(&cached)
+            .await
+            .expect("begin");
+        tx.store(&replacement).await.expect("stage store");
+        tx.commit().await.expect("commit");
+
+        let cached_read = crate::StorageBackend::get_by_path(&cached, path)
+            .await
+            .expect("cached read")
+            .expect("present");
+        let direct_read = crate::StorageBackend::get_by_path(&backend, path)
+            .await
+            .expect("direct read")
+            .expect("present");
+        assert_eq!(
+            cached_read.encrypted_data, b"v2",
+            "the cache must serve the committed transaction write, not the superseded record"
+        );
+        assert_eq!(
+            cached_read.id, direct_read.id,
+            "the cached identity must match what the backend holds after a transaction store"
         );
     }
 }
