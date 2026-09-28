@@ -280,6 +280,24 @@ where
             }
         }
     }
+
+    /// Retire the cached keys a conditional write's canonical readback would have refreshed.
+    ///
+    /// A conditional write has already committed at this point — the caller's error is only
+    /// that the immediate readback failed, not that the write did not land. If the cache is
+    /// left untouched, the pre-write record survives under the path key and later reads serve
+    /// it until the TTL expires, reporting a value the backend no longer holds. Invalidating
+    /// both keys here converts that silent staleness into a cache miss that the next read
+    /// repairs from the backend.
+    async fn invalidate_after_failed_readback(&self, path: &str, previous: Option<&SecretEntry>) {
+        let _ = self.cache.delete(&Self::cache_key_for_path(path)).await;
+        if let Some(previous) = previous {
+            let _ = self
+                .cache
+                .delete(&Self::cache_key_for_id(previous.id))
+                .await;
+        }
+    }
 }
 
 #[async_trait]
@@ -479,7 +497,17 @@ where
             // Read back the canonical record. If the read fails or the record is
             // unexpectedly absent, do not cache the input: a stale or wrong cached identity
             // is worse than a cache miss, which the next read repairs.
-            let canonical = self.storage.get_by_path(&entry.path).await?;
+            let canonical = match self.storage.get_by_path(&entry.path).await {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    // The write landed; only the readback failed. Retire the keys it would
+                    // have refreshed so a later read cannot serve the pre-write record, then
+                    // report the readback failure without pretending the write did not happen.
+                    self.invalidate_after_failed_readback(&entry.path, previous.as_ref())
+                        .await;
+                    return Err(e);
+                }
+            };
             self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
                 .await;
         } else {
@@ -522,7 +550,17 @@ where
         let previous = self.storage.get_by_path(&entry.path).await.ok().flatten();
         let written = self.storage.store_fenced(entry, fence).await?;
         if written {
-            let canonical = self.storage.get_by_path(&entry.path).await?;
+            let canonical = match self.storage.get_by_path(&entry.path).await {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    // Same contract as `compare_and_set`: the write committed, only the
+                    // readback failed. Invalidate the cached keys so no later read reports
+                    // the superseded record, and surface the readback error unchanged.
+                    self.invalidate_after_failed_readback(&entry.path, previous.as_ref())
+                        .await;
+                    return Err(e);
+                }
+            };
             self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
                 .await;
         } else {
@@ -953,6 +991,164 @@ mod round_trip_tests {
         async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
             self.inner.delete_expired_oauth_states().await
         }
+    }
+
+    /// A backend whose `compare_and_set` commits, then makes the *next* `get_by_path` fail,
+    /// so the cache wrapper's canonical readback cannot complete. Reproduces a transient
+    /// backend read fault immediately after a successful conditional write.
+    #[derive(Debug)]
+    struct ReadbackFailsAfterConditionalWriteBackend {
+        inner: crate::backends::MemoryBackend,
+        fail_next_get_by_path: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::StorageBackend for ReadbackFailsAfterConditionalWriteBackend {
+        async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.store(entry).await
+        }
+        async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_id(id).await
+        }
+        async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            if self
+                .fail_next_get_by_path
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::StorageError::BackendError {
+                    backend: "test".to_string(),
+                    message: "transient readback failure".to_string(),
+                });
+            }
+            self.inner.get_by_path(path).await
+        }
+        async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.update(entry).await
+        }
+        async fn upsert(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.upsert(entry).await
+        }
+        async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+            self.inner.delete_by_id(id).await
+        }
+        async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            self.inner.delete_by_path(path).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: crate::Expect<'_>,
+        ) -> StorageResult<bool> {
+            let written = self.inner.compare_and_set(entry, expect).await?;
+            if written {
+                self.fail_next_get_by_path
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(written)
+        }
+        async fn store_fenced(
+            &self,
+            entry: &SecretEntry,
+            fence: crate::StorageFence<'_>,
+        ) -> StorageResult<bool> {
+            let written = self.inner.store_fenced(entry, fence).await?;
+            if written {
+                self.fail_next_get_by_path
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(written)
+        }
+        async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
+            self.inner.delete_owned(path, token).await
+        }
+        async fn list(&self, params: &crate::QueryParams) -> StorageResult<Vec<SecretEntry>> {
+            self.inner.list(params).await
+        }
+        async fn count(&self, params: &crate::QueryParams) -> StorageResult<u64> {
+            self.inner.count(params).await
+        }
+        async fn exists(&self, path: &str) -> StorageResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn begin_transaction(&self) -> StorageResult<Box<dyn crate::StorageTransaction>> {
+            self.inner.begin_transaction().await
+        }
+        async fn health_check(&self) -> StorageResult<crate::HealthStatus> {
+            self.inner.health_check().await
+        }
+        async fn get_stats(&self) -> StorageResult<crate::StorageStats> {
+            self.inner.get_stats().await
+        }
+        async fn migrate(&self) -> StorageResult<()> {
+            self.inner.migrate().await
+        }
+        async fn delete_expired(&self, path_prefix: Option<String>) -> StorageResult<u64> {
+            self.inner.delete_expired(path_prefix).await
+        }
+        async fn store_oauth_state(
+            &self,
+            state: &secreton_domain::OAuthState,
+        ) -> StorageResult<()> {
+            self.inner.store_oauth_state(state).await
+        }
+        async fn get_oauth_state(
+            &self,
+            state: &str,
+        ) -> StorageResult<Option<secreton_domain::OAuthState>> {
+            self.inner.get_oauth_state(state).await
+        }
+        async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
+            self.inner.delete_expired_oauth_states().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_readback_after_a_conditional_write_does_not_serve_the_stale_record() {
+        // Regression: after `compare_and_set` succeeded but its canonical readback failed,
+        // the wrapper returned early on the `?` and left the pre-write record cached under
+        // the path key. A later `get_by_path` then served that superseded value from cache
+        // rather than reporting the record the backend actually holds.
+        //
+        // The property: once the conditional write has committed, a cached read must never
+        // return the pre-write record — the failed readback invalidates the key, so the next
+        // read misses and re-reads the canonical record.
+        let backend = ReadbackFailsAfterConditionalWriteBackend {
+            inner: crate::backends::MemoryBackend::new(),
+            fail_next_get_by_path: std::sync::atomic::AtomicBool::new(false),
+        };
+        let cached = CachedStorage::new(backend, InMemoryCache::new(), Duration::from_secs(300));
+        let path = "kv/readback/target";
+
+        let seeded = sample_entry_with_path(path, b"v1");
+        crate::StorageBackend::store(&cached, &seeded)
+            .await
+            .expect("seed");
+        // Warm the cache under the path so the stale entry exists to be served.
+        assert_eq!(
+            crate::StorageBackend::get_by_path(&cached, path)
+                .await
+                .expect("warm the cache")
+                .expect("seeded")
+                .encrypted_data,
+            b"v1"
+        );
+
+        let replacement = sample_entry_with_path(path, b"v2");
+        let result =
+            crate::StorageBackend::compare_and_set(&cached, &replacement, crate::Expect::Any).await;
+        assert!(
+            result.is_err(),
+            "the canonical readback failed, so the call must report an error"
+        );
+
+        let read = crate::StorageBackend::get_by_path(&cached, path)
+            .await
+            .expect("cached read")
+            .expect("the committed record is present");
+        assert_eq!(
+            read.encrypted_data, b"v2",
+            "the cache must not keep serving the pre-write record after a committed write"
+        );
     }
 
     #[tokio::test]

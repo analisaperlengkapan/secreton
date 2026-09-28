@@ -61,6 +61,19 @@ impl AuditLogger {
                 action,
                 None,
             ),
+            SecurityEventType::SecretAccessDenied {
+                secret_path,
+                user,
+                action,
+                reason,
+            } => (
+                CoreAuditEventType::Custom(format!("secret.{}", action.to_lowercase())),
+                AuditStatus::Denied,
+                user,
+                secret_path,
+                action,
+                Some(vec![("reason".to_string(), reason)].into_iter().collect()),
+            ),
             SecurityEventType::SecretCreation { secret_path, user } => (
                 CoreAuditEventType::SecretWrite,
                 AuditStatus::Success,
@@ -413,6 +426,18 @@ pub enum SecurityEventType {
         secret_path: String,
         user: String,
         action: String,
+    },
+    /// A secret operation the API refused before touching storage.
+    ///
+    /// The rejection paths that never reach the storage layer — an attempt to write or
+    /// delete a seal initialization artifact through the secret API, for instance — would
+    /// otherwise leave no trace at all, so they are recorded here rather than only returned
+    /// to the caller.
+    SecretAccessDenied {
+        secret_path: String,
+        user: String,
+        action: String,
+        reason: String,
     },
     SecretCreation {
         secret_path: String,

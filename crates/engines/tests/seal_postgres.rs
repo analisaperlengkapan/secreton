@@ -638,7 +638,23 @@ impl StorageBackend for NamespacedBackend {
     ) -> secreton_storage::StorageResult<bool> {
         let mut scoped = entry.clone();
         scoped.path = self.scope(&entry.path);
-        self.inner.compare_and_set(&scoped, expect).await
+        // `AbsentFenced` carries a fence path of its own — the initialization lease — and the
+        // caller names it with its unscoped path, exactly as `store_fenced` above does. It
+        // must be re-scoped too: an unscoped fence makes the backend look for the lease
+        // outside this namespace, find nothing, and report a lost lease, failing a root
+        // account write by an initialization that still holds it.
+        let scoped_fence_path;
+        let scoped_expect = match expect {
+            secreton_storage::Expect::AbsentFenced(fence) => {
+                scoped_fence_path = self.scope(fence.path);
+                secreton_storage::Expect::AbsentFenced(secreton_storage::StorageFence::new(
+                    &scoped_fence_path,
+                    fence.token,
+                ))
+            }
+            other => other,
+        };
+        self.inner.compare_and_set(&scoped, scoped_expect).await
     }
 
     async fn delete_owned(&self, path: &str, token: &str) -> secreton_storage::StorageResult<bool> {

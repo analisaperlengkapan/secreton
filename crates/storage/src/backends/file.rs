@@ -921,4 +921,70 @@ mod tests {
             "the sweep orders by earliest expiry, so the listing must be sorted by it"
         );
     }
+
+    /// Regression: `delete_owned` removed only the newest record the path resolved to, so a
+    /// superseded owned record at the same path became readable again after the delete
+    /// reported success. The property: after `delete_owned(path, token)` returns, no record
+    /// of that attempt is readable at the path, and a record of another owner is untouched.
+    #[tokio::test]
+    async fn delete_owned_never_revives_a_superseded_owned_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let backend = FileBackend::new(dir.path().to_str().expect("utf8 path")).expect("backend");
+        let path = "sys/init_staging";
+
+        // Two records at one path under the same owner, then a newer id. `get_by_path`
+        // resolves the newest; the older file is superseded but still on disk.
+        let id1 = Uuid::new_v4();
+        let mut first = entry_at(id1, path, b"first").owned_by("attempt-a");
+        first.updated_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        backend.store(&first).await.expect("store first");
+
+        let id2 = Uuid::new_v4();
+        backend
+            .store(&entry_at(id2, path, b"second").owned_by("attempt-a"))
+            .await
+            .expect("store second");
+
+        // A different attempt's record must survive the cleanup.
+        let other = "sys/init";
+        backend
+            .store(&entry_at(Uuid::new_v4(), other, b"other").owned_by("attempt-b"))
+            .await
+            .expect("store other owner");
+
+        assert!(
+            backend
+                .delete_owned(path, "attempt-a")
+                .await
+                .expect("delete owned"),
+            "the path held owned records, so the delete must report removal"
+        );
+
+        assert!(
+            backend
+                .get_by_path(path)
+                .await
+                .expect("read after delete")
+                .is_none(),
+            "deleting the owned path must not leave a superseded owned record readable"
+        );
+        assert!(
+            backend.get_by_id(id1).await.expect("read id1").is_none(),
+            "the superseded owned record must be gone"
+        );
+        assert!(
+            backend.get_by_id(id2).await.expect("read id2").is_none(),
+            "the newest owned record must be gone"
+        );
+        assert_eq!(
+            backend
+                .get_by_path(other)
+                .await
+                .expect("read other owner")
+                .expect("the other attempt's record must remain")
+                .owner_token(),
+            Some("attempt-b"),
+            "cleanup must not delete another attempt's artifact"
+        );
+    }
 }
