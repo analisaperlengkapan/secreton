@@ -220,9 +220,19 @@ impl StorageTransaction for RedisTransaction {
         let mut args: Vec<String> = Vec::with_capacity(1 + self.operations.len() * 5);
         args.push(self.operations.len().to_string());
 
+        // Paths written earlier in this same operation list. A delete's mapping key cannot
+        // be discovered by reading Redis: the store it follows is still staged, so the
+        // backend read finds no entry and the delete would be handed the sentinel key. The
+        // script would then remove the record but not the mapping the staged write
+        // established, leaving `exists` true over a path whose record is gone. Resolving
+        // against the staged writes closes that, and keeps every key declared to Redis.
+        let mut staged_paths: std::collections::HashMap<Uuid, String> =
+            std::collections::HashMap::new();
+
         for op in &self.operations {
             match op {
                 RedisTransactionOp::Store(entry) | RedisTransactionOp::Update(entry) => {
+                    staged_paths.insert(entry.id, entry.path.clone());
                     let value = serde_json::to_string(entry).map_err(|e| {
                         StorageError::SerializationError {
                             message: e.to_string(),
@@ -245,21 +255,32 @@ impl StorageTransaction for RedisTransaction {
                 }
                 RedisTransactionOp::Delete(id) => {
                     // The mapping key cannot be derived from the id alone — Redis has no
-                    // index from entry to path — so read the entry to learn its path. The
-                    // read is safe to do before the script: the script only uses it as a
-                    // hint and re-checks the mapping against the id before removing it.
+                    // index from entry to path — so learn the path from the staged writes
+                    // first, then from committed storage. The read is safe to do before the
+                    // script: the script only uses it as a hint and re-checks the mapping
+                    // against the id before removing it. A delete with no path at all (the
+                    // record never existed and was never staged) can only have come from the
+                    // sentinel, which the script never treats as a mapping.
                     let entry_key = format!("secreton:entry:{}", id);
-                    let stored: Option<String> =
-                        conn.get(&entry_key)
-                            .await
-                            .map_err(|e| StorageError::QueryFailed {
-                                message: format!("Failed to read entry for transaction: {}", e),
-                            })?;
-                    let path = stored
-                        .as_deref()
-                        .and_then(|json| serde_json::from_str::<SecretEntry>(json).ok())
-                        .map(|entry| entry.path)
-                        .unwrap_or_default();
+                    let path = match staged_paths.get(id) {
+                        Some(path) => path.clone(),
+                        None => {
+                            let stored: Option<String> =
+                                conn.get(&entry_key).await.map_err(|e| {
+                                    StorageError::QueryFailed {
+                                        message: format!(
+                                            "Failed to read entry for transaction: {}",
+                                            e
+                                        ),
+                                    }
+                                })?;
+                            stored
+                                .as_deref()
+                                .and_then(|json| serde_json::from_str::<SecretEntry>(json).ok())
+                                .map(|entry| entry.path)
+                                .unwrap_or_default()
+                        }
+                    };
                     keys.push(Self::path_key_for(&path));
                     keys.push(entry_key);
                     args.push("delete".to_string());
@@ -1620,6 +1641,57 @@ mod tests {
             backend.count(&scoped()).await.expect("count"),
             2,
             "only the replacement and the fresh store remain in this namespace"
+        );
+    }
+
+    /// Storing a record and then deleting that same id within one transaction must leave
+    /// nothing behind — in particular not the path mapping the store installed.
+    ///
+    /// The delete's mapping key cannot be found by reading Redis before the commit: the
+    /// store it follows is still staged, so the read finds no record and the delete was
+    /// handed the sentinel key. The script then removed the entry but not the mapping, so
+    /// `exists` reported a path whose record was gone.
+    #[tokio::test]
+    async fn a_transaction_that_stores_then_deletes_the_same_record_leaves_no_phantom_path() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/contract/transaction-store-then-delete");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let entry = entry_at(&path, b"staged-then-deleted");
+        let id = entry.id;
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&entry).await.expect("stage store");
+        tx.delete(id).await.expect("stage delete");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            backend.get_by_id(id).await.expect("by id").is_none(),
+            "the deleted record must be gone"
+        );
+        assert!(
+            backend
+                .get_by_path(&path)
+                .await
+                .expect("read by path")
+                .is_none(),
+            "the path must not resolve after its record was deleted"
+        );
+        assert!(
+            !backend.exists(&path).await.expect("exists"),
+            "the mapping the staged write installed must not survive the delete"
+        );
+        let mapping: Option<String> = {
+            let mut conn = backend.manager.lock().await;
+            conn.get(format!("secreton:path:{}", path))
+                .await
+                .expect("read mapping")
+        };
+        assert!(
+            mapping.is_none(),
+            "no orphaned mapping may remain for a record deleted in the same transaction"
         );
     }
 

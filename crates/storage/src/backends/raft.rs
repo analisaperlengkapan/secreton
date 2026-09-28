@@ -233,6 +233,45 @@ impl RaftStateMachine {
             .cloned()
     }
 
+    /// Replace the record at `entry.path`, preserving the existing record's id and
+    /// creation time. Condition the write on `expect` in the same step.
+    ///
+    /// Returns `Ok(true)` when the write happened, `Ok(false)` when the precondition did
+    /// not hold. Only `Absent`, `Owner` and `Any` are evaluable here; the caller rejects
+    /// the fenced variant before reaching this.
+    pub fn compare_and_set(
+        &mut self,
+        mut entry: SecretEntry,
+        expect: crate::Expect<'_>,
+    ) -> StorageResult<bool> {
+        let path = entry.path.clone();
+
+        let existing = self.data.get(&path).cloned();
+
+        let precondition_holds = match expect {
+            crate::Expect::Absent => existing.is_none(),
+            crate::Expect::Owner(token) => existing.as_ref().is_some_and(|e| e.has_owner(token)),
+            crate::Expect::Any => true,
+            crate::Expect::AbsentFenced(_) => false,
+        };
+        if !precondition_holds {
+            return Ok(false);
+        }
+
+        // Preserve the identity and creation time of the record already at the path, the
+        // same normalization the other backends perform: a compare-and-set is a
+        // replacement, not a new record. Because the id is preserved the id index already
+        // points at this path, so it needs no repointing.
+        if let Some(previous) = &existing {
+            entry.id = previous.id;
+            entry.created_at = previous.created_at;
+        }
+        self.id_index.insert(entry.id, path.clone());
+        self.data.insert(path, entry);
+        self.update_stats();
+        Ok(true)
+    }
+
     /// List entries matching query parameters
     pub fn list(&self, params: &QueryParams) -> Vec<SecretEntry> {
         let mut results: Vec<SecretEntry> = self
@@ -558,20 +597,43 @@ impl StorageBackend for RaftStorageBackend {
         Coordination::SingleProcess
     }
 
-    /// Refused rather than faked.
+    /// Atomic within this process's state machine.
     ///
-    /// The state machine is process-local and the trait's default already refuses, but it
-    /// is restated here so the refusal is tied to the reason: a compare-and-set that could
-    /// not exclude another replica would be a lock that does not lock.
+    /// This backend reports [`Coordination::SingleProcess`] and its "cluster" is one
+    /// in-process map, so there is no second replica to arbitrate against. It can still
+    /// make a compare-and-set indivisible against concurrent tasks in *this* process, by
+    /// evaluating the precondition and applying the write under the one state-machine write
+    /// lock, which is the whole guarantee a single-process backend can offer. Refusing it
+    /// outright was wrong in the other direction: the bootstrap root account is created
+    /// with `compare_and_set(Absent)` even on a single-process backend, so a fresh Raft
+    /// vault could not initialize at all — every root write returned `Unsupported` and the
+    /// initialization rolled back instead of returning shares.
+    ///
+    /// The fenced variant stays refused: there is no shared lease record for a fence to
+    /// name, and a `store_fenced` here would only check this process's own memory. That is
+    /// the fake-lock failure mode, and a caller that needs a cross-process lease must see
+    /// the refusal rather than a success it cannot rely on.
     async fn compare_and_set(
         &self,
-        _entry: &SecretEntry,
-        _expect: crate::Expect<'_>,
+        entry: &SecretEntry,
+        expect: crate::Expect<'_>,
     ) -> StorageResult<bool> {
-        Err(StorageError::Unsupported {
-            operation: "compare_and_set".to_string(),
-            backend: "raft".to_string(),
-        })
+        if matches!(expect, crate::Expect::AbsentFenced(_)) {
+            return Err(StorageError::Unsupported {
+                operation: "compare_and_set with a fence".to_string(),
+                backend: "raft".to_string(),
+            });
+        }
+
+        let mut state = self
+            .state_machine
+            .write()
+            .map_err(|e| StorageError::BackendError {
+                backend: "raft".to_string(),
+                message: format!("State lock error: {}", e),
+            })?;
+
+        state.compare_and_set(entry.clone(), expect)
     }
 
     /// Refused rather than faked, for the same reason as [`Self::compare_and_set`].

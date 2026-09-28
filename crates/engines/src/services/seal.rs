@@ -369,6 +369,21 @@ struct InitStaging {
     root_username: String,
     /// Set once the root account exists, so cleanup can find its TOTP enrollment by path.
     root_entity_id: Option<String>,
+    /// Whether *this* attempt created the root account at `root_username`.
+    ///
+    /// Registration is an insert-if-absent, so a rejected write — the username is already
+    /// taken — leaves this attempt owning nothing at that path, and the record there belongs
+    /// to a pre-existing account that cleanup must never delete. Only the writer knows which
+    /// case it is; a cleanup that guessed from the username would delete an ordinary account,
+    /// and one that skipped the removal whenever the account survived would strand the marker
+    /// and make every later initialization fail on recovery.
+    ///
+    /// `None` is a marker written before this field existed, where the attempt recorded a
+    /// `root_entity_id` only after the account was created — so an absent field means the
+    /// account was this attempt's, and cleanup should treat it as such rather than strand a
+    /// legacy partial attempt's record.
+    #[serde(default)]
+    root_account_created: Option<bool>,
     /// Set once every durable artifact is stored and the marker is the only thing left.
     ///
     /// Its purpose is to stop a retry from destroying a vault that actually committed:
@@ -870,6 +885,7 @@ impl SealService {
             &InitStaging {
                 root_username: root_username.to_string(),
                 root_entity_id: None,
+                root_account_created: Some(false),
                 committed: false,
                 owner: Some(lease_token.to_string()),
             },
@@ -982,6 +998,7 @@ impl SealService {
                     &InitStaging {
                         root_username: identity.username.clone(),
                         root_entity_id: Some(identity.id.clone()),
+                        root_account_created: Some(true),
                         committed: false,
                         owner: Some(lease_token.to_string()),
                     },
@@ -1050,6 +1067,7 @@ impl SealService {
             &InitStaging {
                 root_username: root_identity.username.clone(),
                 root_entity_id: Some(root_identity.id.clone()),
+                root_account_created: Some(true),
                 committed: true,
                 owner: Some(lease_token.to_string()),
             },
@@ -1324,14 +1342,22 @@ impl SealService {
                     .remove_required(&totp_path, staging.owner.as_deref())
                     .await;
             }
-            let user_path = format!(
-                "{}{}",
-                crate::services::auth::USER_STORAGE_PREFIX,
-                staging.root_username
-            );
-            all_removed &= self
-                .remove_required(&user_path, staging.owner.as_deref())
-                .await;
+            // Only remove the user record when this attempt actually created it. A duplicate
+            // root username was refused by the insert-if-absent leaving the pre-existing
+            // account in place, and this attempt owns nothing there — removing it by name
+            // would delete an ordinary account. The marker still names the username so a
+            // retry can tell what happened; it just does not authorise the deletion. An
+            // absent field is a legacy marker and means the account was this attempt's.
+            if staging.root_account_created.unwrap_or(true) {
+                let user_path = format!(
+                    "{}{}",
+                    crate::services::auth::USER_STORAGE_PREFIX,
+                    staging.root_username
+                );
+                all_removed &= self
+                    .remove_required(&user_path, staging.owner.as_deref())
+                    .await;
+            }
         }
 
         let owner = staging.as_ref().and_then(|s| s.owner.as_deref());
@@ -1445,13 +1471,23 @@ impl SealService {
             return false;
         }
 
-        // Read back. The record must be gone, or belong to another owner; anything else
-        // means the delete did not take effect and the caller must not continue as though
-        // it had.
+        // Read back. The record must be gone, or belong to someone other than this
+        // attempt; anything else means the delete did not take effect and the caller must
+        // not continue as though it had.
+        //
+        // The second arm is the bootstrap-root duplicate case. The root account is created
+        // by an insert-if-absent that stamps this attempt's token, so a rejected write — a
+        // username that already exists — leaves an account this attempt never created, and
+        // an ordinary account carries no owner token at all. Treating that surviving
+        // token-less record as a failed removal stranded the staging marker, and every later
+        // initialization, even with a different username, then failed while recovering the
+        // marker. Only this attempt's own artifacts are stamped, so a token-less record is
+        // never this attempt's and leaving it is correct.
         match self.storage.get_by_path(path).await {
             Ok(None) => true,
             Ok(Some(record)) => match (owner, record.owner_token()) {
                 (Some(owner), Some(record_owner)) if record_owner != owner => true,
+                (Some(_), None) => true,
                 _ => {
                     tracing::error!(
                         "Delete of '{}' during cleanup reported success but the record is \
@@ -2071,6 +2107,73 @@ mod tests {
             .decode(payload)
             .expect("payload is base64url");
         serde_json::from_slice(&bytes).expect("payload is JSON")
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_root_username_does_not_strand_the_staging_marker() {
+        // Regression: `init` writes the staging marker before it registers the root account.
+        // A username already in storage makes that registration fail as a duplicate, and the
+        // attempt owns nothing at the user path. Cleanup then could not remove the
+        // pre-existing account and treated its survival as its own failure, so it kept the
+        // marker — and every later `init`, even with a different username, failed while
+        // recovering that marker. The pre-existing account must also survive: it is not this
+        // attempt's to delete.
+        let _env = crate::test_support::without_root_key();
+        let vault = sealed_vault().await;
+
+        const OCCUPIED: &str = "vault-operator";
+        // An ordinary account: a record at the user path with no owner token. Written
+        // directly so the test does not need an active crypto key (registration encrypts),
+        // which is orthogonal to what this regression is about.
+        vault
+            .storage
+            .store(&SecretEntry::new(
+                format!("users/{OCCUPIED}"),
+                b"ordinary-account".to_vec(),
+                EncryptionMetadata::default(),
+                SecurityLevel::Secret,
+                Uuid::new_v4(),
+            ))
+            .await
+            .expect("pre-existing ordinary account");
+
+        let first = vault
+            .seal
+            .init(3, 2, OCCUPIED, &vault.auth, &vault.mfa)
+            .await;
+        assert!(
+            first.is_err(),
+            "initializing with an occupied username must be refused"
+        );
+
+        // The next attempt, with a different name, must get past recovery and succeed.
+        let second = vault
+            .seal
+            .init(3, 2, "new-root", &vault.auth, &vault.mfa)
+            .await
+            .expect("a retry with a fresh username must not be blocked by the failed attempt");
+
+        assert_eq!(second.keys.len(), 3, "the retry must return its shares");
+        assert!(
+            vault
+                .storage
+                .get_by_path("sys/init_staging")
+                .await
+                .expect("read marker")
+                .is_none(),
+            "a committed initialization must clear its staging marker"
+        );
+
+        // The ordinary account the failed attempt collided with is untouched.
+        let surviving = vault
+            .storage
+            .get_by_path(&format!("users/{OCCUPIED}"))
+            .await
+            .expect("read occupied account");
+        assert!(
+            surviving.is_some(),
+            "cleanup must not delete an account this attempt never created"
+        );
     }
 
     #[tokio::test]
@@ -3499,6 +3602,7 @@ mod tests {
         let staging = serde_json::to_vec(&InitStaging {
             root_username: root_username.to_string(),
             root_entity_id,
+            root_account_created: None,
             committed: false,
             owner: None,
         })
@@ -4050,6 +4154,7 @@ mod tests {
         let staging = serde_json::to_vec(&InitStaging {
             root_username: "crashed-root".to_string(),
             root_entity_id: None,
+            root_account_created: None,
             committed: false,
             owner: None,
         })
@@ -4438,6 +4543,7 @@ mod tests {
         let staging = serde_json::to_vec(&InitStaging {
             root_username: "cleanup-root".to_string(),
             root_entity_id: None,
+            root_account_created: None,
             committed: false,
             owner: Some("this-attempt".to_string()),
         })

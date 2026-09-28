@@ -374,3 +374,81 @@ async fn raft_refuses_a_fence_it_cannot_enforce() {
         "a backend that cannot enforce a fence must refuse, not fake one"
     );
 }
+
+/// Raft must still provide the insert-if-absent the bootstrap-root write needs, even though
+/// it reports `SingleProcess`. Refusing every `compare_and_set` made a fresh Raft vault
+/// uninitialisable: the root account is created with `Expect::Absent` regardless of
+/// coordination, so the write returned `Unsupported` and initialization rolled back instead
+/// of returning shares. The guarantee a single-process backend can offer — indivisible
+/// against concurrent tasks in this process — is enough for that write, and the fenced
+/// variant stays refused because there is no shared lease record for a fence to name.
+#[cfg(feature = "raft")]
+#[tokio::test]
+async fn raft_compare_and_set_arbitrates_within_the_process() {
+    use secreton_storage::backends::{RaftConfig, RaftStorageBackend};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backend = RaftStorageBackend::new(RaftConfig {
+        data_dir: dir.path().to_path_buf(),
+        ..RaftConfig::default()
+    })
+    .await
+    .expect("raft backend");
+
+    let path = "users/root";
+
+    // Insert-if-absent wins on an empty path.
+    assert!(
+        backend
+            .compare_and_set(&entry(path, "init-attempt", b"root"), Expect::Absent)
+            .await
+            .expect("compare_and_set"),
+        "an absent path must admit the first writer"
+    );
+
+    // A second insert-if-absent loses, and must not replace the record.
+    assert!(
+        !backend
+            .compare_and_set(&entry(path, "another", b"other"), Expect::Absent)
+            .await
+            .expect("compare_and_set"),
+        "an occupied path must refuse the insert-if-absent"
+    );
+    let resolved = backend
+        .get_by_path(path)
+        .await
+        .expect("read")
+        .expect("the first writer's record must remain");
+    assert_eq!(resolved.encrypted_data, b"root");
+
+    // The owner-conditional replacement the lease takeover uses still works.
+    assert!(
+        backend
+            .compare_and_set(
+                &entry(path, "init-attempt", b"replaced"),
+                Expect::Owner("init-attempt")
+            )
+            .await
+            .expect("owner-conditional write"),
+        "the record's own owner must be able to replace it"
+    );
+    assert!(
+        !backend
+            .compare_and_set(&entry(path, "stale", b"stale"), Expect::Owner("stale"))
+            .await
+            .expect("owner-conditional write"),
+        "a mismatched owner must not replace the record"
+    );
+
+    // A fence still cannot be honoured, and must be refused rather than faked.
+    assert!(
+        backend
+            .compare_and_set(
+                &entry("sys/init_lease", "winner", b"lease"),
+                Expect::AbsentFenced(StorageFence::new("sys/init_lease", "winner"))
+            )
+            .await
+            .is_err(),
+        "a fenced compare-and-set must be refused on a backend with no shared lease"
+    );
+}

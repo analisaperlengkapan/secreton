@@ -511,12 +511,22 @@ where
             self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
                 .await;
         } else {
-            // The inner write did not happen, but a stale positive cache entry for this
-            // path would make a subsequent read report a record the backend may not have.
+            // The inner write did not happen. A stale positive cache entry for this path
+            // would make a subsequent read report a record the backend may not have — and
+            // the id key matters too: when several wrappers share storage, a replacement
+            // this call *lost* to can have displaced the record the path named, so
+            // `get_by_id` would otherwise keep serving the superseded entry until its TTL
+            // expires. Retire both the path and the id it previously resolved to.
             let _ = self
                 .cache
                 .delete(&Self::cache_key_for_path(&entry.path))
                 .await;
+            if let Some(previous) = previous.as_ref() {
+                let _ = self
+                    .cache
+                    .delete(&Self::cache_key_for_id(previous.id))
+                    .await;
+            }
         }
         Ok(written)
     }
