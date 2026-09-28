@@ -198,9 +198,20 @@ async function main() {
   // changing. Leptos answers a `ServerFnError` with a 500, which the console-error
   // whitelist already keys on; capture it here so the result carries the real status and
   // the assertion below is meaningful.
+  //
+  // Key on the login server function's own URL, not on any `/api/` POST: the page also
+  // issues `current_session` and `system_status` server-function calls, and a bare
+  // `/api/` + POST match would let one of those (or any later API traffic) supply the
+  // status the assertion reads, masking a change to the login request itself. The
+  // generated Leptos route is `/api/sfn/login<hash>`, so the name prefix is what
+  // identifies it.
   let denialStatus = null;
   const onDenialResponse = (resp) => {
-    if (resp.url().includes("/api/") && resp.request().method() === "POST") {
+    const url = new URL(resp.url());
+    if (
+      url.pathname.startsWith("/api/sfn/login") &&
+      resp.request().method() === "POST"
+    ) {
       denialStatus = resp.status();
     }
   };

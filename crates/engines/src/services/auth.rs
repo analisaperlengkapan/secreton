@@ -2635,10 +2635,15 @@ impl AuthenticationService {
         // password. The persisted flag is the boundary; a nil hash would already fail
         // `check_password`, but relying on that alone would be relying on the absence of a
         // value rather than on a stated property.
-        if let Ok(Some(user)) = self.find_user_by_username(username).await
-            && user.password_login_disabled
-        {
-            return Ok(false);
+        if let Ok(Some(user)) = self.find_user_by_username(username).await {
+            // Republish the durable record before the check: the capped startup hydration
+            // (`USER_LOAD_MAX_ENTRIES`) may have omitted this account, and
+            // `UserPassAuthMethod` is what verifies the password. Without this, a valid
+            // account beyond the cap is rejected here even though its stored hash matches.
+            self.hydrate_userpass_identity(&user).await;
+            if user.password_login_disabled {
+                return Ok(false);
+            }
         }
 
         let request = LoginRequest {
@@ -3245,6 +3250,78 @@ mod tests {
         assert!(
             result.is_ok(),
             "a stored account absent from the in-memory map must still authenticate: {result:?}"
+        );
+    }
+
+    /// `verify_password` backs re-authentication (for example before disabling MFA), so an
+    /// account beyond the capped startup hydration must pass it too. Otherwise the account
+    /// can sign in but cannot re-authenticate for a sensitive change.
+    #[tokio::test]
+    async fn verify_password_accepts_an_account_absent_from_startup_hydration() {
+        use secreton_storage::{EncryptionMetadata, SecurityLevel};
+        use uuid::Uuid;
+
+        let (storage, service, _root_key) = auth_with_open_barrier().await;
+
+        let password = crate::test_support::generated_password();
+        let password_hash = service
+            .userpass_method
+            .hash_password(&password)
+            .expect("hash");
+        let user = User {
+            id: Uuid::new_v4().to_string(),
+            username: "beyond-the-cap-verify".to_string(),
+            email: None,
+            password_hash,
+            password_login_disabled: false,
+            full_name: None,
+            is_active: true,
+            is_superuser: false,
+            roles: vec!["user".to_string()],
+            permissions: vec![],
+            policies: vec!["default".to_string()],
+            enabled: true,
+            disabled: false,
+            display_name: None,
+            mfa_enabled: false,
+            mfa_secret: None,
+            last_login: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: HashMap::new(),
+            failed_login_attempts: 0,
+            locked_until: None,
+        };
+        let path = format!("{}{}", USER_STORAGE_PREFIX, user.username);
+        let encrypted = service
+            .crypto
+            .encrypt_data(&serde_json::to_vec(&user).unwrap())
+            .await
+            .unwrap();
+        storage
+            .store(&SecretEntry::new(
+                path,
+                encrypted,
+                EncryptionMetadata::default(),
+                SecurityLevel::Secret,
+                Uuid::new_v4(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .verify_password(&user.username, &password)
+                .await
+                .expect("verify"),
+            "a stored account absent from the in-memory map must still verify its password"
+        );
+        assert!(
+            !service
+                .verify_password(&user.username, "not-the-password")
+                .await
+                .expect("verify"),
+            "a wrong password must still be rejected"
         );
     }
 

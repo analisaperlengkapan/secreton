@@ -337,6 +337,29 @@ where
     touched_ids: Vec<Uuid>,
 }
 
+impl<S, C> CachedTransaction<S, C>
+where
+    S: crate::StorageBackend,
+    C: CacheBackend,
+{
+    /// Note the id a stored path names *now*, before the staged write replaces it.
+    ///
+    /// A `store` at an occupied path replaces the record there, and the backends keep the
+    /// path resolving to the new id. The displaced id is no longer reachable by path, but its
+    /// id cache key survives unless it is retired, and `get_by_id(old_id)` keeps serving the
+    /// superseded record from cache until its TTL expires. Recording it here puts it through
+    /// the same commit-time reconciliation as an id the transaction itself removed: the id is
+    /// kept only if the backend still has it.
+    async fn record_displaced_id(&mut self, entry: &SecretEntry) {
+        let previous = self.storage.get_by_path(&entry.path).await.ok().flatten();
+        if let Some(previous) = previous
+            && previous.id != entry.id
+        {
+            self.touched_ids.push(previous.id);
+        }
+    }
+}
+
 #[async_trait]
 impl<S, C> crate::StorageTransaction for CachedTransaction<S, C>
 where
@@ -344,6 +367,7 @@ where
     C: CacheBackend + 'static,
 {
     async fn store(&mut self, entry: &SecretEntry) -> StorageResult<()> {
+        self.record_displaced_id(entry).await;
         self.inner.store(entry).await?;
         self.touched_paths.push(entry.path.clone());
         self.touched_ids.push(entry.id);
@@ -351,6 +375,7 @@ where
     }
 
     async fn update(&mut self, entry: &SecretEntry) -> StorageResult<()> {
+        self.record_displaced_id(entry).await;
         self.inner.update(entry).await?;
         self.touched_paths.push(entry.path.clone());
         self.touched_ids.push(entry.id);
@@ -1607,6 +1632,69 @@ mod round_trip_tests {
         assert_eq!(
             cached_read.id, direct_read.id,
             "the cached identity must match what the backend holds after a transaction store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_store_retires_the_id_the_path_no_longer_names() {
+        // Regression: a transaction store that replaced a path's record under a *new* id left
+        // the old id's cache key holding the superseded record. `touched_ids` only carried the
+        // replacement id, so the commit never reconciled the displaced id, and `get_by_id(old)`
+        // kept answering from cache with a secret the backend no longer had — until its TTL
+        // expired. The property: after the commit, the id the path no longer names is not
+        // served by id from the cache.
+        let backend = crate::backends::MemoryBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let path = "kv/tx/replace";
+
+        let old = sample_entry_with_path(path, b"v1");
+        let old_id = old.id;
+        crate::StorageBackend::store(&cached, &old)
+            .await
+            .expect("seed");
+        // Warm the old id key, so a stale hit is what the test observes.
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, old_id)
+                .await
+                .expect("warm id")
+                .is_some()
+        );
+
+        let mut replacement = sample_entry_with_path(path, b"v2");
+        replacement.id = Uuid::new_v4();
+        assert_ne!(replacement.id, old_id);
+        let new_id = replacement.id;
+
+        let mut tx = crate::StorageBackend::begin_transaction(&cached)
+            .await
+            .expect("begin");
+        tx.store(&replacement).await.expect("stage store");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, old_id)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "the id the path no longer names must not be served from cache after a transaction store"
+        );
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, new_id)
+                .await
+                .expect("cached read")
+                .is_some(),
+            "the replacement id must be readable"
+        );
+        assert!(
+            crate::StorageBackend::get_by_id(&backend, old_id)
+                .await
+                .expect("backend read")
+                .is_none(),
+            "the backend must no longer hold the displaced record"
         );
     }
 }

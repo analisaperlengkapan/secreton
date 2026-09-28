@@ -951,8 +951,8 @@ impl SealService {
         // 7. Store Encrypted Root Key
         //
         // This is the write the finding names. On Redis the former unconditional `store` set
-        // `secreton:path:sys/root_key` to this attempt's id, so a holder that had already lost
-        // the lease still repointed the mapping the winning attempt had installed — the
+        // `secreton:path:sys/root_key_enc` to this attempt's id, so a holder that had already
+        // lost the lease still repointed the mapping the winning attempt had installed — the
         // winner's returned shares then did not open the root key the path resolved to. The
         // fenced write replaces this atomically while, and only while, the lease is still
         // this attempt's, so a lost lease means the write does not happen at all.
