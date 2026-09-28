@@ -46,6 +46,34 @@ pub struct SignResult {
     pub algorithm: String,
 }
 
+/// Exact paths the seal service owns and writes directly through the storage backend.
+///
+/// The secret API resolves a path to whatever record is newest at it, so an ordinary write
+/// to one of these names would silently replace an initialization artifact — or race the
+/// initialization that is writing it. `store`/`upsert` on the file backend are not serialised
+/// by the advisory lock the seal's fenced writes hold, so a concurrent ordinary write could
+/// interleave with `init` and publish over its config, root key, staging marker, lease or
+/// root identity. Rejecting these paths at the secret API boundary keeps initialization
+/// artifacts reachable only by the seal service, which is the only writer that fences them.
+const RESERVED_INITIALIZATION_PATHS: &[&str] = &[
+    "sys/init",
+    "sys/init_staging",
+    "sys/init_lease",
+    "sys/root_key_enc",
+    "sys/root_identity",
+];
+
+/// Reject an ordinary secret write or delete aimed at an initialization artifact path.
+fn reject_reserved_initialization_path(path: &str) -> Result<(), SecretError> {
+    if RESERVED_INITIALIZATION_PATHS.contains(&path) {
+        return Err(SecretError::InvalidOperation(format!(
+            "'{}' is a reserved initialization path and cannot be written through the secret API",
+            path
+        )));
+    }
+    Ok(())
+}
+
 /// Policy definition
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Policy {
@@ -480,6 +508,7 @@ impl SecretService {
         expires_at_override: Option<Option<chrono::DateTime<chrono::Utc>>>,
     ) -> Result<SecretData, SecretError> {
         let start_time = std::time::Instant::now();
+        reject_reserved_initialization_path(path)?;
         self.check_permission(user, path, "write").await?;
 
         // Validate TTL upper bound before any unchecked numeric casts below
@@ -814,6 +843,7 @@ impl SecretService {
         check_perms: bool,
     ) -> Result<(), SecretError> {
         let start_time = std::time::Instant::now();
+        reject_reserved_initialization_path(path)?;
 
         if check_perms {
             self.check_permission(user, path, "delete").await?;
@@ -2900,6 +2930,71 @@ mod tests {
             .unwrap();
         assert_eq!(secret.path, "app/admin");
         assert!(secret.data.contains_key("username"));
+    }
+
+    #[tokio::test]
+    async fn secret_api_cannot_write_or_delete_an_initialization_artifact() {
+        // Regression: the secret API wrote through `store`/`upsert`, which the file backend
+        // does not serialise with the seal's fenced writes. An ordinary `put_secret` at
+        // `sys/init` (or `sys/init_staging`, `sys/init_lease`, `sys/root_key_enc`,
+        // `sys/root_identity`) could therefore overwrite or race an initialization artifact
+        // — replacing the init config, the lease, or the root identity of a live vault.
+        // Those paths are reachable only by the seal service, so the secret API must refuse
+        // them before doing any work.
+        let _env = crate::test_support::with_root_key();
+        let storage = Arc::new(MemoryBackend::new());
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        let audit = Arc::new(
+            AuditLogger::new(storage.clone(), 2555, 1000, true)
+                .await
+                .unwrap(),
+        );
+        let identity = Arc::new(secreton_auth::InMemoryIdentityService::new());
+        let policy_service = Arc::new(secreton_auth::PolicyService::new());
+        let performance = Arc::new(SecretPerformanceOptimizer::default());
+        seed_admin_policy(&policy_service).await;
+
+        let service = SecretService::new(
+            storage.clone(),
+            crypto,
+            audit,
+            identity,
+            policy_service,
+            performance,
+        )
+        .await
+        .unwrap();
+        let user = mock_user();
+
+        for path in [
+            "sys/init",
+            "sys/init_staging",
+            "sys/init_lease",
+            "sys/root_key_enc",
+            "sys/root_identity",
+        ] {
+            let mut data = HashMap::new();
+            data.insert("tampered".to_string(), "true".to_string());
+            let put = service.put_secret(path, data, None, &user, None).await;
+            assert!(
+                matches!(put, Err(SecretError::InvalidOperation(_))),
+                "a write to the reserved initialization path '{}' must be refused, got {:?}",
+                path,
+                put.as_ref().map(|_| ())
+            );
+            let delete = service.delete_secret(path, &user).await;
+            assert!(
+                matches!(delete, Err(SecretError::InvalidOperation(_))),
+                "a delete of the reserved initialization path '{}' must be refused, got {:?}",
+                path,
+                delete
+            );
+            assert!(
+                storage.get_by_path(path).await.expect("storage").is_none(),
+                "the refused write must not have created '{}'",
+                path
+            );
+        }
     }
 
     #[tokio::test]

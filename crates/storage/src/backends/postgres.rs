@@ -250,21 +250,37 @@ impl StorageBackend for PostgresBackend {
         // oldest-expired entries first, which would otherwise be hidden
         // behind the default newest-first ordering and missed by the
         // `SWEEP_MAX_ENTRIES` cap.
+        //
+        // `security_level` was missing from this whitelist, so a query that sorted by it
+        // fell through to `created_at`. `QueryParams::apply_to` — the in-memory ordering
+        // memory/file/Redis use — sorts by the numeric level, so the two backends returned
+        // different records for the same page, offset and limit. It is exposed as an
+        // integer here to match `SecurityLevel`'s own discriminants.
         let sort_column = match params.sort_by.as_deref() {
             Some("path") => "path",
             Some("created_at") => "created_at",
             Some("updated_at") => "updated_at",
             Some("expires_at") => "expires_at",
+            Some("security_level") => "security_level",
             _ => "created_at",
         };
         let sort_dir = match params.sort_order.as_deref() {
             Some(s) if s.eq_ignore_ascii_case("asc") => "ASC",
             _ => "DESC",
         };
+        // Every ordering carries the id as a final tie-break in the same direction as the
+        // primary key, exactly as `apply_to` does by ordering `(key, id)` and then reversing
+        // the whole comparison for a descending sort. Without it two rows sharing a timestamp
+        // or level are ordered by PostgreSQL's arbitrary scan order, which can differ between
+        // queries and from the other backends, so pagination can repeat or skip a record.
         if sort_column == "expires_at" && sort_dir == "ASC" {
-            query.push_str(" ORDER BY expires_at ASC NULLS LAST");
+            query.push_str(" ORDER BY expires_at ASC NULLS LAST, id ASC");
         } else {
-            query.push_str(&format!(" ORDER BY {} {}", sort_column, sort_dir));
+            query.push_str(&format!(
+                " ORDER BY {column} {dir}, id {dir}",
+                column = sort_column,
+                dir = sort_dir
+            ));
         }
         if let Some(limit) = params.limit {
             query.push_str(&format!(" LIMIT ${}", param_count));
@@ -434,6 +450,13 @@ impl StorageBackend for PostgresBackend {
                 message: format!("Failed to get connection: {}", e),
             })?;
 
+        // `AbsentFenced` is the conjunction of insert-if-absent and a still-held fence, and
+        // its two failure modes must be told apart (occupied path vs. lost lease), so it is
+        // its own statement pair rather than a variant of the single-statement cases below.
+        if let crate::Expect::AbsentFenced(fence) = expect {
+            return self.compare_and_set_absent_fenced(entry, fence).await;
+        }
+
         let encryption_metadata_json =
             serde_json::to_value(&entry.encryption_metadata).map_err(|e| {
                 StorageError::SerializationError {
@@ -555,6 +578,14 @@ impl StorageBackend for PostgresBackend {
                         &token,
                     ],
                 ),
+                // Dispatched to `compare_and_set_absent_fenced` above; the compiler cannot
+                // see that through the `if let`, so restate the refusal here.
+                crate::Expect::AbsentFenced(_) => {
+                    return Err(StorageError::Unsupported {
+                        operation: "compare_and_set".to_string(),
+                        backend: "postgres".to_string(),
+                    });
+                }
             };
 
         let rows_affected =
@@ -1055,6 +1086,135 @@ impl StorageBackend for PostgresBackend {
 }
 
 impl PostgresBackend {
+    /// Insert-if-absent that is also fenced on a still-held lease, in one transaction.
+    ///
+    /// The artifact insert and the fence read must be one indivisible step for the same
+    /// reason [`StorageBackend::store_fenced`] is: a fence checked in a separate statement
+    /// says nothing by the time the insert lands, so a stale initialization could still
+    /// create a privileged identity. `SELECT ... FOR SHARE` locks the lease row, so a
+    /// concurrent takeover blocks on it and the fence is re-evaluated against the row's
+    /// committed version.
+    ///
+    /// The two preconditions are ordered deliberately. Occupancy is checked first, with
+    /// `INSERT ... ON CONFLICT (path) DO NOTHING` followed by a conditional `UPDATE`: a
+    /// plain prefetch of the path would race a concurrent registration that has not
+    /// committed, whereas the conflict resolution evaluates against the latest row. If the
+    /// path is occupied the statement affects no row and [`StorageError::Duplicate`] is
+    /// returned, telling the caller "someone else owns this name". Only then is the fence
+    /// consulted, and a lease that is gone is `Ok(false)` — a distinct outcome from the
+    /// duplicate, so registration never reports a storage-level duplicate for a lost lease
+    /// or vice versa.
+    async fn compare_and_set_absent_fenced(
+        &self,
+        entry: &SecretEntry,
+        fence: StorageFence<'_>,
+    ) -> StorageResult<bool> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| StorageError::ConnectionFailed {
+                message: format!("Failed to get connection: {}", e),
+            })?;
+
+        let encryption_metadata_json =
+            serde_json::to_value(&entry.encryption_metadata).map_err(|e| {
+                StorageError::SerializationError {
+                    message: format!("Failed to serialize encryption metadata: {}", e),
+                }
+            })?;
+        let metadata_json = serde_json::to_value(&entry.metadata).map_err(|e| {
+            StorageError::SerializationError {
+                message: format!("Failed to serialize metadata: {}", e),
+            }
+        })?;
+
+        let security_level = entry.security_level as i32;
+        let version = entry.version as i32;
+
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to begin fenced insert: {}", e),
+            })?;
+
+        // Occupancy is evaluated first, matching the memory and file backends. The caller
+        // checks the registration precondition before the lease, so "someone else owns this
+        // name" must be reported ahead of "your lease is gone"; evaluating the fence first
+        // would report a lost lease (an internal error) for a path that is merely occupied.
+        // `ON CONFLICT (path) DO NOTHING` affects one row when it inserts and no row when
+        // the path already exists, so the statement's own row count is the occupancy test —
+        // no separate race-prone prefetch is needed.
+        let insert_query = "INSERT INTO secreton_entries \
+            (id, path, encrypted_data, encryption_metadata, security_level, metadata, tags, version, owner_id, created_at, updated_at, expires_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+            ON CONFLICT (path) DO NOTHING";
+        let inserted = transaction
+            .execute(
+                insert_query,
+                &[
+                    &entry.id,
+                    &entry.path,
+                    &entry.encrypted_data,
+                    &encryption_metadata_json,
+                    &security_level,
+                    &metadata_json,
+                    &entry.tags,
+                    &version,
+                    &entry.owner_id,
+                    &entry.created_at,
+                    &entry.updated_at,
+                    &entry.expires_at,
+                ],
+            )
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to insert fenced entry: {}", e),
+            })?;
+
+        if inserted == 0 {
+            // A record already occupies the path; the insert did nothing. Roll back and
+            // report the occupied path specifically, so the caller maps it to "already
+            // exists" rather than treating it as a lost lease.
+            let _ = transaction.rollback().await;
+            return Err(StorageError::Duplicate {
+                resource_type: "SecretEntry".to_string(),
+                id: entry.path.clone(),
+            });
+        }
+
+        // The fence lock is taken in the same transaction as the insert above. A takeover
+        // that has run but not committed makes this statement block and then match nothing
+        // once it does, so the artifact cannot land after a lease it no longer holds. If
+        // the fence is gone the whole transaction is rolled back and the insert above is
+        // discarded, so a stale attempt publishes nothing. The owner key is a compile-time
+        // constant.
+        let fence_query = format!(
+            "SELECT 1 FROM secreton_entries WHERE path = $1 AND metadata->>'{owner}' = $2 FOR SHARE",
+            owner = crate::OWNER_TOKEN_KEY
+        );
+        let fence_held = transaction
+            .query_opt(&fence_query, &[&fence.path, &fence.token])
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to evaluate fenced insert: {}", e),
+            })?
+            .is_some();
+        if !fence_held {
+            let _ = transaction.rollback().await;
+            return Ok(false);
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to commit fenced insert: {}", e),
+            })?;
+        Ok(true)
+    }
+
     fn row_to_secreton_entry(&self, row: &Row) -> StorageResult<SecretEntry> {
         let encryption_metadata_value: serde_json::Value = row.get("encryption_metadata");
         let encryption_metadata =

@@ -2787,6 +2787,15 @@ mod tests {
             }
             self.inner.store(entry).await
         }
+        /// The root account is created with `compare_and_set(Absent)`; forwarding keeps the
+        /// atomic contract the wrapper exists to model around.
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
+        }
         /// The write the real path takes on a single-process backend, so the fault lands on
         /// the same artifact regardless of which method carries it.
         async fn upsert(&self, entry: &SecretEntry) -> StorageResult<()> {
@@ -2919,6 +2928,17 @@ mod tests {
             self.maybe_pause(&entry.path).await;
             self.inner.store(entry).await
         }
+        /// The single-process root-account write goes through `compare_and_set(Absent)`; the
+        /// pause must apply here too, so the concurrent-init test parks the first writer in
+        /// the same window it always did.
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.maybe_pause(&entry.path).await;
+            self.inner.compare_and_set(entry, expect).await
+        }
         async fn store_fenced(
             &self,
             entry: &SecretEntry,
@@ -3018,6 +3038,18 @@ mod tests {
                 });
             }
             self.inner.store(entry).await
+        }
+        /// Forward the atomic path to the inner memory backend. Without this the default
+        /// `Unsupported` is returned and initialization — which creates the root account
+        /// with `compare_and_set(Absent)` — cannot run at all. The wrapper's `UNIQUE(path)`
+        /// model is about unconditional `store`, and the insert-if-absent path is exactly
+        /// the constraint-respecting one, so forwarding is faithful.
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
         }
         async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
             self.inner.get_by_id(id).await
@@ -3507,6 +3539,13 @@ mod tests {
         async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
             self.inner.store(entry).await
         }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
+        }
         async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
             self.inner.get_by_id(id).await
         }
@@ -3603,6 +3642,13 @@ mod tests {
     impl StorageBackend for FailingReadPath {
         async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
             self.inner.store(entry).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
         }
         async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
             self.inner.get_by_id(id).await
@@ -3719,6 +3765,13 @@ mod tests {
     impl StorageBackend for FailStagingWhileTotpExists {
         async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
             self.inner.store(entry).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
         }
         async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
             self.inner.get_by_id(id).await
@@ -4070,6 +4123,13 @@ mod tests {
     impl StorageBackend for SilentDeleteFailure {
         async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
             self.inner.store(entry).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
         }
         async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
             self.inner.get_by_id(id).await

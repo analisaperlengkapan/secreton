@@ -177,17 +177,43 @@ pub const OWNER_TOKEN_KEY: &str = "storage_owner";
 
 /// Precondition for [`StorageBackend::compare_and_set`].
 ///
-/// The three variants are the whole contract: a caller states what must already be true
-/// at the path, and the backend performs the check and the write as one indivisible step.
+/// The variants are the whole contract: a caller states what must already be true at the
+/// path, and the backend performs the check and the write as one indivisible step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expect<'a> {
     /// No record may exist at the path. This is insert-if-absent.
     Absent,
+    /// No record may exist at `entry.path`, *and* the record at `fence.path` must still
+    /// carry `fence.token` — the two checks and the write are one indivisible step.
+    ///
+    /// This is the conjunction of [`Self::Absent`] and [`StorageBackend::store_fenced`],
+    /// and it exists because a caller can need both at once. Creating the bootstrap root
+    /// identity is exactly that case: the account must be insert-if-absent so it cannot
+    /// overwrite a concurrently registered user, and it must be fenced on the
+    /// initialization lease so an attempt that has already lost the lease cannot create a
+    /// privileged account at all. Expressing them as one call is what makes the pair
+    /// atomic; a caller that performed `compare_and_set(Absent)` and then `store_fenced`
+    /// would reopen the very window between the two that the fence closes.
+    AbsentFenced(StorageFence<'a>),
     /// The record at the path must carry this exact owner token.
     Owner(&'a str),
     /// No precondition. The write is still a single atomic replacement, which is what
     /// distinguishes it from a read followed by a separate `store`.
     Any,
+}
+
+impl<'a> Expect<'a> {
+    /// The fence to evaluate alongside the precondition, if this variant carries one.
+    ///
+    /// Backends that support [`Self::AbsentFenced`] consult this; the ones that cannot make
+    /// a fenced write indivisible return [`StorageError::Unsupported`] rather than silently
+    /// ignoring the fence, which would replace a locked write with an unlocked one.
+    pub fn fence(&self) -> Option<StorageFence<'a>> {
+        match self {
+            Expect::AbsentFenced(fence) => Some(*fence),
+            _ => None,
+        }
+    }
 }
 
 /// A cross-process fencing token: the durable record a write must still be holding.
@@ -394,21 +420,37 @@ impl QueryParams {
                 // — so the limit truncated arbitrary records and expired secrets past the
                 // cutoff were never swept. A `None` deadline means "never expires", which
                 // must sort last ascending rather than first.
-                entries.sort_by(|a, b| match (a.expires_at, b.expires_at) {
-                    (Some(x), Some(y)) => x.cmp(&y),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
+                entries.sort_by(|a, b| {
+                    match (a.expires_at, b.expires_at) {
+                        (Some(x), Some(y)) => x.cmp(&y),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                    // Tie-break on the id, matching the PostgreSQL backend's `, id ASC`. Two
+                    // records with the same deadline are otherwise ordered by the incoming
+                    // (arbitrary) order, so a paginated query could repeat or skip a record.
+                    .then_with(|| a.id.cmp(&b.id))
+                });
+            } else if sort_by == "security_level" {
+                // Compare the level as its integer discriminant, matching the PostgreSQL
+                // backend's integer `security_level` column. Stringifying it would order
+                // "10" before "9", so the two backends would disagree on the same page as
+                // soon as a level above 9 exists. The id tie-break matches PostgreSQL's
+                // `, id <dir>`.
+                entries.sort_by(|a, b| {
+                    (a.security_level as i32)
+                        .cmp(&(b.security_level as i32))
+                        .then_with(|| a.id.cmp(&b.id))
                 });
             } else {
                 let key = |entry: &SecretEntry| match sort_by.as_str() {
                     "path" => entry.path.clone(),
                     "created_at" => entry.created_at.to_rfc3339(),
                     "updated_at" => entry.updated_at.to_rfc3339(),
-                    "security_level" => (entry.security_level as i32).to_string(),
                     other => entry.metadata.get(other).cloned().unwrap_or_default(),
                 };
-                entries.sort_by_key(key);
+                entries.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| a.id.cmp(&b.id)));
             }
             if descending {
                 entries.reverse();
@@ -469,6 +511,23 @@ pub enum StorageError {
     /// backend did not keep.
     #[error("Unsupported operation: {operation} is not supported by the {backend} backend")]
     Unsupported { operation: String, backend: String },
+}
+
+impl StorageError {
+    /// Whether this error means a precondition did not hold rather than that storage
+    /// failed.
+    ///
+    /// [`StorageBackend::compare_and_set`] normally reports a lost race as `Ok(false)`, but
+    /// a backend whose precondition is a database constraint may surface it as an error
+    /// instead. A caller that registered an identity and must tell "someone else already
+    /// took this name" apart from "storage is broken" needs that distinction, and a storage
+    /// outage must never be reported to a user as "already exists". Only errors a backend
+    /// raises specifically for a failed precondition are classified here; a generic
+    /// [`Self::QueryFailed`] or [`Self::ConnectionFailed`] is not, so it cannot masquerade
+    /// as a duplicate.
+    pub fn is_precondition_failure(&self) -> bool {
+        matches!(self, StorageError::Duplicate { .. })
+    }
 }
 
 // impl From<azure_storage::Error> for StorageError {
@@ -976,6 +1035,70 @@ mod tests {
         assert!(
             listed.iter().all(|e| !e.path.starts_with("sys/")),
             "reserved entries must not be returned at all"
+        );
+    }
+
+    #[test]
+    fn security_level_sort_is_numeric_and_matches_postgres() {
+        // `security_level` used `sort_by_key` on the enum, which orders by discriminant, but
+        // PostgreSQL orders its integer `security_level` column — so the two backends agreed
+        // only by accident of the variant order. A `sort_by` of that name also used to fall
+        // through to the metadata fallback in `apply_to`. Pin the numeric ordering and the
+        // id tie-break that PostgreSQL adds with `, id <dir>`.
+        let mut low = query_entry("kv/low", None);
+        low.security_level = SecurityLevel::Public;
+        low.id = Uuid::from_u128(2);
+        let mut high = query_entry("kv/high", None);
+        high.security_level = SecurityLevel::TopSecret;
+        high.id = Uuid::from_u128(1);
+        // A record above 9 in a hypothetical expansion: string comparison would order it
+        // before a two-digit level and diverge from the integer column.
+        let mut mid = query_entry("kv/mid", None);
+        mid.security_level = SecurityLevel::Confidential;
+        mid.id = Uuid::from_u128(3);
+
+        let params = QueryParams {
+            sort_by: Some("security_level".to_string()),
+            sort_order: Some("asc".to_string()),
+            ..Default::default()
+        };
+        let ordered = params.apply_to(vec![high.clone(), low.clone(), mid.clone()]);
+        let paths: Vec<&str> = ordered.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["kv/low", "kv/mid", "kv/high"],
+            "ascending `security_level` must order by the numeric level"
+        );
+    }
+
+    #[test]
+    fn equal_sort_keys_are_broken_by_id_like_postgres() {
+        // Two records sharing the sort key are otherwise ordered by the arbitrary incoming
+        // order, which can differ between backends and between queries — so pagination can
+        // repeat or skip a record. PostgreSQL appends `, id <dir>`; `apply_to` must too.
+        let mut a = query_entry("kv/a", None);
+        a.id = Uuid::from_u128(30);
+        let mut b = query_entry("kv/b", None);
+        b.id = Uuid::from_u128(10);
+        let mut c = query_entry("kv/c", None);
+        c.id = Uuid::from_u128(20);
+        // Force the sort keys equal so only the tie-break decides the order, and present the
+        // records in a non-id order so a stable sort on the incoming order would differ.
+        let stamp = a.created_at;
+        b.created_at = stamp;
+        c.created_at = stamp;
+
+        let params = QueryParams {
+            sort_by: Some("created_at".to_string()),
+            sort_order: Some("asc".to_string()),
+            ..Default::default()
+        };
+        let ordered = params.apply_to(vec![a.clone(), b.clone(), c.clone()]);
+        let ids: Vec<Uuid> = ordered.iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![b.id, c.id, a.id],
+            "equal sort keys must tie-break on the id, matching PostgreSQL's `, id ASC`"
         );
     }
 }

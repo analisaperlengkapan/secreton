@@ -59,7 +59,30 @@ impl UserPassAuthMethod {
         users.insert(username, user_entry);
     }
 
-    /// Create a user with raw password (hashes it)
+    /// Hash a raw password and return the PHC string, without registering anything.
+    ///
+    /// Registration is a durable-write decision, not a hashing one. Exposing hashing alone
+    /// lets the caller build the account record and commit it atomically (insert-if-absent),
+    /// then publish the in-memory login identity only after the durable write wins. Keeping
+    /// hashing and registration together forced that caller to register in memory *before*
+    /// storage could refuse a duplicate, which is how an in-memory identity for an account
+    /// that was never written could exist.
+    pub fn hash_password(&self, password: &str) -> AuthMethodResult<String> {
+        let salt = Salt::generate();
+        let argon2 = Argon2::default();
+        let password_hash = argon2
+            .hash_password_with_salt(password.as_bytes(), salt.as_ref())
+            .map_err(|_| SecretonError::Internal {
+                message: "Password hashing failed".to_string(),
+            })?
+            .to_string();
+        Ok(password_hash)
+    }
+
+    /// Create a user with raw password (hashes it), registering it in the in-memory map.
+    ///
+    /// Kept for callers that only manage the in-memory method; the durable registration path
+    /// uses [`Self::hash_password`] so it can publish the identity after storage commits.
     pub async fn create_user(
         &self,
         username: String,
@@ -69,15 +92,7 @@ impl UserPassAuthMethod {
         policies: Vec<String>,
         permissions: Vec<String>,
     ) -> AuthMethodResult<String> {
-        let salt = Salt::generate();
-        let argon2 = Argon2::default();
-        let password_hash = argon2
-            .hash_password_with_salt(password.as_bytes(), salt.as_ref())
-            .map_err(|_| SecretonError::Internal {
-                message: "Password hashing failed".to_string(),
-            })?
-            .to_string();
-
+        let password_hash = self.hash_password(password)?;
         self.add_user(
             username,
             password_hash.clone(),

@@ -1818,42 +1818,28 @@ impl AuthenticationService {
         roles: Vec<String>,
         permissions: Vec<String>,
     ) -> Result<User, AuthError> {
-        // Check if user exists
         let path = format!("{}{}", USER_STORAGE_PREFIX, username);
-        if self.storage.exists(&path).await? {
-            return Err(AuthError::UserAlreadyExists);
-        }
-
         let user_id = Uuid::new_v4().to_string();
 
-        // Create in UserPass method (generates hash)
-        let password_hash = self
-            .userpass_method
-            .create_user(
-                username.to_string(),
-                password,
-                user_id.clone(),
-                roles.clone(),
-                vec!["default".to_string()],
-                permissions.clone(),
-            )
-            .await
-            .map_err(|_| {
-                AuthError::Internal(anyhow::anyhow!("Failed to create user in auth method"))
-            })?;
+        // Hash first: hashing is expensive and must not run while another writer is
+        // committing the same username, and it must not register anything in memory before
+        // storage has decided whether the name is free.
+        let password_hash = self.userpass_method.hash_password(password).map_err(|_| {
+            AuthError::Internal(anyhow::anyhow!("Failed to hash the user password"))
+        })?;
 
         let user = User {
-            id: user_id,
+            id: user_id.clone(),
             username: username.to_string(),
             email: email.clone(),
-            password_hash,
+            password_hash: password_hash.clone(),
             password_login_disabled: false,
             full_name: None,
             is_active: true,
             is_superuser: roles.contains(&"admin".to_string())
                 || roles.contains(&"root".to_string()),
-            roles,
-            permissions,
+            roles: roles.clone(),
+            permissions: permissions.clone(),
             policies: vec!["default".to_string()],
             enabled: true,
             disabled: false,
@@ -1868,11 +1854,8 @@ impl AuthenticationService {
             locked_until: None,
         };
 
-        // Store user
         let user_data = serde_json::to_vec(&user)
             .map_err(|e| AuthError::Internal(anyhow::anyhow!("Serialization error: {}", e)))?;
-
-        // Encrypt user data
         let encrypted_data = self.crypto.encrypt_data(&user_data).await.map_err(|e| {
             AuthError::Crypto(secreton_crypto::CryptoError::Internal(e.to_string()))
         })?;
@@ -1885,7 +1868,39 @@ impl AuthenticationService {
             Uuid::parse_str(&user.id).unwrap_or_default(),
         );
 
-        self.storage.store(&entry).await?;
+        // The existence check and the write are one atomic insert-if-absent, not a read
+        // followed by a `store`. The read-then-write let an ordinary registration and the
+        // bootstrap-root registration both pass the same `exists` check and then both write
+        // the path: whichever landed last silently replaced the other identity — for the
+        // bootstrap path that meant an attacker's concurrent registration could displace the
+        // privileged account initialized moments earlier (or vice versa), with no error
+        // reported to either caller. `compare_and_set(Absent)` makes the second writer see
+        // the occupied path and stop.
+        match self
+            .storage
+            .compare_and_set(&entry, secreton_storage::Expect::Absent)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(AuthError::UserAlreadyExists),
+            Err(e) if e.is_precondition_failure() => return Err(AuthError::UserAlreadyExists),
+            Err(e) => return Err(AuthError::Storage(e)),
+        }
+
+        // Publish the in-memory login identity only after the durable write wins. Registering
+        // it before the write would leave a login that works until the process restarts when
+        // the write then fails or loses the race.
+        self.userpass_method
+            .add_user(
+                username.to_string(),
+                password_hash,
+                user_id,
+                roles,
+                vec!["default".to_string()],
+                permissions,
+                false,
+            )
+            .await;
 
         Ok(user)
     }
@@ -1940,11 +1955,13 @@ impl AuthenticationService {
     /// privileged account behind while reporting success. Callers outside initialization
     /// pass `None`, the same way the ordinary MFA setup path leaves an enrollment unowned.
     ///
-    /// When `fence` is supplied the account is written through
-    /// [`StorageBackend::store_fenced`], so the write itself only lands while the
-    /// initialization still holds the lease it names. The owner token alone would only make
-    /// the account removable afterwards; the fence is what stops an attempt that has already
-    /// lost the lease from creating a privileged account at all.
+    /// When `fence` is supplied the account is written through an atomic
+    /// insert-if-absent that also evaluates the fence, so the write only lands while the
+    /// initialization still holds the lease it names *and* only while the path is free. The
+    /// owner token alone would only make the account removable afterwards; the fence is what
+    /// stops an attempt that has already lost the lease from creating a privileged account
+    /// at all, and the insert-if-absent is what stops a concurrent ordinary registration of
+    /// the same username from replacing the account after initialization commits.
     pub async fn register_bootstrap_root_owned(
         &self,
         username: &str,
@@ -1955,10 +1972,6 @@ impl AuthenticationService {
         fence: Option<StorageFence<'_>>,
     ) -> Result<User, AuthError> {
         let path = format!("{}{}", USER_STORAGE_PREFIX, username);
-        if self.storage.exists(&path).await? {
-            return Err(AuthError::UserAlreadyExists);
-        }
-
         let user_id = Uuid::new_v4().to_string();
 
         // Register the identity with the userpass method so token issuance sees it, but
@@ -2011,23 +2024,31 @@ impl AuthenticationService {
         // order registers a login identity in memory for an account whose durable write then
         // fails — a login that works until the process restarts, and, on the fenced path, a
         // login for an attempt that had already lost its lease.
-        match fence {
-            Some(fence) => {
-                let written = self
-                    .storage
-                    .store_fenced(&entry, fence)
-                    .await
-                    .map_err(AuthError::Storage)?;
-                if !written {
-                    return Err(AuthError::Internal(anyhow::anyhow!(
-                        "the initialization lease was lost before the root account could \
-                         be written"
-                    )));
-                }
+        //
+        // The write is an atomic insert-if-absent in both arms. With a fence it is
+        // `AbsentFenced`, which evaluates the path's emptiness and the lease together:
+        // `store_fenced` alone would overwrite a user registered concurrently under the same
+        // username, and a separate `exists` check followed by `store_fenced` would reopen the
+        // check-then-write window the fence exists to close.
+        let expectation = match fence {
+            Some(fence) => secreton_storage::Expect::AbsentFenced(fence),
+            None => secreton_storage::Expect::Absent,
+        };
+        match self.storage.compare_and_set(&entry, expectation).await {
+            Ok(true) => {}
+            // The path is already occupied: an ordinary account of this username exists, or
+            // won the race to create it. Never replace it.
+            Ok(false) if fence.is_none() => return Err(AuthError::UserAlreadyExists),
+            // A fenced `Ok(false)` means the lease is gone, not that the name is taken; the
+            // two must not be conflated, so it stays an internal failure.
+            Ok(false) => {
+                return Err(AuthError::Internal(anyhow::anyhow!(
+                    "the initialization lease was lost before the root account could \
+                     be written"
+                )));
             }
-            None => {
-                self.storage.store(&entry).await?;
-            }
+            Err(e) if e.is_precondition_failure() => return Err(AuthError::UserAlreadyExists),
+            Err(e) => return Err(AuthError::Storage(e)),
         }
 
         self.userpass_method
@@ -3220,6 +3241,16 @@ mod tests {
                 });
             }
             self.inner.store(entry).await
+        }
+        /// `register_user` now writes the account with `compare_and_set(Absent)`; forward it
+        /// to the inner memory backend so this fault-injection wrapper stays transparent for
+        /// everything it does not deliberately intercept.
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
         }
         async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
             self.inner.get_by_id(id).await

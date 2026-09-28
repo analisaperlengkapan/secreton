@@ -147,8 +147,23 @@ impl StorageBackend for MemoryBackend {
         let mut data = self.data.write();
         let existing = data.get(&entry.path);
 
+        // `AbsentFenced` reports an occupied path as an error, not `Ok(false)`, so a caller
+        // can tell "someone else already took this name" from "my lease is gone" — both
+        // must stop the write, but only the first is a duplicate. See `Expect`.
+        if let crate::Expect::AbsentFenced(_) = expect
+            && existing.is_some()
+        {
+            return Err(StorageError::Duplicate {
+                resource_type: "SecretEntry".to_string(),
+                id: entry.path.clone(),
+            });
+        }
+
         let holds = match expect {
             crate::Expect::Absent => existing.is_none(),
+            crate::Expect::AbsentFenced(fence) => data
+                .get(fence.path)
+                .is_some_and(|held| held.has_owner(fence.token)),
             crate::Expect::Owner(token) => existing.is_some_and(|e| e.has_owner(token)),
             crate::Expect::Any => true,
         };

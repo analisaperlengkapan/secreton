@@ -55,29 +55,37 @@ enum RedisTransactionOp {
     Delete(Uuid),
 }
 
-/// The Lua script a transaction commit runs, one invocation per mutating operation.
+/// The key used in place of a path key for an entry that has no path.
 ///
-/// A commit previously wrote only `secreton:entry:*`. The path mapping `secreton:path:*`
-/// — which is how `get_by_path`, `exists`, `list` and `count` reach a record — was left
-/// untouched, so a record written inside a transaction was invisible to every read that
-/// resolves by path, and a record deleted inside one left its mapping behind pointing at a
-/// missing entry. Doing the mapping maintenance here, in one server-side step, keeps it
-/// atomic with the body write and consistent with [`RedisBackend::store`] and
-/// [`RedisBackend::compare_and_set`].
+/// Lua indexes `KEYS` positionally and Redis rejects an empty key name, so the "no path"
+/// case needs a real, never-written key. A `GET` of it returns nil, which is exactly how
+/// the script treats "this record has no mapping".
+const NO_PATH_KEY: &str = "secreton:_no_path_";
+
+/// The Lua script a transaction commit runs, once for the *whole* operation list.
+///
+/// A commit previously invoked one independent script per operation, holding this process's
+/// manager mutex only around each call. Two defects followed. First, a later operation that
+/// failed left the earlier scripts' writes published — Redis cannot roll back a script that
+/// already returned — so the transaction contract ("a failed commit publishes nothing") was
+/// broken. Running every operation inside one script makes the commit one atomic unit:
+/// Redis executes a script without interleaving other commands, and no error path in this
+/// script occurs after a write has been applied. Second, the superseded entry key was
+/// resolved from a read in Rust before the script ran and then deleted unconditionally; a
+/// concurrent writer that moved the path to a new id in that window had its record deleted
+/// even though it belonged elsewhere. The script now resolves the mapping itself and removes
+/// the superseded record only while that record still names this path.
 ///
 /// The delete branch removes the mapping only while it still names the id being deleted, the
-/// same guard `delete_by_id` uses: a path rewritten since the transaction staged the delete
-/// must stay reachable through its replacement.
+/// same guard `delete_by_id` uses.
 ///
-/// KEYS[1]=path key ('' when the entry has no path), KEYS[2]=entry key.
-/// ARGV: [1]=mode (`write`|`delete`), [2]=entry json, [3]=id, [4]=absolute expiry second or
-/// '' , [5]=superseded entry key to drop or ''.
+/// KEYS: two per operation, in order — `[path_key, entry_key]`; `path_key` is
+/// [`NO_PATH_KEY`] when the entry has no path.
+/// ARGV: `[1]`=operation count, then five per operation:
+/// `[mode]` (`write`|`delete`), `[entry json]`, `[id]`, `[absolute expiry or '']`,
+/// `[path]` (`''` for none).
 const TRANSACTION_SCRIPT: &str = r"
-    local mode = ARGV[1]
-    local path_key = KEYS[1]
-    local entry_key = KEYS[2]
-    local id = ARGV[3]
-    local superseded_key = ARGV[5]
+    local n = tonumber(ARGV[1])
 
     local function set_maybe_expiring(key, value, expires)
         if expires ~= '' then
@@ -93,23 +101,46 @@ const TRANSACTION_SCRIPT: &str = r"
         end
     end
 
-    if mode == 'write' then
-        if superseded_key ~= '' then
-            redis.call('DEL', superseded_key)
-        end
-        set_maybe_expiring(entry_key, ARGV[2], ARGV[4])
-        if path_key ~= '' then
-            set_maybe_expiring(path_key, id, ARGV[4])
-        end
-        return 1
-    end
+    for i = 1, n do
+        local base = 2 + (i - 1) * 5
+        local mode = ARGV[base]
+        local value = ARGV[base + 1]
+        local id = ARGV[base + 2]
+        local expires = ARGV[base + 3]
+        local path = ARGV[base + 4]
+        local path_key = KEYS[(i - 1) * 2 + 1]
+        local entry_key = KEYS[(i - 1) * 2 + 2]
 
-    local mapping = redis.call('GET', path_key)
-    local removed = redis.call('DEL', entry_key)
-    if removed > 0 and mapping == id then
-        redis.call('DEL', path_key)
+        if mode == 'write' then
+            -- Resolve the superseded record here, not from a pre-read the caller did. The
+            -- mapping must currently name a different id for this path, and that id's record
+            -- must still name this path: a record moved to another path by a concurrent
+            -- writer must not be deleted out from under that path.
+            local mapping = redis.call('GET', path_key)
+            if mapping and mapping ~= id then
+                local superseded = redis.call('GET', 'secreton:entry:' .. mapping)
+                if superseded then
+                    local ok, decoded = pcall(cjson.decode, superseded)
+                    if ok and type(decoded) == 'table' and decoded.path == path then
+                        redis.call('DEL', 'secreton:entry:' .. mapping)
+                    end
+                end
+            end
+            set_maybe_expiring(entry_key, value, expires)
+            -- Guard on the path string, not the key: a pathless entry's key is the sentinel
+            -- and must never be written as though it were a mapping.
+            if path ~= '' then
+                set_maybe_expiring(path_key, id, expires)
+            end
+        else
+            local mapping = redis.call('GET', path_key)
+            local removed = redis.call('DEL', entry_key)
+            if removed > 0 and mapping == id then
+                redis.call('DEL', path_key)
+            end
+        end
     end
-    return removed
+    return 1
 ";
 
 impl RedisTransaction {
@@ -121,23 +152,13 @@ impl RedisTransaction {
         }
     }
 
-    /// Resolve the id a path currently maps to, so a write can drop the record it supersedes
-    /// and a delete can tell whether the mapping still names the id being deleted.
-    async fn current_mapping(
-        conn: &mut redis::aio::ConnectionManager,
-        path: &str,
-    ) -> StorageResult<Option<Uuid>> {
+    /// The key to pass as a path key for an entry that has no path.
+    fn path_key_for(path: &str) -> String {
         if path.is_empty() {
-            return Ok(None);
+            NO_PATH_KEY.to_string()
+        } else {
+            format!("secreton:path:{}", path)
         }
-        let key = format!("secreton:path:{}", path);
-        let value: Option<String> =
-            conn.get(&key)
-                .await
-                .map_err(|e| StorageError::QueryFailed {
-                    message: format!("Failed to read path mapping: {}", e),
-                })?;
-        Ok(value.as_deref().and_then(|v| Uuid::parse_str(v).ok()))
     }
 }
 
@@ -182,71 +203,51 @@ impl StorageTransaction for RedisTransaction {
             });
         }
 
-        // Every operation goes through the transaction script, so the entry body and the
-        // path mapping that reaches it are written, superseded and removed together. The
-        // mapping maintenance is what `store` and `compare_and_set` do and what this commit
-        // previously omitted, leaving transaction writes invisible to `get_by_path`/`list`
-        // and transaction deletes leaving orphaned mappings.
+        // Build the script inputs *before* any write. Serialisation and path policy run
+        // client-side, so a failure here happens with nothing published; the script itself
+        // has no error path after a write, which is what makes the commit all-or-nothing.
+        // The operation count, the key list and the argument list are assembled together so
+        // the script's positional indexing cannot drift.
         let mut conn = self.manager.lock().await;
 
-        for op in self.operations {
+        let script = redis::Script::new(TRANSACTION_SCRIPT);
+        // Exactly two keys per operation, in the order the script indexes them:
+        // `[path_key, entry_key]`. The entry key is derived from the id here rather than in
+        // the script so both key names are declared to Redis (Cluster would otherwise reject
+        // the in-script `secreton:entry:<id>` access) and so the positional indexing is
+        // assembled in one place.
+        let mut keys: Vec<String> = Vec::with_capacity(self.operations.len() * 2);
+        let mut args: Vec<String> = Vec::with_capacity(1 + self.operations.len() * 5);
+        args.push(self.operations.len().to_string());
+
+        for op in &self.operations {
             match op {
                 RedisTransactionOp::Store(entry) | RedisTransactionOp::Update(entry) => {
-                    let entry_key = format!("secreton:entry:{}", entry.id);
-                    let value = serde_json::to_string(&entry).map_err(|e| {
+                    let value = serde_json::to_string(entry).map_err(|e| {
                         StorageError::SerializationError {
                             message: e.to_string(),
                         }
                     })?;
-
-                    let path_key = if entry.path.is_empty() {
-                        String::new()
-                    } else {
-                        format!("secreton:path:{}", entry.path)
-                    };
-
-                    // A rewrite under a fresh id leaves the previous entry key behind; it
-                    // must be dropped so it cannot surface in an enumeration after its
-                    // mapping has moved on.
-                    let superseded_key = if let Some(old_id) =
-                        Self::current_mapping(&mut conn, &entry.path).await?
-                    {
-                        if old_id != entry.id {
-                            format!("secreton:entry:{}", old_id)
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    };
-
-                    // An already-expired write must not resurrect the path: signal an empty
-                    // deadline of '' and let the script's TTL branch see a non-positive ttl
-                    // and delete both keys.
+                    // An already-expired write must not resurrect the path: the empty deadline
+                    // makes the script's TTL branch see a non-positive ttl and delete both
+                    // keys.
                     let expires = entry
                         .expires_at
                         .map(|at| at.timestamp().to_string())
                         .unwrap_or_default();
-
-                    let keys: Vec<String> = vec![path_key, entry_key];
-                    redis::Script::new(TRANSACTION_SCRIPT)
-                        .key(&keys[0])
-                        .key(&keys[1])
-                        .arg("write")
-                        .arg(&value)
-                        .arg(entry.id.to_string())
-                        .arg(&expires)
-                        .arg(&superseded_key)
-                        .invoke_async::<i64>(&mut *conn)
-                        .await
-                        .map_err(|e| StorageError::QueryFailed {
-                            message: format!("Failed to execute transaction write: {}", e),
-                        })?;
+                    keys.push(Self::path_key_for(&entry.path));
+                    keys.push(format!("secreton:entry:{}", entry.id));
+                    args.push("write".to_string());
+                    args.push(value);
+                    args.push(entry.id.to_string());
+                    args.push(expires);
+                    args.push(entry.path.clone());
                 }
                 RedisTransactionOp::Delete(id) => {
                     // The mapping key cannot be derived from the id alone — Redis has no
-                    // index from entry to path — so read the entry to learn its path, then
-                    // let the script remove the mapping only while it still names this id.
+                    // index from entry to path — so read the entry to learn its path. The
+                    // read is safe to do before the script: the script only uses it as a
+                    // hint and re-checks the mapping against the id before removing it.
                     let entry_key = format!("secreton:entry:{}", id);
                     let stored: Option<String> =
                         conn.get(&entry_key)
@@ -254,40 +255,38 @@ impl StorageTransaction for RedisTransaction {
                             .map_err(|e| StorageError::QueryFailed {
                                 message: format!("Failed to read entry for transaction: {}", e),
                             })?;
-                    let path_key = match stored
+                    let path = stored
                         .as_deref()
                         .and_then(|json| serde_json::from_str::<SecretEntry>(json).ok())
                         .map(|entry| entry.path)
-                        .filter(|path| !path.is_empty())
-                    {
-                        Some(path) => format!("secreton:path:{}", path),
-                        None => String::new(),
-                    };
-
-                    if path_key.is_empty() {
-                        conn.del::<_, ()>(&entry_key).await.map_err(|e| {
-                            StorageError::QueryFailed {
-                                message: format!("Failed to delete entry in transaction: {}", e),
-                            }
-                        })?;
-                    } else {
-                        redis::Script::new(TRANSACTION_SCRIPT)
-                            .key(&path_key)
-                            .key(&entry_key)
-                            .arg("delete")
-                            .arg("")
-                            .arg(id.to_string())
-                            .arg("")
-                            .arg("")
-                            .invoke_async::<i64>(&mut *conn)
-                            .await
-                            .map_err(|e| StorageError::QueryFailed {
-                                message: format!("Failed to execute transaction delete: {}", e),
-                            })?;
-                    }
+                        .unwrap_or_default();
+                    keys.push(Self::path_key_for(&path));
+                    keys.push(entry_key);
+                    args.push("delete".to_string());
+                    args.push(String::new());
+                    args.push(id.to_string());
+                    args.push(String::new());
+                    args.push(path);
                 }
             }
         }
+
+        // One script invocation for the whole list, so every write, mapping update and
+        // superseded-record removal either all happen or none do. The previous per-operation
+        // invocations left earlier writes published when a later one failed.
+        for key in &keys {
+            script.key(key);
+        }
+        script.arg(args[0].clone());
+        for arg in &args[1..] {
+            script.arg(arg);
+        }
+        script
+            .invoke_async::<_, i64>(&mut *conn)
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to execute transaction commit: {}", e),
+            })?;
 
         self.committed = true;
         Ok(())
@@ -335,6 +334,124 @@ impl RedisBackend {
     async fn take_pause(&self) {
         if let Some(pause) = &self.pause {
             pause.park().await;
+        }
+    }
+
+    /// Insert-if-absent that is also fenced on a still-held lease, in one script.
+    ///
+    /// Both preconditions and the write run server-side as one atomic unit, which is what
+    /// closes the registration race: a plain `exists` check on the caller's side and a later
+    /// `store` are two steps, and a concurrent ordinary registration can pass the same check
+    /// in between and have its account replaced. Here the path mapping is read (KEYS[1]) and
+    /// the fence record is read (KEYS[2] -> entry) inside the same script that writes, so
+    /// either the path is empty and the lease still names this attempt, or nothing is written.
+    ///
+    /// Returns `1` written, `0` lost lease, `2` path already occupied — the occupied result
+    /// is mapped to [`StorageError::Duplicate`] by the caller so "someone else registered
+    /// this name" is never confused with "this attempt's lease expired".
+    ///
+    /// KEYS[1]=entry path key, KEYS[2]=fence path key.
+    /// ARGV[1]=entry value, ARGV[2]=entry id, ARGV[3]=absolute expiry second or '',
+    /// ARGV[4]=fence owner token.
+    async fn compare_and_set_absent_fenced(
+        &self,
+        entry: &SecretEntry,
+        fence: StorageFence<'_>,
+    ) -> StorageResult<bool> {
+        let entry_path_key = if entry.path.is_empty() {
+            String::new()
+        } else {
+            format!("secreton:path:{}", entry.path)
+        };
+        // A pathless entry has no mapping to contend over; that is a programming error for
+        // this operation rather than something to silently treat as absent.
+        if entry_path_key.is_empty() {
+            return Err(StorageError::Unsupported {
+                operation: "compare_and_set(AbsentFenced) on a pathless entry".to_string(),
+                backend: "redis".to_string(),
+            });
+        }
+
+        let value = serde_json::to_string(entry).map_err(|e| StorageError::SerializationError {
+            message: e.to_string(),
+        })?;
+        let fence_path_key = format!("secreton:path:{}", fence.path);
+        let expires = entry
+            .expires_at
+            .map(|at| at.timestamp().to_string())
+            .unwrap_or_default();
+
+        let script = redis::Script::new(
+            r"
+            local expires = ARGV[3]
+
+            local function write(key, value)
+                if expires ~= '' then
+                    local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
+                    if ttl <= 0 then
+                        redis.call('DEL', key)
+                        return
+                    end
+                    redis.call('SET', key, value)
+                    redis.call('PEXPIRE', key, ttl * 1000)
+                else
+                    redis.call('SET', key, value)
+                end
+            end
+
+            -- Occupancy first: a live record at the path means another registration won,
+            -- which the caller must see as a duplicate rather than a lost lease.
+            if redis.call('GET', KEYS[1]) then
+                return 2
+            end
+
+            -- Then the fence: the lease record must still exist and carry this token.
+            local fence_id = redis.call('GET', KEYS[2])
+            if not fence_id then
+                return 0
+            end
+            local fence_entry = redis.call('GET', 'secreton:entry:' .. fence_id)
+            if not fence_entry then
+                return 0
+            end
+            local ok, decoded = pcall(cjson.decode, fence_entry)
+            if not ok or type(decoded) ~= 'table' or type(decoded.metadata) ~= 'table'
+                or decoded.metadata['storage_owner'] ~= ARGV[4] then
+                return 0
+            end
+
+            write('secreton:entry:' .. ARGV[2], ARGV[1])
+            write(KEYS[1], ARGV[2])
+            return 1
+            ",
+        );
+
+        let outcome: i64 = {
+            let mut conn = self.manager.lock().await;
+            script
+                .key(&entry_path_key)
+                .key(&fence_path_key)
+                .arg(&value)
+                .arg(entry.id.to_string())
+                .arg(&expires)
+                .arg(fence.token)
+                .invoke_async(&mut *conn)
+                .await
+                .map_err(|e| StorageError::QueryFailed {
+                    message: format!("Failed to fenced insert entry: {}", e),
+                })?
+        };
+
+        match outcome {
+            1 => Ok(true),
+            0 => Ok(false),
+            2 => Err(StorageError::Duplicate {
+                resource_type: "SecretEntry".to_string(),
+                id: entry.path.clone(),
+            }),
+            other => Err(StorageError::QueryFailed {
+                message: format!("fenced insert returned an unexpected outcome: {other}"),
+            }),
         }
     }
 }
@@ -608,6 +725,12 @@ impl StorageBackend for RedisBackend {
         entry: &SecretEntry,
         expect: crate::Expect<'_>,
     ) -> StorageResult<bool> {
+        // `AbsentFenced` combines insert-if-absent with a lease fence, and its two failure
+        // modes must be distinguishable, so it runs its own single script.
+        if let crate::Expect::AbsentFenced(fence) = expect {
+            return self.compare_and_set_absent_fenced(entry, fence).await;
+        }
+
         let path_key = format!("secreton:path:{}", entry.path);
 
         let expected_owner = match expect {
@@ -702,6 +825,13 @@ impl StorageBackend for RedisBackend {
             crate::Expect::Absent => "absent",
             crate::Expect::Any => "any",
             crate::Expect::Owner(_) => "owner",
+            // Dispatched above; restated so the match stays exhaustive.
+            crate::Expect::AbsentFenced(_) => {
+                return Err(StorageError::Unsupported {
+                    operation: "compare_and_set".to_string(),
+                    backend: "redis".to_string(),
+                });
+            }
         };
 
         for _ in 0..CONDITIONAL_WRITE_MAX_ATTEMPTS {

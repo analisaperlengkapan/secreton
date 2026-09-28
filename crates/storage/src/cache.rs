@@ -860,8 +860,25 @@ mod round_trip_tests {
             expect: crate::Expect<'_>,
         ) -> StorageResult<bool> {
             // Deliberately *do not* normalize the id: write exactly the caller's record.
+            //
+            // `AbsentFenced` reports an occupied path as an error, not `Ok(false)`, so a
+            // caller can tell "someone else already took this name" from "my lease is gone".
+            // The check runs before the fence for the same reason as the memory backend.
+            if let crate::Expect::AbsentFenced(_) = expect
+                && self.inner.get_by_path(&entry.path).await?.is_some()
+            {
+                return Err(crate::StorageError::Duplicate {
+                    resource_type: "SecretEntry".to_string(),
+                    id: entry.path.clone(),
+                });
+            }
             let held = match expect {
                 crate::Expect::Absent => self.inner.get_by_path(&entry.path).await?.is_none(),
+                crate::Expect::AbsentFenced(fence) => self
+                    .inner
+                    .get_by_path(fence.path)
+                    .await?
+                    .is_some_and(|e| e.has_owner(fence.token)),
                 crate::Expect::Owner(token) => self
                     .inner
                     .get_by_path(&entry.path)

@@ -114,10 +114,108 @@ async fn assert_fenced_contract(backend: &(dyn StorageBackend + Send + Sync), le
     );
 }
 
+/// The `compare_and_set(.., Expect::AbsentFenced(_))` contract every backend must honour.
+///
+/// Creating the bootstrap root identity needs both an insert-if-absent and a still-held
+/// lease, as one indivisible step: a plain `Absent` would let a concurrently registered
+/// user be replaced, and a plain `store_fenced` would overwrite one. The two failure modes
+/// must also stay distinguishable — an occupied path is a duplicate, while a lost lease is
+/// `Ok(false)` — because the caller reports them as different errors.
+async fn assert_absent_fenced_contract(backend: &(dyn StorageBackend + Send + Sync), lease: &str) {
+    let artifact = "users/root";
+
+    backend
+        .store(&entry(lease, "winner", b"lease"))
+        .await
+        .expect("store lease record");
+
+    // While the path is free and the lease held, the write lands.
+    assert!(
+        backend
+            .compare_and_set(
+                &entry(artifact, "winner", b"root"),
+                Expect::AbsentFenced(StorageFence::new(lease, "winner"))
+            )
+            .await
+            .expect("fenced insert by the lease holder"),
+        "a free path plus a held lease must accept the insert"
+    );
+
+    // Now the path is occupied: the result must be a duplicate, not a lost-lease `false`,
+    // and the existing record must be untouched.
+    let occupied = backend
+        .compare_and_set(
+            &entry(artifact, "winner", b"replacement"),
+            Expect::AbsentFenced(StorageFence::new(lease, "winner")),
+        )
+        .await;
+    assert!(
+        matches!(occupied, Err(ref e) if e.is_precondition_failure()),
+        "an occupied path must be reported as a precondition failure, got {occupied:?}"
+    );
+    assert_eq!(
+        backend
+            .get_by_path(artifact)
+            .await
+            .expect("read")
+            .expect("the root record survives")
+            .encrypted_data,
+        b"root",
+        "a refused insert-if-absent must not replace the existing record"
+    );
+
+    // A stale attempt at a free path is `false` (lost lease), never a duplicate — the two
+    // outcomes must not be conflated.
+    let stale = backend
+        .compare_and_set(
+            &entry("users/other", "stale", b"stale"),
+            Expect::AbsentFenced(StorageFence::new(lease, "stale")),
+        )
+        .await
+        .expect("fenced insert by a stale holder");
+    assert!(
+        !stale,
+        "a stale lease on a free path must be refused, not treated as a duplicate"
+    );
+    assert!(
+        backend
+            .get_by_path("users/other")
+            .await
+            .expect("read")
+            .is_none(),
+        "a refused stale insert must write nothing"
+    );
+}
+
 #[tokio::test]
 async fn memory_backend_honours_the_fence() {
     let backend = MemoryBackend::new();
     assert_fenced_contract(&backend, "sys/init_lease").await;
+}
+
+#[tokio::test]
+async fn memory_backend_honours_absent_fenced() {
+    let backend = MemoryBackend::new();
+    assert_absent_fenced_contract(&backend, "sys/init_lease").await;
+}
+
+#[tokio::test]
+async fn file_backend_honours_absent_fenced() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backend = FileBackend::new(dir.path().to_str().expect("utf8 path")).expect("file backend");
+    assert_absent_fenced_contract(&backend, "sys/init_lease").await;
+}
+
+#[tokio::test]
+async fn cache_wrapper_preserves_the_absent_fenced_contract() {
+    use secreton_storage::cache::InMemoryCache;
+
+    let storage: Arc<dyn StorageBackend + Send + Sync> = Arc::new(CachedStorage::new(
+        MemoryBackend::new(),
+        InMemoryCache::new(),
+        Duration::from_secs(60),
+    ));
+    assert_absent_fenced_contract(storage.as_ref(), "sys/init_lease").await;
 }
 
 #[tokio::test]

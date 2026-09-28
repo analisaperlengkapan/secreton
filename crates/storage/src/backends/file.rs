@@ -112,19 +112,6 @@ impl FileBackend {
         })
     }
 
-    /// Serialize and write a secreton entry to file
-    fn write_entry(&self, file_path: &Path, entry: &SecretEntry) -> StorageResult<()> {
-        let content =
-            serde_json::to_string_pretty(entry).map_err(|e| StorageError::SerializationError {
-                message: format!("Failed to serialize entry: {}", e),
-            })?;
-
-        fs::write(file_path, content).map_err(|e| StorageError::BackendError {
-            backend: "File".to_string(),
-            message: format!("Failed to write entry file {}: {}", file_path.display(), e),
-        })
-    }
-
     /// Write an entry through a unique temporary file and a rename, so a reader never
     /// observes a half-written record and two concurrent writers never collide.
     ///
@@ -366,6 +353,10 @@ impl FileBackend {
 #[async_trait]
 impl StorageBackend for FileBackend {
     async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+        // Deliberately not serialised by the advisory lock: `store` is last-writer-wins, and
+        // a plain store racing a conditional one is already covered by the conditional
+        // write's own contract (see `compare_and_set`). Taking the exclusive lock here would
+        // put every ordinary write behind a cross-process lock it does not need.
         let file_path = self.entry_path(entry.id);
         self.write_entry_atomically(&file_path, entry).await
     }
@@ -395,9 +386,10 @@ impl StorageBackend for FileBackend {
     }
 
     async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
-        // For file backend, update is same as store (overwrite)
+        // For file backend, update is same as store (overwrite) and, like `store`, is not
+        // serialised by the advisory lock; the atomic rename still makes it whole.
         let file_path = self.entry_path(entry.id);
-        self.write_entry(&file_path, entry)
+        self.write_entry_atomically(&file_path, entry).await
     }
 
     async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
@@ -471,8 +463,26 @@ impl StorageBackend for FileBackend {
         let _guard = self.acquire_lock()?;
         let existing = self.get_by_path(&entry.path).await?;
 
+        // `AbsentFenced` reports an occupied path as an error, not `Ok(false)`, so a caller
+        // can tell "someone else already took this name" from "my lease is gone" — both
+        // must stop the write, but only the first is a duplicate. See `Expect`.
+        if let crate::Expect::AbsentFenced(_) = expect
+            && existing.is_some()
+        {
+            return Err(StorageError::Duplicate {
+                resource_type: "SecretEntry".to_string(),
+                id: entry.path.clone(),
+            });
+        }
+
         let holds = match expect {
             crate::Expect::Absent => existing.is_none(),
+            // The fence read shares the advisory lock with the write, so this is a genuine
+            // check-and-write, not the read-then-write `store_fenced`'s default refuses.
+            crate::Expect::AbsentFenced(fence) => self
+                .get_by_path(fence.path)
+                .await?
+                .is_some_and(|held| held.has_owner(fence.token)),
             crate::Expect::Owner(token) => existing.as_ref().is_some_and(|e| e.has_owner(token)),
             crate::Expect::Any => true,
         };
@@ -497,21 +507,34 @@ impl StorageBackend for FileBackend {
     async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
         // Conditional on ownership *and* executed under the lock, so a record rewritten
         // by another attempt between a naive read and delete cannot be removed by this one.
+        //
+        // Every record at the path that carries `token` is removed, not only the newest one.
+        // `store` is keyed by id, so an attempt that wrote the path under more than one id
+        // left several files behind; `get_by_path` resolves the newest, and removing only
+        // that one made the *previous* owned record visible again — `delete_owned` reported
+        // success while a read of the path still resolved, to a record of the very attempt
+        // the caller believed it had removed. A record carrying a different owner is
+        // deliberately preserved: cleanup must never delete another attempt's artifact.
         let _guard = self.acquire_lock()?;
-        let Some(entry) = self.get_by_path(path).await? else {
-            return Ok(false);
-        };
-        if !entry.has_owner(token) {
-            return Ok(false);
+        let entries = self.scan_entries()?;
+        let mut removed_any = false;
+        for entry in entries {
+            if entry.path != path || !entry.has_owner(token) {
+                continue;
+            }
+            match fs::remove_file(self.entry_path(entry.id)) {
+                Ok(()) => removed_any = true,
+                // Already removed by someone else; the record is gone either way.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(StorageError::BackendError {
+                        backend: "File".to_string(),
+                        message: format!("Failed to delete owned entry: {}", e),
+                    });
+                }
+            }
         }
-        match fs::remove_file(self.entry_path(entry.id)) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(StorageError::BackendError {
-                backend: "File".to_string(),
-                message: format!("Failed to delete owned entry: {}", e),
-            }),
-        }
+        Ok(removed_any)
     }
 
     /// The fence read and the write happen while the advisory lock is held, so the check
