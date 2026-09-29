@@ -1224,6 +1224,12 @@ mod round_trip_tests {
                     .get_by_path(&entry.path)
                     .await?
                     .is_some_and(|e| e.has_owner(token)),
+                crate::Expect::UnexpiredOwner(token) => {
+                    self.inner.get_by_path(&entry.path).await?.is_some_and(|e| {
+                        e.has_owner(token)
+                            && crate::lease_has_not_expired(&e, chrono::Utc::now().timestamp())
+                    })
+                }
                 crate::Expect::Any => true,
             };
             if !held {

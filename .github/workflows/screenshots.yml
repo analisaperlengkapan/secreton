@@ -200,14 +200,24 @@ jobs:
           pkill -f 'cargo-leptos' 2>/dev/null || true
           pkill -f 'secreton-server' 2>/dev/null || true
 
-      - name: Upload screenshots and server log
+      # Prints the server log to the job output only when something failed, which is where a
+      # human debugging the run reads it. It is deliberately *not* uploaded as an artifact:
+      # the 5xx path logs internal detail (invariant 4), and a downloadable artifact widens
+      # that beyond the job's own log, which is already scoped to the repository.
+      - name: Server log on failure
+        if: failure()
+        run: |
+          if [ -f /tmp/secreton-serve.log ]; then
+            echo "server log follows" >&2
+            cat /tmp/secreton-serve.log >&2
+          fi
+
+      - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: screenshots
-          path: |
-            docs/screenshots/
-            /tmp/secreton-serve.log
+          path: docs/screenshots/
           if-no-files-found: warn
 
       # The capture rewrites `docs/screenshots/*.png`. A diff means the rendered frontend

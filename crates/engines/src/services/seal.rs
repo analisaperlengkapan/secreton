@@ -828,16 +828,28 @@ impl SealService {
                     lost.store(true, Ordering::SeqCst);
                     return;
                 }
+                // `UnexpiredOwner`, not `Owner`: the renewal must be atomic on *both* the
+                // token and the deadline. The read above is only an early-out — an arbitrary
+                // window separates it from this write, and the lease can lapse inside it.
+                // Conditioning the replacement on the token alone would let this write
+                // revive a lease whose deadline had already passed, and a second replica that
+                // read that expiry and is taking the lease over would then race an attempt
+                // that believes it still holds a live lease. Folding the deadline into the
+                // same indivisible step closes that window: the write lands only while the
+                // record is both owned and still live, and a lapsed lease is never revived.
                 match storage
-                    .compare_and_set(&lease_entry(&owner, ttl_secs), Expect::Owner(&owner))
+                    .compare_and_set(
+                        &lease_entry(&owner, ttl_secs),
+                        Expect::UnexpiredOwner(&owner),
+                    )
                     .await
                 {
                     Ok(true) => {}
                     Ok(false) => {
                         tracing::error!(
-                            "Initialization lease renewal found the lease absent or owned by \
-                             another attempt; fencing this initialization so it cannot write \
-                             or commit."
+                            "Initialization lease renewal found the lease absent, expired, or \
+                             owned by another attempt; fencing this initialization so it cannot \
+                             write or commit."
                         );
                         lost.store(true, Ordering::SeqCst);
                         return;
@@ -4788,6 +4800,10 @@ mod tests {
         /// When set, a read of the lease record reports it as already expired, so a test can
         /// drive the renewal's lapsed-lease fail-closed path deterministically.
         expire_lease_on_read: std::sync::atomic::AtomicBool,
+        /// When set, the lease record is lapsed *in storage* the moment it is read — after
+        /// the read has returned a live body — so a test can force the lapse into the window
+        /// between a renewal's read and its conditional write. One-shot.
+        lapse_lease_after_read: std::sync::atomic::AtomicBool,
         /// Notified after each read of the lease record, so a test can wait for a renewal's
         /// expiry check instead of sleeping a fixed interval.
         lease_read: tokio::sync::Notify,
@@ -4806,6 +4822,7 @@ mod tests {
                 fail_staging_after_totp: std::sync::atomic::AtomicBool::new(false),
                 staging_fault_fired: std::sync::atomic::AtomicBool::new(false),
                 expire_lease_on_read: std::sync::atomic::AtomicBool::new(false),
+                lapse_lease_after_read: std::sync::atomic::AtomicBool::new(false),
                 lease_read: tokio::sync::Notify::new(),
             }
         }
@@ -4867,6 +4884,34 @@ mod tests {
                         record.encrypted_data = serde_json::to_vec(&held).unwrap_or_default();
                     }
                 }
+                // One-shot: a renewal has just read a *live* lease, and now the lease lapses
+                // in storage before the renewal's conditional write. This forces the lapse
+                // into the read-to-write window deterministically, which is exactly what an
+                // owner-only precondition cannot see. The body the read returned stays live.
+                if self
+                    .lapse_lease_after_read
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    && let Some(record) = found.as_ref()
+                    && let Some(owner) = record.owner_token()
+                {
+                    let lapsed = SecretEntry::new(
+                        INIT_LEASE_PATH.to_string(),
+                        serde_json::to_vec(&InitLease {
+                            owner: owner.to_string(),
+                            expires_at: Utc::now().timestamp() - 1,
+                        })
+                        .expect("serialise lapsed lease"),
+                        EncryptionMetadata::default(),
+                        SecurityLevel::Internal,
+                        Uuid::nil(),
+                    )
+                    .owned_by(owner)
+                    .add_metadata(
+                        secreton_storage::LEASE_EXPIRES_AT_KEY.to_string(),
+                        (Utc::now().timestamp() - 1).to_string(),
+                    );
+                    self.inner.upsert(&lapsed).await?;
+                }
             }
             Ok(found)
         }
@@ -4892,7 +4937,7 @@ mod tests {
             // operation the fault targets, so acquisition (insert-if-absent) still succeeds
             // and only the attempt's continued holding of the lease is broken.
             if entry.path == INIT_LEASE_PATH
-                && matches!(expect, Expect::Owner(_))
+                && matches!(expect, Expect::Owner(_) | Expect::UnexpiredOwner(_))
                 && self
                     .fail_lease_renewal
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -5374,7 +5419,7 @@ mod tests {
             // this backend model "expired leases are unusable" instead of "expired leases are
             // takeable", which is not the situation under test.
             if entry.path == INIT_LEASE_PATH
-                && matches!(expect, Expect::Owner(_))
+                && matches!(expect, Expect::Owner(_) | Expect::UnexpiredOwner(_))
                 && self.expiry_forced.load(std::sync::atomic::Ordering::SeqCst)
             {
                 let existing = self.inner.get_by_path(INIT_LEASE_PATH).await?;
@@ -5808,6 +5853,76 @@ mod tests {
         assert_eq!(
             claims_of(&complete.root_token.expect("root credential"))["username"],
             "renewed-root"
+        );
+    }
+
+    /// Regression: a renewal conditioned only on the owner token revived a lease whose
+    /// deadline had already passed. The renewal read the record, observed it live, and the
+    /// deadline lapsed before its write — an owner-only precondition still matched, so the
+    /// lapsed lease was rewritten with a fresh deadline. A replica that read that expiry and
+    /// was taking the lease over then raced an attempt that believed it held a live lease.
+    ///
+    /// The lapse is forced into the read-to-write window: the backend arms a one-shot hook
+    /// that expires the lease *in storage* on the read that returns a live body. The renewal
+    /// must be refused, leaving the stored deadline unextended. Falsified by conditioning the
+    /// renewal on `Expect::Owner` (the lapsed deadline is then overwritten and the stored
+    /// record is live again).
+    #[tokio::test]
+    async fn a_renewal_cannot_revive_a_lease_that_lapsed_in_its_read_to_write_window() {
+        let _env = crate::test_support::without_root_key();
+        let storage = Arc::new(SharedCrossProcessBackend::new(INIT_PATH));
+        let storage_dyn: Arc<dyn StorageBackend + Send + Sync> = storage.clone();
+        let vault =
+            Arc::new(sealed_vault_with_storage_and_lease_ttl(storage_dyn.clone(), Some(3)).await);
+
+        let attempt = {
+            let vault = vault.clone();
+            tokio::spawn(async move {
+                vault
+                    .seal
+                    .init(3, 2, "windowed-root", &vault.auth, &vault.mfa)
+                    .await
+            })
+        };
+
+        // The attempt is parked inside the root-key write, past the `check` that precedes it,
+        // holding the lease. Arm the lapse now so the next renewal reads a live body and then
+        // finds the lease expired at write time.
+        storage.reached.notified().await;
+        storage
+            .lapse_lease_after_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // At least one renewal interval (ttl / divisor = 1s) elapses, so a renewal reads the
+        // lease and attempts its conditional write with the lapse already in storage.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // The renewal must not have revived the lease: the stored deadline is still past.
+        let stored = storage
+            .inner
+            .get_by_path(INIT_LEASE_PATH)
+            .await
+            .expect("read lease")
+            .expect("the lapsed lease record must still be present");
+        let recorded = stored
+            .metadata
+            .get(secreton_storage::LEASE_EXPIRES_AT_KEY)
+            .and_then(|value| value.parse::<i64>().ok())
+            .expect("the lease records its deadline");
+        assert!(
+            recorded <= Utc::now().timestamp(),
+            "a renewal must not extend a lease whose deadline lapsed before its write; \
+             recorded {recorded} is not in the past"
+        );
+
+        storage.resume.notify_one();
+        let outcome = attempt.await.expect("the attempt task must not panic");
+        assert!(
+            outcome.is_err(),
+            "an attempt whose lease lapsed must fail closed rather than commit"
+        );
+        assert!(
+            !vault.seal.is_initialized().await,
+            "a fenced attempt must not leave an initialised vault"
         );
     }
 }

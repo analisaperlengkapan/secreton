@@ -251,6 +251,12 @@ impl RaftStateMachine {
         let precondition_holds = match expect {
             crate::Expect::Absent => existing.is_none(),
             crate::Expect::Owner(token) => existing.as_ref().is_some_and(|e| e.has_owner(token)),
+            // Owner *and* deadline, evaluated in the same state-machine step as the
+            // replacement: a renewal must not revive a lease that lapsed before this instant.
+            crate::Expect::UnexpiredOwner(token) => existing.as_ref().is_some_and(|e| {
+                e.has_owner(token)
+                    && crate::lease_has_not_expired(e, chrono::Utc::now().timestamp())
+            }),
             crate::Expect::Any => true,
             crate::Expect::AbsentFenced(_) => false,
         };

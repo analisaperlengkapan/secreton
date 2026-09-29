@@ -227,6 +227,25 @@ pub enum Expect<'a> {
     AbsentFenced(StorageFence<'a>),
     /// The record at the path must carry this exact owner token.
     Owner(&'a str),
+    /// The record at the path must carry this exact owner token **and** its recorded lease
+    /// deadline must still be in the future — checked against the backend's own clock, in
+    /// the same indivisible step as the write.
+    ///
+    /// This is [`Self::Owner`] with the deadline check folded in, and it exists because
+    /// [`Self::Owner`] alone is not enough to renew a lease. A renewal that reads the lease,
+    /// observes it live, and then writes it back is a read-then-write: an arbitrary window —
+    /// a scheduling pause, a slow round trip, a lock the writer waited on — separates the two,
+    /// and the lease can lapse inside it. Replacing the record is conditioned only on the
+    /// token, which a lapsed-but-not-yet-taken-over lease still carries, so the owner-conditional
+    /// write silently extends a deadline the holder had already exceeded. A second replica that
+    /// read the expiry in that window and is taking the lease over then races an attempt that
+    /// believes it still holds a live lease — the overlap the lease exists to prevent.
+    ///
+    /// Folding the deadline check into the precondition, evaluated in the same atomic step as
+    /// the write, closes that window: the write lands only if the record is both owned and
+    /// still live at the instant it is replaced, and a lapsed lease is never revived. Fails
+    /// closed on a missing or unparseable deadline, exactly as [`LEASE_EXPIRES_AT_KEY`] does.
+    UnexpiredOwner(&'a str),
     /// No precondition. The write is still a single atomic replacement, which is what
     /// distinguishes it from a read followed by a separate `store`.
     Any,

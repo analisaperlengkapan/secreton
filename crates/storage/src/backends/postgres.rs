@@ -517,7 +517,7 @@ impl StorageBackend for PostgresBackend {
         let security_level = entry.security_level as i32;
         let version = entry.version as i32;
         let token = match expect {
-            crate::Expect::Owner(token) => token.to_string(),
+            crate::Expect::Owner(token) | crate::Expect::UnexpiredOwner(token) => token.to_string(),
             _ => String::new(),
         };
 
@@ -557,12 +557,28 @@ impl StorageBackend for PostgresBackend {
                         &entry.expires_at,
                     ],
                 ),
-                crate::Expect::Owner(_) => (
+                crate::Expect::Owner(_) | crate::Expect::UnexpiredOwner(_) => (
                     // The owner key is a compile-time constant, not interpolated input.
+                    // `UnexpiredOwner` folds the lease deadline into the same `WHERE`, so the
+                    // renewal is a single statement whose precondition and write cannot
+                    // interleave: a lease that lapsed before the statement executes matches no
+                    // row and is never revived. The deadline is read from metadata against the
+                    // database clock, and the regex guard keeps the `::bigint` cast from
+                    // erroring on a malformed value rather than rejecting it.
                     format!(
                         "UPDATE secreton_entries SET{owner_update_set} \
-                         WHERE path = $1 AND metadata->>'{owner}' = $11",
-                        owner = crate::OWNER_TOKEN_KEY
+                         WHERE path = $1 AND metadata->>'{owner}' = $11{deadline}",
+                        owner = crate::OWNER_TOKEN_KEY,
+                        deadline = match expect {
+                            crate::Expect::UnexpiredOwner(_) => format!(
+                                " AND metadata->>'{expires}' IS NOT NULL \
+                                 AND (metadata->>'{expires}') ~ '^[0-9]+$' \
+                                 AND (metadata->>'{expires}')::bigint \
+                                     > EXTRACT(EPOCH FROM NOW())::bigint",
+                                expires = crate::LEASE_EXPIRES_AT_KEY
+                            ),
+                            _ => String::new(),
+                        }
                     ),
                     vec![
                         &entry.path,

@@ -488,6 +488,11 @@ impl StorageBackend for FileBackend {
                 })
             }
             crate::Expect::Owner(token) => existing.as_ref().is_some_and(|e| e.has_owner(token)),
+            // Owner *and* deadline, evaluated under the same advisory lock as the
+            // replacement: a renewal must not revive a lease that lapsed before this instant.
+            crate::Expect::UnexpiredOwner(token) => existing.as_ref().is_some_and(|e| {
+                e.has_owner(token) && crate::lease_has_not_expired(e, Utc::now().timestamp())
+            }),
             crate::Expect::Any => true,
         };
         if !holds {
@@ -989,6 +994,58 @@ mod tests {
                 .owner_token(),
             Some("attempt-b"),
             "cleanup must not delete another attempt's artifact"
+        );
+    }
+
+    /// Regression: `Expect::Owner` alone let a renewal revive a lease that had already
+    /// lapsed — the check-then-write ran under the lock, but the deadline could pass between
+    /// the caller's read and this call, and the token alone still matched. `UnexpiredOwner`
+    /// folds the deadline into the same advisory-locked step, so the lapsed lease is not
+    /// revived. Falsified by treating the new variant like `Owner`.
+    #[tokio::test]
+    async fn an_unexpired_owner_write_refuses_to_revive_a_lapsed_lease() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let backend = FileBackend::new(dir.path().to_str().expect("utf8 path")).expect("backend");
+        let path = "sys/init_lease";
+        let lease = |token: &str, expires_at: i64| {
+            entry_at(Uuid::new_v4(), path, b"lease")
+                .owned_by(token)
+                .add_metadata(
+                    crate::LEASE_EXPIRES_AT_KEY.to_string(),
+                    expires_at.to_string(),
+                )
+        };
+
+        backend
+            .store(&lease("attempt-a", Utc::now().timestamp() - 1))
+            .await
+            .expect("store lapsed lease");
+
+        assert!(
+            !backend
+                .compare_and_set(
+                    &lease("attempt-a", Utc::now().timestamp() + 300),
+                    crate::Expect::UnexpiredOwner("attempt-a")
+                )
+                .await
+                .expect("conditional renewal"),
+            "a renewal must not revive a lease whose deadline has already passed"
+        );
+
+        // The positive control: a live owned lease is renewed.
+        backend
+            .store(&lease("attempt-b", Utc::now().timestamp() + 300))
+            .await
+            .expect("store live lease");
+        assert!(
+            backend
+                .compare_and_set(
+                    &lease("attempt-b", Utc::now().timestamp() + 600),
+                    crate::Expect::UnexpiredOwner("attempt-b")
+                )
+                .await
+                .expect("conditional renewal"),
+            "a live owned lease must be renewable"
         );
     }
 }

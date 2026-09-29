@@ -930,11 +930,13 @@ impl StorageBackend for RedisBackend {
         let path_key = format!("secreton:path:{}", entry.path);
 
         let expected_owner = match expect {
-            crate::Expect::Owner(token) => Some(token.to_string()),
+            crate::Expect::Owner(token) | crate::Expect::UnexpiredOwner(token) => {
+                Some(token.to_string())
+            }
             _ => None,
         };
 
-        // KEYS[1]=path key; ARGV[1]=value, ARGV[2]=mode ("absent" | "any" | "owner"),
+        // KEYS[1]=path key; ARGV[1]=value, ARGV[2]=mode ("absent" | "any" | "owner" | "unexpired_owner"),
         // ARGV[3]=owner token (owner mode only), ARGV[4]=the id the payload was built with,
         // ARGV[5]=the os.time() at which the record expires, or '' for no expiry.
         //
@@ -988,7 +990,7 @@ impl StorageBackend for RedisBackend {
             end
 
             if not mapping then
-                if mode == 'owner' then
+                if mode == 'owner' or mode == 'unexpired_owner' then
                     return 0
                 end
                 if write('secreton:entry:' .. expected, ARGV[1]) == 0 then
@@ -1011,7 +1013,7 @@ impl StorageBackend for RedisBackend {
                 end
             end
 
-            if mode == 'owner' then
+            if mode == 'owner' or mode == 'unexpired_owner' then
                 local current = redis.call('GET', 'secreton:entry:' .. mapping)
                 if not current then
                     return 0
@@ -1020,6 +1022,16 @@ impl StorageBackend for RedisBackend {
                 if not ok or type(decoded) ~= 'table' or type(decoded.metadata) ~= 'table'
                     or decoded.metadata['storage_owner'] ~= ARGV[3] then
                     return 0
+                end
+                -- An expired lease is not a held lease: `unexpired_owner` folds the deadline
+                -- into the same atomic step as the replacement, so a renewal cannot revive a
+                -- lease that lapsed before this instant. The deadline is compared against the
+                -- server clock; a missing or non-numeric deadline fails closed.
+                if mode == 'unexpired_owner' then
+                    local lease_expires = tonumber(decoded.metadata['lease_expires_at'])
+                    if not lease_expires or lease_expires <= tonumber(redis.call('TIME')[1]) then
+                        return 0
+                    end
                 end
             end
 
@@ -1043,6 +1055,7 @@ impl StorageBackend for RedisBackend {
             crate::Expect::Absent => "absent",
             crate::Expect::Any => "any",
             crate::Expect::Owner(_) => "owner",
+            crate::Expect::UnexpiredOwner(_) => "unexpired_owner",
             // Dispatched above; restated so the match stays exhaustive.
             crate::Expect::AbsentFenced(_) => {
                 return Err(StorageError::Unsupported {
@@ -2343,5 +2356,61 @@ mod tests {
             .expect("a live record must survive an expired write targeting another path");
         assert_eq!(resolved.id, live_id);
         assert_eq!(resolved.encrypted_data, b"live");
+    }
+
+    /// Regression: an `Expect::Owner`-conditioned renewal revived a lease whose deadline had
+    /// already passed, because the owner token alone still matched. `UnexpiredOwner` checks
+    /// the recorded deadline in the same Lua step as the replacement, so a lapsed lease is
+    /// not revived. Falsified by treating the new variant like `Owner`.
+    #[tokio::test]
+    async fn an_unexpired_owner_write_refuses_to_revive_a_lapsed_lease() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/lease/unexpired");
+        let now = Utc::now().timestamp();
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        // A lapsed lease owned by `attempt-a`: the deadline is in the past, but the token
+        // still matches, which is exactly what an owner-only precondition cannot see.
+        let lapsed = entry_at(&path, b"lapsed")
+            .owned_by("attempt-a")
+            .add_metadata(
+                crate::LEASE_EXPIRES_AT_KEY.to_string(),
+                (now - 1).to_string(),
+            );
+        backend.store(&lapsed).await.expect("store lapsed lease");
+        let renewal = entry_at(&path, b"renewed")
+            .owned_by("attempt-a")
+            .add_metadata(
+                crate::LEASE_EXPIRES_AT_KEY.to_string(),
+                (now + 300).to_string(),
+            );
+
+        assert!(
+            !backend
+                .compare_and_set(&renewal, Expect::UnexpiredOwner("attempt-a"))
+                .await
+                .expect("conditional renewal"),
+            "a renewal must not revive a lease whose deadline has already passed"
+        );
+
+        // The positive control: a live owned lease is renewable through the same path.
+        let live = entry_at(&path, b"live").owned_by("attempt-b").add_metadata(
+            crate::LEASE_EXPIRES_AT_KEY.to_string(),
+            (now + 300).to_string(),
+        );
+        backend.store(&live).await.expect("store live lease");
+        assert!(
+            backend
+                .compare_and_set(
+                    &renewal.owned_by("attempt-b"),
+                    Expect::UnexpiredOwner("attempt-b")
+                )
+                .await
+                .expect("conditional renewal"),
+            "a live owned lease must be renewable"
+        );
     }
 }

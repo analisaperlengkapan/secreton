@@ -197,6 +197,11 @@ impl StorageBackend for MemoryBackend {
                     && crate::lease_has_not_expired(held, Utc::now().timestamp())
             }),
             crate::Expect::Owner(token) => existing.is_some_and(|e| e.has_owner(token)),
+            // Owner *and* deadline, evaluated under the same write guard as the replacement:
+            // a renewal must not revive a lease that lapsed before this instant.
+            crate::Expect::UnexpiredOwner(token) => existing.is_some_and(|e| {
+                e.has_owner(token) && crate::lease_has_not_expired(e, Utc::now().timestamp())
+            }),
             crate::Expect::Any => true,
         };
         if !holds {
@@ -988,5 +993,75 @@ mod tests {
             .build()
             .expect("runtime")
             .block_on(future)
+    }
+
+    /// A record at `path` owned by `token` whose recorded lease deadline is `expires_at`
+    /// (Unix seconds).
+    fn lease_entry_at(path: &str, token: &str, expires_at: i64) -> SecretEntry {
+        SecretEntry::new(
+            path.to_string(),
+            b"lease".to_vec(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::new_v4(),
+        )
+        .owned_by(token)
+        .add_metadata(
+            crate::LEASE_EXPIRES_AT_KEY.to_string(),
+            expires_at.to_string(),
+        )
+    }
+
+    /// Regression: `Expect::Owner` alone let a renewal revive a lease that had already
+    /// lapsed. The renewal read the record, saw it live, and then the record's deadline
+    /// passed before the write; conditioning only on the token replaced it with a fresh
+    /// deadline, and a replica that read the expiry in that window raced an attempt that
+    /// still believed it held a live lease. `UnexpiredOwner` folds the deadline into the
+    /// same atomic step, so the lapsed lease is not revived. Falsified by treating the new
+    /// variant like `Owner`.
+    #[tokio::test]
+    async fn an_unexpired_owner_write_refuses_to_revive_a_lapsed_lease() {
+        let backend = MemoryBackend::new();
+        let path = "sys/init_lease";
+        let lapsed_at = Utc::now().timestamp() - 1;
+        let lapsed = lease_entry_at(path, "attempt-a", lapsed_at);
+        backend.store(&lapsed).await.unwrap();
+
+        let renewal = lease_entry_at(path, "attempt-a", Utc::now().timestamp() + 300);
+        assert!(
+            !backend
+                .compare_and_set(&renewal, crate::Expect::UnexpiredOwner("attempt-a"))
+                .await
+                .unwrap(),
+            "a renewal must not revive a lease whose deadline has already passed"
+        );
+        let expired_marker = lapsed_at.to_string();
+        assert_eq!(
+            backend
+                .get_by_path(path)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata
+                .get(crate::LEASE_EXPIRES_AT_KEY)
+                .map(String::as_str),
+            Some(expired_marker.as_str()),
+            "the lapsed lease record must be left untouched, not rewritten with a fresh deadline"
+        );
+
+        // The positive control: a *live* owned lease is renewed, so the variant is not simply
+        // refusing every write.
+        let live = lease_entry_at(path, "attempt-b", Utc::now().timestamp() + 300);
+        backend.store(&live).await.unwrap();
+        assert!(
+            backend
+                .compare_and_set(
+                    &lease_entry_at(path, "attempt-b", Utc::now().timestamp() + 600),
+                    crate::Expect::UnexpiredOwner("attempt-b")
+                )
+                .await
+                .unwrap(),
+            "a live owned lease must be renewable"
+        );
     }
 }
