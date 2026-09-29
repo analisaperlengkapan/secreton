@@ -30,6 +30,13 @@ fn entry(path: &str, payload: &[u8]) -> SecretEntry {
     )
 }
 
+/// An entry carrying a single metadata pair, so a `metadata_filters` query can select it.
+fn entry_with_metadata(path: &str, payload: &[u8], key: &str, value: &str) -> SecretEntry {
+    let mut entry = entry(path, payload);
+    entry.metadata.insert(key.to_string(), value.to_string());
+    entry
+}
+
 fn postgres_url() -> Option<String> {
     match std::env::var("SECRETON_TEST_POSTGRES_URL") {
         Ok(url) if !url.trim().is_empty() => Some(url),
@@ -106,4 +113,77 @@ async fn postgres_count_matches_the_paginated_page() {
     backend.migrate().await.expect("migrate");
     let namespace = format!("count-pagination/pg/{}", uuid::Uuid::new_v4());
     assert_count_matches_the_page(&backend, &namespace).await;
+}
+
+#[tokio::test]
+async fn postgres_count_with_metadata_filter_and_pagination_matches_the_page() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let backend = secreton_storage::backends::PostgresBackend::new(&url)
+        .await
+        .expect("connect");
+    backend.migrate().await.expect("migrate");
+    let namespace = format!("count-pagination/pg-meta/{}", uuid::Uuid::new_v4());
+    assert_metadata_count_matches_the_page(&backend, &namespace).await;
+}
+
+/// The same pagination contract, but with a metadata filter present.
+///
+/// A metadata predicate binds a JSONB value; `count` builds numbered placeholders and must
+/// advance past that binding before it emits `LIMIT $n` / `OFFSET $n`. When it did not, the
+/// limit reused the JSONB placeholder and PostgreSQL rejected the query with a "could not
+/// determine data type" / bind-count error — so a filtered, paginated count failed outright
+/// instead of returning the page size. `list` already advanced the counter; this pins the two
+/// backends to the same answer under a filter.
+async fn assert_metadata_count_matches_the_page(
+    backend: &(dyn StorageBackend + Send + Sync),
+    namespace: &str,
+) {
+    // Five rows share the filter, and three more are outside it. The filter must narrow the
+    // page before `limit`/`offset` apply, exactly as `list` does.
+    for i in 0..5u8 {
+        let path = format!("{namespace}/in/{i}");
+        backend
+            .store(&entry_with_metadata(&path, &[i], "team", "ops"))
+            .await
+            .expect("seed matching entry");
+    }
+    for i in 0..3u8 {
+        let path = format!("{namespace}/out/{i}");
+        backend
+            .store(&entry_with_metadata(&path, &[i], "team", "infra"))
+            .await
+            .expect("seed non-matching entry");
+    }
+
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("team".to_string(), "ops".to_string());
+
+    let scoped = |limit: Option<u32>, offset: Option<u32>| QueryParams {
+        path_prefix: Some(namespace.to_string()),
+        metadata_filters: filters.clone(),
+        limit,
+        offset,
+        ..QueryParams::default()
+    };
+
+    for (limit, offset) in [
+        (None, None),
+        (Some(3), None),
+        (Some(3), Some(2)),
+        (Some(2), Some(4)),
+        (Some(10), Some(4)),
+        (None, Some(2)),
+    ] {
+        let params = scoped(limit, offset);
+        let listed = backend.list(&params).await.expect("list");
+        let counted = backend.count(&params).await.expect("count");
+        assert_eq!(
+            counted,
+            listed.len() as u64,
+            "a metadata-filtered count must equal the page list returns for \
+             limit={limit:?} offset={offset:?}"
+        );
+    }
 }

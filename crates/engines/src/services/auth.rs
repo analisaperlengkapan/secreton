@@ -1812,6 +1812,47 @@ impl AuthenticationService {
         .owned_by(&owner)
         .with_expiration(claim_expiry);
 
+        // A completed rotation revokes the refresh token durably at a *different* path from
+        // the reservation, and that revocation outlives the short claim window (it is written
+        // with the token's own expiry). Reclaiming a lapsed reservation must therefore not be
+        // enough to exchange the token again: a replay whose `is_token_revoked` fast path
+        // missed (a different replica, or a storage read that failed open) would otherwise
+        // delete the expired reservation and re-claim the slot, and be handed a second session
+        // for a token that was already exchanged. Check the durable revocation here, at the
+        // point of reclaiming, and refuse — fail *closed* on a read error, because the
+        // alternative is admitting a replay of a single-use token.
+        match self
+            .storage
+            .get_by_path(&Self::revoked_token_path(refresh_token))
+            .await
+        {
+            Ok(Some(revocation)) => {
+                let live = revocation
+                    .expires_at
+                    .map(|exp| exp > chrono::Utc::now())
+                    .unwrap_or(true);
+                if live {
+                    // Undo the in-memory slot this call just inserted, exactly as the
+                    // `Ok(false)` arm below does, so this process does not carry a reservation
+                    // for a token it must refuse.
+                    let mut blacklist = self.token_blacklist.write().await;
+                    blacklist.remove(refresh_token);
+                    return Ok(None);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read the durable revocation record while reserving a refresh \
+                     token; refusing the exchange rather than risk replaying an already-rotated \
+                     token: {e}"
+                );
+                let mut blacklist = self.token_blacklist.write().await;
+                blacklist.remove(refresh_token);
+                return Err(AuthError::Storage(e));
+            }
+        }
+
         // A lapsed claim must not block a retry. `compare_and_set(Absent)` does not by
         // itself reclaim a record at the path, and the reservation is deliberately *not*
         // deleted on a successful exchange, so a claim whose short deadline passed — an
@@ -4370,6 +4411,77 @@ mod tests {
             0,
             "a release must never remove a reservation by path — that read-then-delete \
              fallback is exactly what lets a stale release destroy another attempt's slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reclaimed_reservation_still_honors_a_live_durable_revocation() {
+        // Regression (Auth Bypass): `reserve_refresh_token` reclaimed a lapsed reservation by
+        // deleting the expired record and re-claiming the slot, without ever consulting the
+        // durable *revocation* a completed rotation had written at a different path. A replay
+        // whose early `is_token_revoked` check missed — another replica, or a storage read that
+        // failed open — therefore obtained a second session for an already-exchanged token once
+        // its short claim window elapsed. The property: a lapsed reservation is not reclaimable
+        // while a live revocation for the same token exists.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+        // A one-second claim window stands in for the production two minutes.
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "revoked-but-reclaimable-refresh-token";
+        service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // A completed rotation writes the durable revocation and leaves the reservation, with
+        // its short claim window, to lapse.
+        service.revoke_token(token.to_string(), expiry).await;
+
+        // Clear the in-memory fast path, modelling a different replica (or an instance that
+        // never saw the revocation) whose only record of the revocation is durable storage.
+        {
+            let mut blacklist = service.token_blacklist.write().await;
+            blacklist.remove(token);
+        }
+
+        // Let the claim lapse, then attempt to reclaim it. The durable revocation must win.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim a lapsed but revoked reservation")
+                .is_none(),
+            "a live durable revocation must refuse the reclaimed slot, \
+             or a replay of an exchanged token is issued a second session"
+        );
+
+        // Guard the other direction: a token with no durable revocation is still reclaimable
+        // after its claim lapses, so the check did not simply disable reclaiming altogether.
+        let fresh_token = "unrevoked-reclaimable-refresh-token";
+        let _first = service
+            .reserve_refresh_token(fresh_token, expiry)
+            .await
+            .expect("first reserve")
+            .expect("the first claim wins");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            service
+                .reserve_refresh_token(fresh_token, expiry)
+                .await
+                .expect("re-claim an unrevoked lapsed reservation")
+                .is_some(),
+            "a lapsed reservation with no durable revocation must remain reclaimable"
         );
     }
 

@@ -805,6 +805,12 @@ impl StorageBackend for PostgresBackend {
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect(),
             )));
+            // Advance past the placeholder just bound, exactly as `list` does. Without this
+            // `param_count` still names the JSONB predicate, so a following `LIMIT ${...}` or
+            // a nonzero-offset `OFFSET ${...}` reuses `$1` for an integer while a second value
+            // is appended: PostgreSQL sees the placeholder bound to two values and rejects the
+            // whole query, so a filtered, paginated `count` failed instead of returning a size.
+            param_count += 1;
         }
 
         if !params.include_expired {

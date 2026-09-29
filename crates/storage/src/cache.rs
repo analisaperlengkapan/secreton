@@ -363,6 +363,24 @@ where
             self.touched_ids.push(previous.id);
         }
     }
+
+    /// Note the path an id currently names in the backend, before a staged write moves it.
+    ///
+    /// A `store` or `update` of an existing id at a *new* path is a relocation: the backend
+    /// then resolves the id only at the new path, but the old path's cache key survives unless
+    /// it is reconciled. Recording the source path here makes the commit clear it (the path is
+    /// re-read from the backend and cached, or, absent, dropped) so a cached lookup at the
+    /// former path cannot keep serving the relocated record until its TTL expires. The id's
+    /// *current* path is read from the backend, not from the cache, so a relocation this
+    /// wrapper did not observe is still caught.
+    async fn record_relocated_path(&mut self, entry: &SecretEntry) {
+        if let Ok(Some(previous)) = self.storage.get_by_id(entry.id).await
+            && !previous.path.is_empty()
+            && previous.path != entry.path
+        {
+            self.touched_paths.push(previous.path);
+        }
+    }
 }
 
 #[async_trait]
@@ -373,6 +391,7 @@ where
 {
     async fn store(&mut self, entry: &SecretEntry) -> StorageResult<()> {
         self.record_displaced_id(entry).await;
+        self.record_relocated_path(entry).await;
         self.inner.store(entry).await?;
         self.staged_paths.insert(entry.id, entry.path.clone());
         self.touched_paths.push(entry.path.clone());
@@ -382,6 +401,7 @@ where
 
     async fn update(&mut self, entry: &SecretEntry) -> StorageResult<()> {
         self.record_displaced_id(entry).await;
+        self.record_relocated_path(entry).await;
         self.inner.update(entry).await?;
         self.staged_paths.insert(entry.id, entry.path.clone());
         self.touched_paths.push(entry.path.clone());
@@ -468,12 +488,31 @@ where
             }
         }
         for id in &touched_ids {
-            // A record still present (a write, possibly under a different path) has already
-            // had its id key refreshed above; a removed or superseded id has not.
-            if storage.get_by_id(*id).await.ok().flatten().is_none() {
-                let _ = cache
-                    .delete(&CachedStorage::<S, C>::cache_key_for_id(*id))
-                    .await;
+            // Reconcile each touched id against the backend as the authority, rather than
+            // assuming the path loop above refreshed it.
+            //
+            // The path loop refreshes an id key only when the *path* readback succeeds. If that
+            // read fails after a committed update, the path key is cleared but the id key kept
+            // the pre-write value, and `get_by_id` then served the stale record until its TTL
+            // expired — a committed update invisible through half the API. A `get_by_id` that
+            // succeeds must refresh the id key with the canonical record; an absent record or a
+            // failed read must drop it, so the next read misses and goes to the backend.
+            match storage.get_by_id(*id).await {
+                Ok(Some(canonical)) => {
+                    let serialized = postcard::to_stdvec(&canonical).unwrap_or_default();
+                    let _ = cache
+                        .set(
+                            &CachedStorage::<S, C>::cache_key_for_id(*id),
+                            serialized,
+                            Some(default_ttl),
+                        )
+                        .await;
+                }
+                Ok(None) | Err(_) => {
+                    let _ = cache
+                        .delete(&CachedStorage::<S, C>::cache_key_for_id(*id))
+                        .await;
+                }
             }
         }
         Ok(())
@@ -1796,6 +1835,425 @@ mod round_trip_tests {
                 .expect("cached read")
                 .is_none(),
             "the deleted id must not be readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_relocation_clears_the_old_path_cache() {
+        // Regression: `CachedTransaction` tracked only the destination path of a staged
+        // `store`/`update`. On a backend that relocates an id — the record's `path` field
+        // moves to the new path — a cached lookup at the *former* path kept returning the
+        // relocated record until its TTL expired, even though the backend no longer names it
+        // there. The property: after a commit that moves an id, the old path resolves to
+        // nothing through the wrapper, matching the backend.
+        //
+        // `RelocatingBackend` makes the relocation explicit (`MemoryBackend` reconciles the
+        // id index too, so the stale lookup would otherwise hit the backend and miss).
+        let backend = RelocatingBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let old_path = "kv/tx/relocate-old";
+        let new_path = "kv/tx/relocate-new";
+
+        // Seed at the old path through the wrapper, then read it back so both the path key
+        // (`old_path`) and the id key hold the record.
+        let entry = sample_entry_with_path(old_path, b"payload");
+        crate::StorageBackend::store(&cached, &entry)
+            .await
+            .expect("seed");
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, old_path)
+                .await
+                .expect("warm old path")
+                .is_some(),
+            "the seed must be cached at the old path"
+        );
+
+        // Move the same id to a new path through a transaction.
+        let mut relocated = entry.clone();
+        relocated.path = new_path.to_string();
+        let mut tx = crate::StorageBackend::begin_transaction(&cached)
+            .await
+            .expect("begin");
+        tx.store(&relocated).await.expect("stage store");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, new_path)
+                .await
+                .expect("cached read")
+                .is_some(),
+            "the relocated record must resolve at its new path"
+        );
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, old_path)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "the former path must not keep serving the relocated record from cache"
+        );
+    }
+
+    /// A backend that relocates an id: `store` of an existing id at a different path removes
+    /// the record from the old path and leaves it reachable only at the new one, so a cached
+    /// old-path key is the only way the former path could still answer. State is shared across
+    /// clones (like `MemoryBackend`), so the wrapper and the test observe the same store.
+    #[derive(Debug, Clone)]
+    struct RelocatingBackend {
+        data: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, SecretEntry>>>,
+    }
+
+    impl RelocatingBackend {
+        fn new() -> Self {
+            Self {
+                data: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::StorageBackend for RelocatingBackend {
+        async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            let mut data = self.data.write().unwrap();
+            // Drop any record of the same id under a different path, so the id resolves only
+            // at the new path.
+            data.retain(|_, record| record.id != entry.id || record.path == entry.path);
+            data.insert(entry.path.clone(), entry.clone());
+            Ok(())
+        }
+        async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
+            let data = self.data.read().unwrap();
+            Ok(data.values().find(|record| record.id == id).cloned())
+        }
+        async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            let data = self.data.read().unwrap();
+            Ok(data.get(path).cloned())
+        }
+        async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.store(entry).await
+        }
+        async fn upsert(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.store(entry).await
+        }
+        async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+            let mut data = self.data.write().unwrap();
+            let before = data.len();
+            data.retain(|_, record| record.id != id);
+            Ok(data.len() < before)
+        }
+        async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            let mut data = self.data.write().unwrap();
+            Ok(data.remove(path).is_some())
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            _expect: crate::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.store(entry).await?;
+            Ok(true)
+        }
+        async fn store_fenced(
+            &self,
+            entry: &SecretEntry,
+            _fence: crate::StorageFence<'_>,
+        ) -> StorageResult<bool> {
+            self.store(entry).await?;
+            Ok(true)
+        }
+        async fn delete_owned(&self, path: &str, _token: &str) -> StorageResult<bool> {
+            self.delete_by_path(path).await
+        }
+        async fn list(&self, params: &crate::QueryParams) -> StorageResult<Vec<SecretEntry>> {
+            let data = self.data.read().unwrap();
+            Ok(params.apply_to(data.values().cloned().collect()))
+        }
+        async fn count(&self, params: &crate::QueryParams) -> StorageResult<u64> {
+            Ok(self.list(params).await?.len() as u64)
+        }
+        async fn exists(&self, path: &str) -> StorageResult<bool> {
+            let data = self.data.read().unwrap();
+            Ok(data.contains_key(path))
+        }
+        async fn begin_transaction(&self) -> StorageResult<Box<dyn crate::StorageTransaction>> {
+            Ok(Box::new(RelocatingTransaction {
+                backend: self.clone(),
+                ops: Vec::new(),
+            }))
+        }
+        async fn health_check(&self) -> StorageResult<crate::HealthStatus> {
+            Ok(crate::HealthStatus {
+                is_healthy: true,
+                response_time_ms: 0.0,
+                connections_active: 0,
+                connections_idle: 0,
+                last_error: None,
+                uptime_seconds: 0,
+            })
+        }
+        async fn get_stats(&self) -> StorageResult<crate::StorageStats> {
+            let data = self.data.read().unwrap();
+            Ok(crate::StorageStats {
+                total_entries: data.len() as u64,
+                total_size_bytes: 0,
+                average_entry_size: 0.0,
+                entries_by_security_level: std::collections::HashMap::new(),
+                entries_created_today: 0,
+                entries_updated_today: 0,
+                expired_entries: 0,
+            })
+        }
+        async fn migrate(&self) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn delete_expired(&self, _path_prefix: Option<String>) -> StorageResult<u64> {
+            Ok(0)
+        }
+        async fn store_oauth_state(
+            &self,
+            _state: &secreton_domain::OAuthState,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn get_oauth_state(
+            &self,
+            _state: &str,
+        ) -> StorageResult<Option<secreton_domain::OAuthState>> {
+            Ok(None)
+        }
+        async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Buffered transaction for [`RelocatingBackend`]. `commit` applies the staged ops through
+    /// the backend's relocating `store`, so a moved id is dropped from its former path.
+    #[derive(Debug)]
+    struct RelocatingTransaction {
+        backend: RelocatingBackend,
+        ops: Vec<(Uuid, SecretEntry)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::StorageTransaction for RelocatingTransaction {
+        async fn store(&mut self, entry: &SecretEntry) -> StorageResult<()> {
+            self.ops.push((entry.id, entry.clone()));
+            Ok(())
+        }
+        async fn update(&mut self, entry: &SecretEntry) -> StorageResult<()> {
+            self.ops.push((entry.id, entry.clone()));
+            Ok(())
+        }
+        async fn delete(&mut self, id: Uuid) -> StorageResult<bool> {
+            crate::StorageBackend::delete_by_id(&self.backend, id).await
+        }
+        async fn commit(self: Box<Self>) -> StorageResult<()> {
+            for (_, entry) in &self.ops {
+                crate::StorageBackend::store(&self.backend, entry).await?;
+            }
+            Ok(())
+        }
+        async fn rollback(self: Box<Self>) -> StorageResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A backend whose transaction commit succeeds, then makes the *next* `get_by_path` fail,
+    /// so the cache wrapper's post-commit canonical path readback cannot complete.
+    /// `MemoryBackend` leaves no stale path behind on its own, so this isolated the wrapper's
+    /// id-key reconciliation.
+    #[derive(Debug, Clone)]
+    struct FailingPathReadbackBackend {
+        inner: crate::backends::MemoryBackend,
+        fail_next_get_by_path: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FailingPathReadbackBackend {
+        fn new() -> Self {
+            Self {
+                inner: crate::backends::MemoryBackend::new(),
+                fail_next_get_by_path: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingPathReadbackTransaction {
+        inner: Box<dyn crate::StorageTransaction>,
+        fail_next_get_by_path: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::StorageTransaction for FailingPathReadbackTransaction {
+        async fn store(&mut self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.store(entry).await
+        }
+        async fn update(&mut self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.update(entry).await
+        }
+        async fn delete(&mut self, id: Uuid) -> StorageResult<bool> {
+            self.inner.delete(id).await
+        }
+        async fn commit(self: Box<Self>) -> StorageResult<()> {
+            let Self {
+                inner,
+                fail_next_get_by_path,
+            } = *self;
+            inner.commit().await?;
+            // Arm the failure *after* the durable commit, so only the wrapper's post-commit
+            // readback (which runs next) observes it.
+            fail_next_get_by_path.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn rollback(self: Box<Self>) -> StorageResult<()> {
+            let Self { inner, .. } = *self;
+            inner.rollback().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::StorageBackend for FailingPathReadbackBackend {
+        async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.store(entry).await
+        }
+        async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_id(id).await
+        }
+        async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            if self
+                .fail_next_get_by_path
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::StorageError::BackendError {
+                    backend: "test".to_string(),
+                    message: "transient post-commit readback failure".to_string(),
+                });
+            }
+            self.inner.get_by_path(path).await
+        }
+        async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.update(entry).await
+        }
+        async fn upsert(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.upsert(entry).await
+        }
+        async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+            self.inner.delete_by_id(id).await
+        }
+        async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            self.inner.delete_by_path(path).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: crate::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
+        }
+        async fn store_fenced(
+            &self,
+            entry: &SecretEntry,
+            fence: crate::StorageFence<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.store_fenced(entry, fence).await
+        }
+        async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
+            self.inner.delete_owned(path, token).await
+        }
+        async fn list(&self, params: &crate::QueryParams) -> StorageResult<Vec<SecretEntry>> {
+            self.inner.list(params).await
+        }
+        async fn count(&self, params: &crate::QueryParams) -> StorageResult<u64> {
+            self.inner.count(params).await
+        }
+        async fn exists(&self, path: &str) -> StorageResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn begin_transaction(&self) -> StorageResult<Box<dyn crate::StorageTransaction>> {
+            Ok(Box::new(FailingPathReadbackTransaction {
+                inner: self.inner.begin_transaction().await?,
+                fail_next_get_by_path: self.fail_next_get_by_path.clone(),
+            }))
+        }
+        async fn health_check(&self) -> StorageResult<crate::HealthStatus> {
+            self.inner.health_check().await
+        }
+        async fn get_stats(&self) -> StorageResult<crate::StorageStats> {
+            self.inner.get_stats().await
+        }
+        async fn migrate(&self) -> StorageResult<()> {
+            self.inner.migrate().await
+        }
+        async fn delete_expired(&self, path_prefix: Option<String>) -> StorageResult<u64> {
+            self.inner.delete_expired(path_prefix).await
+        }
+        async fn store_oauth_state(
+            &self,
+            state: &secreton_domain::OAuthState,
+        ) -> StorageResult<()> {
+            self.inner.store_oauth_state(state).await
+        }
+        async fn get_oauth_state(
+            &self,
+            state: &str,
+        ) -> StorageResult<Option<secreton_domain::OAuthState>> {
+            self.inner.get_oauth_state(state).await
+        }
+        async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
+            self.inner.delete_expired_oauth_states().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_path_readback_still_reconciles_the_touched_id() {
+        // Regression: when `get_by_path` failed during commit reconciliation after a committed
+        // `update`, the path loop cleared the path key but the id loop deleted the id key only
+        // if the record was *absent*. The record exists with new data, so the stale pre-update
+        // value stayed in the id cache and `get_by_id` served it until TTL — a committed update
+        // invisible through one read path. The property: a touched id is reconciled with the
+        // canonical `get_by_id` result, refreshed on success and invalidated on failure.
+        let backend = FailingPathReadbackBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let path = "kv/tx/readback-update";
+
+        // Seed and warm both caches with `v1`.
+        let mut entry = sample_entry_with_path(path, b"v1");
+        let id = entry.id;
+        crate::StorageBackend::store(&cached, &entry)
+            .await
+            .expect("seed");
+        let warm = crate::StorageBackend::get_by_id(&cached, id)
+            .await
+            .expect("warm")
+            .expect("present");
+        assert_eq!(warm.encrypted_data, b"v1");
+
+        // A transaction update commits `v2`, then the post-commit path readback fails. The
+        // stale cached `v1` must not survive that failed readback.
+        entry.encrypted_data = b"v2".to_vec();
+        let mut tx = crate::StorageBackend::begin_transaction(&cached)
+            .await
+            .expect("begin");
+        tx.update(&entry).await.expect("stage update");
+        tx.commit().await.expect("commit");
+
+        let served = crate::StorageBackend::get_by_id(&cached, id)
+            .await
+            .expect("cached read")
+            .expect("the record must still exist");
+        assert_eq!(
+            served.encrypted_data, b"v2",
+            "a committed update must not be masked by a stale cached id entry after a failed \
+             path readback"
         );
     }
 }
