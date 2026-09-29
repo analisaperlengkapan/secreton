@@ -53,3 +53,7 @@ coverage/
 /certs/
 *.pem
 !crates/**/testdata/*.pem
+
+# Node tooling (screenshots). The manifest and lockfile are committed; the installed
+# tree is not. Nothing here is needed for the Rust build.
+/node_modules/

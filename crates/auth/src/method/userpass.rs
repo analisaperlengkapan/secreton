@@ -25,7 +25,14 @@ impl UserPassAuthMethod {
         }
     }
 
-    /// Add a user with hashed password
+    /// Add a user with hashed password.
+    ///
+    /// `password_login_disabled` marks the bootstrap root identity: an account that owns
+    /// the vault but was never issued a password. The flag is the boundary, not the
+    /// username — a deployment that renamed root still gets the same protection.
+    // Named like the record it populates; a wrapper type would add a conversion at every
+    // call site for no clarity.
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_user(
         &self,
         username: String,
@@ -34,6 +41,7 @@ impl UserPassAuthMethod {
         groups: Vec<String>,
         policies: Vec<String>,
         permissions: Vec<String>,
+        password_login_disabled: bool,
     ) {
         let user_entry = UserEntry {
             username: username.to_string(),
@@ -44,13 +52,37 @@ impl UserPassAuthMethod {
             roles: vec![], // Added roles
             permissions,
             metadata: HashMap::new(),
+            password_login_disabled,
         };
 
         let mut users = self.users.write().await;
         users.insert(username, user_entry);
     }
 
-    /// Create a user with raw password (hashes it)
+    /// Hash a raw password and return the PHC string, without registering anything.
+    ///
+    /// Registration is a durable-write decision, not a hashing one. Exposing hashing alone
+    /// lets the caller build the account record and commit it atomically (insert-if-absent),
+    /// then publish the in-memory login identity only after the durable write wins. Keeping
+    /// hashing and registration together forced that caller to register in memory *before*
+    /// storage could refuse a duplicate, which is how an in-memory identity for an account
+    /// that was never written could exist.
+    pub fn hash_password(&self, password: &str) -> AuthMethodResult<String> {
+        let salt = Salt::generate();
+        let argon2 = Argon2::default();
+        let password_hash = argon2
+            .hash_password_with_salt(password.as_bytes(), salt.as_ref())
+            .map_err(|_| SecretonError::Internal {
+                message: "Password hashing failed".to_string(),
+            })?
+            .to_string();
+        Ok(password_hash)
+    }
+
+    /// Create a user with raw password (hashes it), registering it in the in-memory map.
+    ///
+    /// Kept for callers that only manage the in-memory method; the durable registration path
+    /// uses [`Self::hash_password`] so it can publish the identity after storage commits.
     pub async fn create_user(
         &self,
         username: String,
@@ -60,15 +92,7 @@ impl UserPassAuthMethod {
         policies: Vec<String>,
         permissions: Vec<String>,
     ) -> AuthMethodResult<String> {
-        let salt = Salt::generate();
-        let argon2 = Argon2::default();
-        let password_hash = argon2
-            .hash_password_with_salt(password.as_bytes(), salt.as_ref())
-            .map_err(|_| SecretonError::Internal {
-                message: "Password hashing failed".to_string(),
-            })?
-            .to_string();
-
+        let password_hash = self.hash_password(password)?;
         self.add_user(
             username,
             password_hash.clone(),
@@ -76,9 +100,35 @@ impl UserPassAuthMethod {
             groups,
             policies,
             permissions,
+            false,
         )
         .await;
         Ok(password_hash)
+    }
+
+    /// Register the bootstrap root identity: a privileged account with no password.
+    ///
+    /// No hash is stored at all, so there is no generated credential to leak and nothing
+    /// for a password verifier to accept. Combined with `password_login_disabled` this
+    /// holds even if a hash were later planted on the record.
+    pub async fn add_bootstrap_root(
+        &self,
+        username: String,
+        id: String,
+        groups: Vec<String>,
+        policies: Vec<String>,
+        permissions: Vec<String>,
+    ) {
+        self.add_user(
+            username,
+            String::new(),
+            id,
+            groups,
+            policies,
+            permissions,
+            true,
+        )
+        .await;
     }
 
     /// Verify password against hash
@@ -124,6 +174,13 @@ impl AuthMethodImpl for UserPassAuthMethod {
         match credentials {
             AuthCredentials::UserPass { username, password } => {
                 if let Some(user_entry) = self.get_user(username).await {
+                    // The bootstrap root identity is never password-authenticatable. The
+                    // check is on the account's persisted property, so it covers the
+                    // account regardless of the name it was created under, and it fails
+                    // closed before a hash is even considered.
+                    if user_entry.password_login_disabled {
+                        return Err(SecretonError::InvalidCredentials);
+                    }
                     if self.check_password(password, &user_entry.password_hash)? {
                         let user_info = UserInfo {
                             id: Some(user_entry.id.clone()),
@@ -190,4 +247,7 @@ pub struct UserEntry {
     pub roles: Vec<String>,
     pub permissions: Vec<String>,
     pub metadata: HashMap<String, String>,
+    /// Mirrors `User::password_login_disabled`: the bootstrap root identity is not
+    /// password-authenticatable, whether or not a hash were present.
+    pub password_login_disabled: bool,
 }

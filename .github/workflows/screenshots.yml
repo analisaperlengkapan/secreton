@@ -1,0 +1,247 @@
+name: Screenshots
+
+# The screenshot suite is the only check that exercises the rendered frontend: a blank
+# page, an overflowing layout, an unclickably small control, a wrong status code or an
+# unexpected console error all pass every Rust test. It needs a running `cargo leptos
+# serve` and a browser, which is why it is its own workflow rather than a step in `ci.yml`.
+#
+# This job *asserts*; it never commits. The committed PNGs are documentation, and a capture
+# that wrote whatever the current build happens to render would let a visual regression land
+# as a "refreshed" image — so the job uploads `docs/screenshots/` as an artifact and never
+# stages it. Drift is reported for a human to judge: some views change on their own between
+# runs (the dashboard embeds the live secret count), so failing on any pixel change would be
+# red for a reason that is not a regression. The gate is the assertion suite the script runs
+# — blank, overflow, tiny control, wrong status, console error.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  screenshots:
+    name: Frontend screenshots
+    runs-on: ubuntu-latest
+    # Bounds the whole job: the wasm build is minutes, and a hung `cargo leptos serve` or a
+    # login that never completes should fail rather than occupy a runner indefinitely.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+
+      # Pinned, so the toolchain here matches `Dockerfile`, `README.md` and
+      # `CONTRIBUTING.md`. Unpinned resolves to 0.3.9, whose `wasm_split_cli_support`
+      # dependency does not compile on the pinned Rust toolchain.
+      - uses: taiki-e/install-action@cargo-leptos
+        with:
+          tool: cargo-leptos@0.3.7
+
+      # `cargo-leptos` chooses its Tailwind download with `cfg!(target_env = "musl")`
+      # evaluated when cargo-leptos *itself* was compiled. install-action ships a musl
+      # build, so on this glibc runner it concludes musl, downloads the musl asset, and
+      # that binary cannot exec here. `Exe::get()` consults PATH first, so supplying a
+      # verified glibc binary bypasses the download entirely. Same reasoning as `ci.yml`'s
+      # WASM job.
+      - name: Install the Tailwind CLI
+        env:
+          TAILWIND_VERSION: v4.2.1
+          TAILWIND_SHA256: 39e8d4e24b3c83b0a6e69e100a972fbc75d5fef8dce47b3ddac3cf92dea81fe3
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/tailwindcss" \
+            "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-linux-x64"
+          echo "${TAILWIND_SHA256}  $HOME/.local/bin/tailwindcss" | sha256sum -c -
+          chmod +x "$HOME/.local/bin/tailwindcss"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Node is tooling only; the Rust build never needs it. `npm ci` installs the pinned
+      # `playwright-core` from the committed lockfile, and the browser is fetched by an
+      # explicit step so the download is a visible, versioned part of the job rather than
+      # a side effect of a lifecycle hook.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: package.json
+          cache: npm
+      - run: npm ci
+      - run: npm run browser:install
+      # Tooling preflight only: this proves `playwright-core` resolves and Chromium launches,
+      # so a broken pin or a missing system library fails in seconds instead of after the
+      # wasm build. It deliberately does not exercise the frontend — the capture step below
+      # is the frontend gate, and it is the only step that can see the rendered page.
+      - run: npm run screenshots:check
+      # The layout rule the capture applies, tested without a browser. It pins the minimum
+      # target size and reads `layout.rs` to prove the sign-out control stays above it, so
+      # a regression there fails here in seconds instead of depending on a capture run.
+      - run: npm run test:screenshots
+
+      - name: Build server + wasm bundle
+        # cargo-leptos 0.3.7 has no `--locked` flag of its own (`cargo leptos build --help`
+        # lists `--bin-cargo-args`/`--lib-cargo-args`, not `--locked`), but it forwards both
+        # to the `cargo` invocations it makes. Passing `--locked` through them keeps the
+        # build on the committed `Cargo.lock`, so a build in CI cannot silently resolve a
+        # different dependency set than the one the other jobs verified. The preflight below
+        # makes a lockfile that would need updating a hard failure before the build starts,
+        # rather than a `--locked` error twelve minutes in.
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo leptos build --release --bin-cargo-args=--locked --lib-cargo-args=--locked
+
+      # `cargo leptos serve --release` reuses the release bundle built above and serves on
+      # :3000. Without `--release` it rebuilds the whole workspace in the debug profile,
+      # which is what overran the readiness wait. It is long-running, so it runs detached
+      # with its output in a file the failure path can print.
+      - name: Start the server
+        env:
+          # A per-run secret, never committed and never printed. The server refuses to
+          # start without one, and a fixed value here would be a credential in the
+          # workflow file.
+          SECRETON__AUTH__JWT__SECRET: ${{ github.token }}${{ github.run_id }}${{ github.run_attempt }}secreton-ci-jwt-secret
+        run: |
+          set -euo pipefail
+          nohup cargo leptos serve --release > /tmp/secreton-serve.log 2>&1 &
+          echo "$!" > /tmp/secreton-serve.pid
+
+      - name: Wait for /health and /login
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:3000/health; then
+              echo "/health ready after ${i} attempt(s)"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "server did not become ready; log follows" >&2
+              cat /tmp/secreton-serve.log >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/login || true)
+            if [ "$code" = "200" ]; then
+              echo "/login ready after ${i} attempt(s)"
+              exit 0
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "login page did not render; log follows" >&2
+              cat /tmp/secreton-serve.log >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+      # The vault starts sealed with no accounts, and the UI needs a real account. `init`
+      # and `unseal` produce the shares and the one-hour bootstrap token; the share and the
+      # token are written to files under `$RUNNER_TEMP` and never echoed, so no credential
+      # reaches the log. The password is generated per run rather than hard-coded.
+      - name: Create the screenshot account
+        run: |
+          set -euo pipefail
+          API=http://127.0.0.1:3000/api/v1
+          WORK=$(mktemp -d)
+          chmod 700 "$WORK"
+
+          printf '{"shares":3,"threshold":2,"root_username":"screenshots"}' \
+            | curl -fsS -X POST "$API/sys/init" -H 'Content-Type: application/json' --data-binary @- \
+            | jq -r '.data.keys[]' > "$WORK/shares"
+
+          : > "$WORK/root"
+          while IFS= read -r key; do
+            RESP=$(printf '{"key":"%s"}' "$key" \
+              | curl -fsS -X POST "$API/sys/unseal" -H 'Content-Type: application/json' --data-binary @-)
+            TOKEN=$(printf '%s' "$RESP" | jq -r '.data.root_token // empty')
+            if [ -n "$TOKEN" ]; then printf '%s' "$TOKEN" > "$WORK/root"; break; fi
+          done < "$WORK/shares"
+          test -s "$WORK/root" || { echo "unseal never returned a root token" >&2; exit 1; }
+
+          PASSWORD=$(openssl rand -base64 24)
+          jq -n --arg u screenshots_user --arg p "$PASSWORD" \
+            '{username:$u,password:$p,email:"screenshots@example.invalid",roles:["user"],permissions:[]}' \
+            | curl -fsS -X POST "$API/auth/users" \
+                -H "Authorization: Bearer $(cat "$WORK/root")" \
+                -H 'Content-Type: application/json' --data-binary @- > /dev/null
+
+          # `>> $GITHUB_ENV` from a file keeps the password out of the log. The script
+          # requires both variables.
+          {
+            echo "SCREENSHOT_USER=screenshots_user"
+            echo "SCREENSHOT_PASSWORD=$PASSWORD"
+          } >> "$GITHUB_ENV"
+          rm -rf "$WORK"
+
+      - name: Capture and verify every view
+        run: npm run screenshots
+
+      # Runs whether the capture passed or failed, so a hung or crashed server is stopped
+      # rather than left for the runner to reclaim.
+      - name: Stop the server
+        if: always()
+        run: |
+          if [ -f /tmp/secreton-serve.pid ]; then
+            kill "$(cat /tmp/secreton-serve.pid)" 2>/dev/null || true
+          fi
+          pkill -f 'cargo-leptos' 2>/dev/null || true
+          pkill -f 'secreton-server' 2>/dev/null || true
+
+      # Prints the server log to the job output only when something failed, which is where a
+      # human debugging the run reads it. It is deliberately *not* uploaded as an artifact:
+      # the 5xx path logs internal detail (invariant 4), and a downloadable artifact widens
+      # that beyond the job's own log, which is already scoped to the repository.
+      - name: Server log on failure
+        if: failure()
+        run: |
+          if [ -f /tmp/secreton-serve.log ]; then
+            echo "server log follows" >&2
+            cat /tmp/secreton-serve.log >&2
+          fi
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: screenshots
+          path: docs/screenshots/
+          if-no-files-found: warn
+
+      # The capture rewrites `docs/screenshots/*.png`. A diff means the rendered frontend
+      # changed, which a human should look at. The dashboard embeds the live secret count,
+      # which grows as sessions are recorded, so the pixels of that one view differ
+      # legitimately between runs; the mobile dashboard inherits the same varying count.
+      # Every *other* view is deterministic, so drift there is a real signal and fails the
+      # job rather than warning — a warning on the assertion job cannot establish that the
+      # committed images still depict the current UI. The varying views are still surfaced
+      # through the artifact and the annotation.
+      - name: Check the committed screenshots against the capture
+        if: always()
+        run: |
+          if git diff --quiet -- docs/screenshots \
+              ':!docs/screenshots/dashboard.png' \
+              ':!docs/screenshots/mobile-dashboard.png'; then
+            echo "Deterministic screenshots match the committed images."
+          else
+            echo "::error::Committed screenshots differ from the capture for a deterministic view."
+            git --no-pager diff --stat -- docs/screenshots
+            exit 1
+          fi
+          if ! git diff --quiet -- docs/screenshots; then
+            echo "::warning::The dashboard views differ from the committed images (they embed \
+            the live secret count). Inspect the 'screenshots' artifact and refresh them \
+            deliberately if the change is intended."
+          fi

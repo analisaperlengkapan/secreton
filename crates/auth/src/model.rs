@@ -297,6 +297,17 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
     pub disabled: bool,
     pub password_hash: String,
+    /// True for the bootstrap root identity `init` creates: an account that owns the
+    /// vault but was never given a password it could authenticate with.
+    ///
+    /// The boundary that keeps this account out of the password-login path is this
+    /// persisted property of the account, not the spelling of the username it was created
+    /// under. A literal `"root"` check was the whole guard before custom root usernames
+    /// existed, and it silently stopped covering the account the moment the name became
+    /// configurable. Defaults to false so records written before the field existed
+    /// deserialize as ordinary password-authenticatable accounts.
+    #[serde(default)]
+    pub password_login_disabled: bool,
     pub full_name: Option<String>,
     pub is_active: bool,
     pub is_superuser: bool,

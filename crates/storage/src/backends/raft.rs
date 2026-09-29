@@ -13,8 +13,8 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::{
-    HealthStatus, QueryParams, SecretEntry, StorageBackend, StorageError, StorageResult,
-    StorageStats, StorageTransaction,
+    Coordination, HealthStatus, QueryParams, SecretEntry, StorageBackend, StorageError,
+    StorageResult, StorageStats, StorageTransaction,
 };
 use secreton_domain::OAuthState;
 
@@ -139,6 +139,7 @@ impl RaftStateMachine {
                 let path = entry.path.clone();
                 let id = entry.id;
 
+                self.retire_relocated_record(&entry);
                 self.data.insert(path.clone(), entry);
                 self.id_index.insert(id, path);
                 self.update_stats();
@@ -198,6 +199,24 @@ impl RaftStateMachine {
         }
     }
 
+    /// Remove the record an id currently occupies when it is being written at a different
+    /// path, so a relocation cannot leave the id reachable through both paths.
+    ///
+    /// `id_index` is the only place that remembers where an id lives. A `store` of an
+    /// existing id at a new path, or a conditional replacement that carries an id already
+    /// present under another path, must drop the old record in the same state-machine step;
+    /// otherwise `get_by_path` keeps answering the abandoned path and enumeration reports
+    /// the same secret twice. Guarded by the record's own `id` so a map that has since been
+    /// repointed at a different record is not disturbed.
+    fn retire_relocated_record(&mut self, entry: &SecretEntry) {
+        if let Some(previous_path) = self.id_index.get(&entry.id)
+            && previous_path != &entry.path
+            && self.data.get(previous_path).map(|record| record.id) == Some(entry.id)
+        {
+            self.data.remove(previous_path);
+        }
+    }
+
     /// Update storage statistics
     fn update_stats(&mut self) {
         self.stats.total_entries = self.data.len() as u64;
@@ -231,6 +250,62 @@ impl RaftStateMachine {
             .get(&id)
             .and_then(|path| self.data.get(path))
             .cloned()
+    }
+
+    /// Replace the record at `entry.path`, preserving the existing record's id and
+    /// creation time. Condition the write on `expect` in the same step.
+    ///
+    /// Returns `Ok(true)` when the write happened, `Ok(false)` when the precondition did
+    /// not hold. Only `Absent`, `Owner` and `Any` are evaluable here; the caller rejects
+    /// the fenced variant before reaching this.
+    pub fn compare_and_set(
+        &mut self,
+        mut entry: SecretEntry,
+        expect: crate::Expect<'_>,
+    ) -> StorageResult<bool> {
+        let path = entry.path.clone();
+
+        let existing = self.data.get(&path).cloned();
+
+        let precondition_holds = match expect {
+            crate::Expect::Absent => existing.is_none(),
+            crate::Expect::Owner(token) => existing.as_ref().is_some_and(|e| e.has_owner(token)),
+            // Owner *and* deadline, evaluated in the same state-machine step as the
+            // replacement: a renewal must not revive a lease that lapsed before this instant.
+            crate::Expect::UnexpiredOwner(token) => existing.as_ref().is_some_and(|e| {
+                e.has_owner(token)
+                    && crate::lease_has_not_expired(e, chrono::Utc::now().timestamp())
+            }),
+            // Owner *and* already expired, in the same state-machine step as the replacement:
+            // a reclaim must not overwrite a claim another reader extended back to life in
+            // the read-to-write window. A record without an expiration fails closed.
+            crate::Expect::ExpiredOwner(token) => existing
+                .as_ref()
+                .is_some_and(|e| e.has_owner(token) && e.is_expired()),
+            crate::Expect::Any => true,
+            crate::Expect::AbsentFenced(_) => false,
+        };
+        if !precondition_holds {
+            return Ok(false);
+        }
+
+        // Preserve the identity and creation time of the record already at the path, the
+        // same normalization the other backends perform: a compare-and-set is a
+        // replacement, not a new record. Because the id is preserved the id index already
+        // points at this path, so it needs no repointing.
+        if let Some(previous) = &existing {
+            entry.id = previous.id;
+            entry.created_at = previous.created_at;
+        }
+        // An insert-if-absent at a *new* path can carry an id that already lives at another
+        // path. Leaving the old record in place would make both paths answer that id and
+        // enumeration report the secret twice; the memory backend retires the old path for
+        // exactly this case. Do it in the same state-machine step as the insert.
+        self.retire_relocated_record(&entry);
+        self.id_index.insert(entry.id, path.clone());
+        self.data.insert(path, entry);
+        self.update_stats();
+        Ok(true)
     }
 
     /// List entries matching query parameters
@@ -544,6 +619,75 @@ impl StorageBackend for RaftStorageBackend {
                 message: "Unexpected response type".to_string(),
             }),
         }
+    }
+
+    /// Single-process only, stated rather than implied.
+    ///
+    /// This backend's "cluster" is a single node whose state machine is an in-process
+    /// `RwLock<HashMap>` (`initialize_cluster` elects itself leader and no peer is ever
+    /// contacted), and the data directory it creates is never written to. Two replicas
+    /// therefore hold two unrelated maps, so nothing here can arbitrate between them.
+    /// Reporting `CrossProcess` would let a caller believe a lease taken on one replica
+    /// excluded another, which is exactly the belief the seal service must not hold.
+    fn coordination(&self) -> Coordination {
+        Coordination::SingleProcess
+    }
+
+    /// Atomic within this process's state machine.
+    ///
+    /// This backend reports [`Coordination::SingleProcess`] and its "cluster" is one
+    /// in-process map, so there is no second replica to arbitrate against. It can still
+    /// make a compare-and-set indivisible against concurrent tasks in *this* process, by
+    /// evaluating the precondition and applying the write under the one state-machine write
+    /// lock, which is the whole guarantee a single-process backend can offer. Refusing it
+    /// outright was wrong in the other direction: the bootstrap root account is created
+    /// with `compare_and_set(Absent)` even on a single-process backend, so a fresh Raft
+    /// vault could not initialize at all — every root write returned `Unsupported` and the
+    /// initialization rolled back instead of returning shares.
+    ///
+    /// The fenced variant stays refused: there is no shared lease record for a fence to
+    /// name, and a `store_fenced` here would only check this process's own memory. That is
+    /// the fake-lock failure mode, and a caller that needs a cross-process lease must see
+    /// the refusal rather than a success it cannot rely on.
+    async fn compare_and_set(
+        &self,
+        entry: &SecretEntry,
+        expect: crate::Expect<'_>,
+    ) -> StorageResult<bool> {
+        if matches!(expect, crate::Expect::AbsentFenced(_)) {
+            return Err(StorageError::Unsupported {
+                operation: "compare_and_set with a fence".to_string(),
+                backend: "raft".to_string(),
+            });
+        }
+
+        let mut state = self
+            .state_machine
+            .write()
+            .map_err(|e| StorageError::BackendError {
+                backend: "raft".to_string(),
+                message: format!("State lock error: {}", e),
+            })?;
+
+        state.compare_and_set(entry.clone(), expect)
+    }
+
+    /// Refused rather than faked, for the same reason as [`Self::compare_and_set`].
+    ///
+    /// A fence is only meaningful against a shared record, and this backend's state machine
+    /// is a process-local map that no second replica observes. A `store_fenced` here could
+    /// only check its own memory, which would report success to a caller that believes it
+    /// holds a cross-process lease it does not — the fake-lock failure mode. It refuses so
+    /// the seal service fails closed instead.
+    async fn store_fenced(
+        &self,
+        _entry: &SecretEntry,
+        _fence: crate::StorageFence<'_>,
+    ) -> StorageResult<bool> {
+        Err(StorageError::Unsupported {
+            operation: "store_fenced".to_string(),
+            backend: "raft".to_string(),
+        })
     }
 
     async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>> {

@@ -86,3 +86,6 @@ tokio-postgres.workspace = true
 # have created actually exists and carries the role's grants.
 mysql_async.workspace = true
 tokio = { workspace = true, features = ["full"] }
+# The refresh-reservation test needs a backend that reports cross-process coordination,
+# which is what makes the reservation authoritative across two service instances.
+tempfile.workspace = true

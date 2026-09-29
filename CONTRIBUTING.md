@@ -1,803 +1,236 @@
 # Contributing to Secreton
 
-Thank you for your interest in contributing to Secreton! We're building an enterprise-grade secrets management system, and we appreciate your help in making it better.
+Thanks for helping. Secreton is a secrets-management platform and pre-1.0 — the API and
+storage shapes can still change, so a contribution that simplifies something is as welcome
+as one that adds something.
 
-## 📋 Table of Contents
+> **Start with [`AGENTS.md`](AGENTS.md).** It is the single source of truth for the layout,
+> the commands, and the invariants review enforces. This file covers the human workflow
+> around it; where the two disagree, `AGENTS.md` wins.
 
-- [Code of Conduct](#code-of-conduct)
-- [Getting Started](#getting-started)
-- [Development Environment](#development-environment)
-- [Project Structure](#project-structure)
-- [Development Workflow](#development-workflow)
-- [Coding Standards](#coding-standards)
-- [Testing Guidelines](#testing-guidelines)
-- [Documentation](#documentation)
-- [Pull Request Process](#pull-request-process)
-- [Issue Guidelines](#issue-guidelines)
-- [Security](#security)
-- [Community](#community)
+## Before you start
 
-## 📜 Code of Conduct
+Read the invariants in `AGENTS.md`. They are not style preferences — each one is there
+because violating it caused a real defect here. The three that surprise people most:
 
-### Our Pledge
+- **Axum only, one listener.** The UI, the REST API and gRPC answer on one port from one
+  router. If you find yourself adding a second `serve()` call, stop.
+- **No build-time network access.** A build script that downloads an artifact breaks
+  hermetic, offline and air-gapped builds. This is why `utoipa-swagger-ui` is not a
+  dependency and `protoc` is vendored.
+- **Audit before returning.** Any handler that reads, writes or deletes a secret emits an
+  `AuditEvent` — including on the denial path, which is the path that matters.
 
-We are committed to providing a welcoming and inclusive environment for everyone. We expect all contributors to:
-
-- Be respectful and considerate
-- Welcome newcomers and help them get started
-- Accept constructive criticism gracefully
-- Focus on what's best for the community
-- Show empathy towards other community members
-
-### Unacceptable Behavior
-
-- Harassment, discriminatory language, or personal attacks
-- Trolling, insulting comments, or derogatory remarks
-- Publishing private information without permission
-- Any conduct that could be considered inappropriate in a professional setting
-
-## 🚀 Getting Started
+## Setup
 
 ### Prerequisites
 
-Before you begin, ensure you have:
-
-- **Rust 1.90+**: `rustup update stable`
-- **PostgreSQL 15+**: For local development
-- **Git**: For version control
-- **Docker** (optional): For containerized testing
-- **Basic knowledge**: Rust, async programming, cryptography concepts
-
-### Fork and Clone
-
-1. Fork the repository on GitHub
-2. Clone your fork:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/secreton.git
-   cd secreton
-   ```
-
-3. Add upstream remote:
-   ```bash
-   git remote add upstream https://github.com/analisaperlengkapan/secreton.git
-   ```
-
-4. Create a feature branch:
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-## 🛠️ Development Environment
-
-### Initial Setup
-
-1. **Install Rust Components**
-   ```bash
-   rustup component add rustfmt clippy
-   rustup component add llvm-tools-preview  # For coverage
-   ```
-
-2. **Install Development Tools**
-   ```bash
-   # Essential tools
-   cargo install cargo-watch      # Watch for file changes
-   cargo install cargo-tarpaulin  # Code coverage
-   cargo install cargo-audit      # Security auditing
-   cargo install cargo-outdated   # Check outdated deps
-   cargo install cargo-deny       # License and security checks
-   cargo install cargo-llvm-cov   # Coverage reporting
-   ```
-
-3. **Setup Database**
-   ```bash
-   # Using Docker
-   docker run --name secreton-dev-db \
-     -e POSTGRES_USER=secreton_user \
-     -e POSTGRES_PASSWORD=dev_password \
-     -e POSTGRES_DB=secreton_db \
-     -p 5432:5432 \
-     -d postgres:15-alpine
-   
-   # Or install PostgreSQL natively
-   # Ubuntu/Debian
-   sudo apt-get install postgresql postgresql-contrib
-   
-   # macOS
-   brew install postgresql@15
-   ```
-
-4. **Configure Environment**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your local settings
-   nano .env
-   ```
-
-5. **Verify Setup**
-   ```bash
-   # Check all tools are installed
-   rustc --version
-   cargo --version
-   psql --version
-   
-   # Build project
-   cargo build --workspace
-   
-   # Run tests
-   cargo test --workspace
-   ```
-
-## 📁 Project Structure
-
-Secreton is organized as a Cargo workspace with multiple crates:
-
-```
-secreton/
-├── .github/              # GitHub Actions workflows
-│   ├── workflows/        # CI/CD pipelines
-│   └── codeql-config.yml # CodeQL configuration
-├── crates/               # Rust crates (workspace members)
-│   ├── api/             # REST API server (Axum)
-│   ├── agent/           # Sidecar agent for auto-auth
-│   ├── auth/            # Authentication methods (JWT, OAuth, LDAP, RADIUS)
-│   ├── cli/             # Command-line interface
-│   ├── common/          # Shared utilities and helpers
-│   ├── config/          # Configuration management
-│   ├── core/            # Core business logic and services
-│   ├── crypto/          # Cryptography operations (RustCrypto)
-│   ├── enterprise/      # Enterprise features
-│   ├── errors/          # Error types and handling
-│   ├── infrastructure/  # Infrastructure integrations (K8s, Docker)
-│   ├── integrations/    # Third-party integrations (AWS, GCP)
-│   ├── monitoring/      # Metrics and observability
-│   ├── performance/     # Performance optimizations
-│   ├── replication/     # High availability and replication
-│   ├── secrets/         # Secret engines base
-│   ├── secrets-database/ # Database secret engine
-│   ├── secrets-pki/     # PKI secret engine
-│   ├── security/        # Security features and audit
-│   ├── storage/         # Storage backends (PostgreSQL, Redis, etc.)
-│   └── ui/              # Web UI (optional, Leptos)
-├── config/              # Configuration files
-├── tests/               # Integration tests
-├── docs/                # Documentation
-├── Cargo.toml           # Workspace manifest
-├── deny.toml            # Cargo deny configuration
-└── .env.example         # Example environment variables
-```
-
-### Key Crates
-
-- **secreton-api**: Main HTTP API server, REST endpoints, OpenAPI docs
-- **secreton-core**: Core business logic, secret engines, policies
-- **secreton-crypto**: All cryptographic operations, encryption, signing
-- **secreton-auth**: Authentication methods and token management
-- **secreton-storage**: Storage backend abstraction and implementations
-- **secreton-cli**: Command-line tool for users
-
-## 🔄 Development Workflow
-
-### Day-to-Day Development
-
-1. **Sync with Upstream**
-   ```bash
-   git fetch upstream
-   git rebase upstream/main
-   ```
-
-2. **Make Changes**
-   - Write code following our standards
-   - Add tests for new functionality
-   - Update documentation
-
-3. **Test Locally**
-   ```bash
-   # Run tests continuously
-   cargo watch -x test
-   
-   # Or run manually
-   cargo test --workspace --all-features
-   ```
-
-4. **Format and Lint**
-   ```bash
-   # Auto-format code
-   cargo fmt --all
-   
-   # Check for issues
-   cargo clippy --workspace --all-targets --all-features -- -D warnings
-   ```
-
-5. **Commit Changes**
-   ```bash
-   git add .
-   git commit -m "feat: add new feature"
-   # Follow conventional commits format
-   ```
-
-6. **Push to Your Fork**
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-### Running the Project
-
-**API Server:**
-```bash
-# Development mode with auto-reload
-cargo watch -x 'run -p secreton-api --bin api_server'
-
-# Or run directly
-cargo run -p secreton-api --bin api_server
-
-# With debug logging
-RUST_LOG=debug cargo run -p secreton-api --bin api_server
-```
-
-**Agent:**
-```bash
-cargo run -p secreton-agent
-```
-
-**CLI:**
-```bash
-cargo run -p secreton-cli -- --help
-cargo run -p secreton-cli -- kv put secret/test value=hello
-```
-
-## 📝 Coding Standards
-
-### Rust Style Guide
-
-We follow the official Rust style guide with some additions:
-
-1. **Formatting**: Use `rustfmt` (no exceptions)
-   ```bash
-   cargo fmt --all
-   ```
-
-2. **Linting**: All `clippy` warnings must be addressed
-   ```bash
-   cargo clippy --workspace --all-targets --all-features -- -D warnings
-   ```
-
-3. **Naming Conventions**:
-   - **Crates**: `secreton-{module}` (kebab-case)
-   - **Modules**: `snake_case`
-   - **Types/Structs**: `PascalCase`
-   - **Functions/Methods**: `snake_case`
-   - **Constants**: `SCREAMING_SNAKE_CASE`
-   - **Lifetimes**: `'a`, `'b`, short and descriptive
-
-4. **Error Handling**:
-   - Use `Result<T, SecretonError>` for fallible operations
-   - Never use `unwrap()` or `expect()` in production code
-   - Use `?` operator for error propagation
-   - Add context to errors: `.context("what failed")?`
-
-5. **Async Code**:
-   - Use `async fn` for all I/O operations
-   - Use `tokio` as the async runtime
-   - Prefer `async_trait` for async traits
-   - Avoid blocking operations in async code
-
-6. **Comments**:
-   - Use `///` for public API documentation
-   - Use `//` for implementation comments
-   - Write doc tests in documentation
-   - Explain "why", not "what"
-
-7. **Security**:
-   - Use `zeroize` for sensitive data in memory
-   - Never log secrets or credentials
-   - Use constant-time operations for crypto
-   - Validate all inputs
-   - Sanitize all outputs
-
-### Code Organization
-
-**File Structure:**
-```rust
-// Standard ordering:
-// 1. Module documentation
-//! Module description
-
-// 2. Imports (grouped)
-use std::collections::HashMap;
-
-use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-
-use crate::error::SecretonError;
-use crate::types::SecretData;
-
-// 3. Types
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MyType {
-    // fields
-}
-
-// 4. Implementations
-impl MyType {
-    // Public methods first
-    pub fn new() -> Self { }
-    
-    // Private methods after
-    fn internal_method(&self) { }
-}
-
-// 5. Traits
-impl MyTrait for MyType { }
-
-// 6. Tests
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_something() { }
-}
-```
-
-### Commit Messages
-
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
-
-```
-<type>(<scope>): <description>
-
-[optional body]
-
-[optional footer]
-```
-
-**Types:**
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation changes
-- `style`: Code style changes (formatting)
-- `refactor`: Code refactoring
-- `perf`: Performance improvements
-- `test`: Adding or updating tests
-- `chore`: Maintenance tasks
-- `ci`: CI/CD changes
-- `build`: Build system changes
-
-**Examples:**
-```
-feat(crypto): add ChaCha20-Poly1305 cipher support
-
-fix(api): correct token validation error handling
-
-docs(readme): update installation instructions
-
-test(storage): add integration tests for PostgreSQL backend
-```
-
-## 🧪 Testing Guidelines
-
-### Test Categories
-
-1. **Unit Tests**: Test individual functions/methods
-2. **Integration Tests**: Test component interactions
-3. **End-to-End Tests**: Test complete workflows
-4. **Performance Tests**: Benchmarks and load tests
-5. **Security Tests**: Cryptography and vulnerability tests
-
-### Writing Tests
-
-**Unit Tests:**
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_secret_encryption() {
-        let secret = Secret::new("password123");
-        let encrypted = secret.encrypt().unwrap();
-        
-        assert_ne!(secret.data(), encrypted.data());
-        assert_eq!(encrypted.decrypt().unwrap(), secret);
-    }
-    
-    #[tokio::test]
-    async fn test_async_operation() {
-        let service = MyService::new().await;
-        let result = service.do_something().await;
-        
-        assert!(result.is_ok());
-    }
-}
-```
-
-**Integration Tests:**
-```rust
-// tests/integration_test.rs
-use secreton_api::Server;
-use secreton_core::SecretEngine;
-
-#[tokio::test]
-async fn test_api_secret_storage() {
-    let server = Server::new_test().await;
-    let client = server.client();
-    
-    // Test create
-    let response = client
-        .post("/v1/secret/data/myapp")
-        .json(&json!({"value": "secret"}))
-        .send()
-        .await
-        .unwrap();
-    
-    assert_eq!(response.status(), 200);
-    
-    // Test retrieve
-    let response = client
-        .get("/v1/secret/data/myapp")
-        .send()
-        .await
-        .unwrap();
-    
-    assert_eq!(response.status(), 200);
-}
-```
-
-### Running Tests
+- Rust — rustup installs the pinned toolchain from `rust-toolchain.toml` (1.94.1) on first
+  use. Do not pass `+nightly` to any command.
+- [`cargo-leptos`](https://github.com/leptos-rs/cargo-leptos):
+  `cargo install cargo-leptos --locked --version 0.3.7`. The pin is required on this
+  toolchain — 0.3.8 and later resolve `wasm_split_cli_support` 0.2.3, which does not
+  compile on 1.94.1 (E0658). See the Dockerfile.
+- PostgreSQL and MySQL — only if you are working on the dynamic database-credentials
+  engine. Everything else runs against in-memory storage with no external service.
+- Node and `playwright-core` — only for regenerating screenshots. The version is pinned in
+  the root `package.json`; see [Screenshots](#screenshots).
+
+### Get it running
 
 ```bash
-# Run all tests
-cargo test --workspace --all-features
+git clone https://github.com/analisaperlengkapan/secreton.git
+cd secreton
 
-# Run specific crate tests
-cargo test -p secreton-core
-
-# Run with output
-cargo test --workspace -- --nocapture
-
-# Run ignored tests
-cargo test --workspace -- --ignored
-
-# Run single test
-cargo test test_name
-
-# Run tests matching pattern
-cargo test secret
+export SECRETON__AUTH__JWT__SECRET="$(openssl rand -base64 48)"
+cargo leptos serve
 ```
 
-### Test Coverage
+Then open <http://localhost:3000>. A fresh instance is sealed and has no accounts; the
+quick-start in the [README](README.md#quick-start) initialises it, unseals it, and creates
+a user you can sign in with. Storage defaults to in-memory, so there is nothing to set up
+and nothing to clean up — but state is gone on restart.
+
+## Layout
+
+Ten crates, strictly layered: a crate may only depend on those above it.
+
+| Crate | What it holds | May not contain |
+|---|---|---|
+| `crates/domain` | Shared types, the one `SecretonError`, the API envelope | Any I/O, any web framework — it must keep compiling for `wasm32-unknown-unknown` |
+| `crates/crypto` | AEAD, KDF, signing, Shamir, the transit engine, the barrier | Storage, HTTP |
+| `crates/storage` | One `StorageBackend` trait; memory, file, PostgreSQL, Redis, Raft | Business logic |
+| `crates/auth` | Auth methods, identity, MFA, tokens, policy engine, governance | HTTP, axum layers |
+| `crates/engines` | Secret engines, seal, audit, lifecycle, the `Services` graph | HTTP — no `axum`, no `Request`, no `StatusCode` |
+| `crates/ui` | Leptos components, routes, server functions | Server-only dependencies |
+| `crates/server` | Axum router, handlers, middleware, gRPC, the binary | Business logic — delegate to `engines` |
+| `crates/client` | Typed HTTP client over `/api/v1` | — |
+| `crates/cli`, `crates/agent` | Binaries built on `client` | Direct storage access |
+
+The reason for the layer boundary is concrete: it is what lets the same service back a REST
+handler, a gRPC method and a Leptos server function without a translation layer, and what
+lets the UI share its request and response types with the backend so a mismatch is a
+compile error rather than a runtime surprise.
+
+## Checks
+
+Run these before pushing. CI runs exactly this set, plus a feature matrix, an MSRV job, a
+docs job and a Docker build.
 
 ```bash
-# Generate coverage report
-cargo tarpaulin --workspace --all-features --out Html
+cargo fmt --all
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo test   --workspace --locked
 
-# Or use llvm-cov
-cargo llvm-cov --workspace --all-features --html
-
-# View report
-open tarpaulin-report.html
+# The UI must keep compiling for wasm. This is the guardrail that catches a
+# server-only dependency leaking into crates/ui.
+cargo check -p secreton-ui --locked --target wasm32-unknown-unknown \
+    --no-default-features --features hydrate
 ```
 
-**Coverage Requirements:**
-- New features: **minimum 80% coverage**
-- Critical paths (crypto, auth): **minimum 90% coverage**
-- Bug fixes: **must add test that catches the bug**
-
-### Benchmarks
+Both feature combinations of the server must also build:
 
 ```bash
-# Run benchmarks
-cargo bench --workspace
-
-# Run specific benchmark
-cargo bench -p secreton-crypto -- encryption
-
-# Compare results
-cargo bench --workspace -- --save-baseline main
-# Make changes
-cargo bench --workspace -- --baseline main
+cargo check -p secreton-server --locked --no-default-features
+cargo check -p secreton-server --locked --features grpc
 ```
 
-## 📚 Documentation
+`docker build -t secreton:local .` is worth running when you touch the frontend build. The
+image is the only thing that exercises cargo-leptos end to end — the Tailwind run,
+wasm-bindgen, wasm-opt and the feature set cargo-leptos builds with. Six separate defects
+lived in that path while every cargo command passed.
 
-### Code Documentation
+## Testing
 
-1. **Public APIs**: All public items must have documentation
-   ```rust
-   /// Encrypts data using AES-256-GCM.
-   ///
-   /// # Arguments
-   ///
-   /// * `data` - The plaintext data to encrypt
-   /// * `key` - The encryption key (must be 32 bytes)
-   ///
-   /// # Returns
-   ///
-   /// Returns the encrypted data wrapped in a `Result`.
-   ///
-   /// # Errors
-   ///
-   /// Returns `CryptoError` if encryption fails.
-   ///
-   /// # Examples
-   ///
-   /// ```
-   /// use secreton_crypto::encrypt;
-   ///
-   /// let key = [0u8; 32];
-   /// let data = b"secret data";
-   /// let encrypted = encrypt(data, &key).unwrap();
-   /// ```
-   pub fn encrypt(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
-       // implementation
-   }
-   ```
+Unit tests live beside the code in `#[cfg(test)]`; integration tests go in that crate's
+`tests/`. There is no root `tests/` directory — the root manifest is a virtual workspace,
+so cargo never builds one, and roughly thirty files sat there for months being silently
+ignored.
 
-2. **Modules**: Document module purpose
-   ```rust
-   //! Authentication module.
-   //!
-   //! This module provides various authentication methods including:
-   //! - JWT tokens
-   //! - OAuth 2.0 / OIDC
-   //! - LDAP
-   //! - Multi-factor authentication
-   ```
+Two rules worth stating explicitly:
 
-3. **Examples**: Provide runnable examples
-   ```rust
-   /// # Examples
-   ///
-   /// ```
-   /// use secreton_core::Secret;
-   ///
-   /// let secret = Secret::new("my_password");
-   /// assert!(!secret.is_empty());
-   /// ```
-   ```
+- **Name a test after the property, not the function.** `rolled_back_transaction_writes_are_discarded`,
+  not `test_transaction`. The name is what tells the next person what regressed.
+- **Never depend on the network.** If you need an endpoint that cannot be reached, use
+  `192.0.2.1` (RFC 5737).
 
-### Documentation Generation
+Cryptographic code gets property tests in `crates/crypto/tests/properties.rs`. The dynamic
+database-credentials engine gets integration tests that connect to a live server and assert
+the account exists after issuing and is gone after revoking — a generated username and
+password returned without provisioning anything is not an implementation, and a caller
+cannot tell the difference from a response body.
+
+Tests that need a real service skip when its environment variable is unset, and CI sets all
+three:
+
+| Variable | Service | What it proves |
+|---|---|---|
+| `SECRETON_TEST_POSTGRES_URL` | PostgreSQL | Issued database credentials correspond to a real account; two replicas sharing one PostgreSQL admit exactly one `init`; `store_fenced` refuses a lost lease and leaves the winner's record untouched |
+| `SECRETON_TEST_MYSQL_URL` | MySQL/MariaDB | The same for MySQL |
+| `SECRETON_TEST_REDIS_URL` | Redis | `delete_by_path` reports and performs the delete; `compare_and_set` arbitrates; `store_fenced` refuses a stale attempt without repointing the path mapping; two replicas sharing one Redis admit exactly one `init` |
+
+The Redis tests exist because "path-keyed operations are a no-op" was true of that backend
+and could only be caught against the real server — a double cannot show whether the Lua
+script does what the Rust around it assumes.
+
+## Adding things
+
+### A REST endpoint
+
+Handler in `crates/server/src/handlers/`, exposed from that module's `routes()`. Business
+logic goes in `crates/engines`, never in the handler. Add the `utoipa` annotation so it
+appears in the OpenAPI document. Public (pre-auth) routes go in `public_routes()`;
+everything else sits behind the auth layer by default.
+
+Return errors through the shared envelope; do not leak internals. A 5xx body carries a
+fixed string, with the detail going to the log correlated by `x-request-id` — connection
+strings and file paths must never reach a response body.
+
+### A UI page
+
+Components in `crates/ui/src/components/`, pages in `crates/ui/src/pages/`, routed in
+`app.rs`. Fetch data with a `#[server]` function, not a hand-written `fetch` — the server
+function shares its types with the backend, so a mismatch is a compile error. Any page you
+add must be reachable from `app.rs`; an unrouted page is dead code.
+
+### A storage backend
+
+Implement `StorageBackend` in `crates/storage/src/backends/`, behind a cargo feature, with
+integration tests. A backend without tests does not go in — nineteen were deleted for
+exactly this reason: they compiled, were selectable from config, and returned
+`"Not implemented"` in production.
+
+### A dependency
+
+Add it to `[workspace.dependencies]` in the root manifest and reference it as
+`foo.workspace = true`. Never pin a version in a member crate: that is how this repository
+ended up with two versions of `axum` and `reqwest` in one tree.
+
+## Screenshots
+
+UI changes should show their result. The capture script signs in through the real form —
+the session is in an `HttpOnly` cookie, so driving the form is the only way in — and fails
+if any view is blank, errored, overflowing, or logging an unexpected console error.
+
+Its one dependency is declared and pinned in the root [`package.json`](package.json), so a
+capture is reproducible rather than dependent on whatever `NODE_PATH` happens to hold.
+None of this is part of the Rust build.
 
 ```bash
-# Generate documentation
-cargo doc --workspace --all-features --no-deps
-
-# Open in browser
-cargo doc --workspace --all-features --no-deps --open
-
-# Check for broken links
-cargo doc --workspace --all-features --no-deps 2>&1 | grep warning
+npm ci                                      # installs the pinned playwright-core
+npm run browser:install                     # once, fetches the matching Chromium
+npm run screenshots:check                   # optional: prove the browser launches
+cargo leptos serve                          # in one terminal
+npm run screenshots                         # in another
 ```
 
-### README and Guides
+`npm run browser:install` is a separate step on purpose: `npm install` should not reach the
+network for a browser, and neither should anything in the Rust build. If you already have a
+Chromium, skip it and set `CHROMIUM_PATH=/path/to/chromium`.
 
-- Keep README.md up to date
-- Add examples for new features
-- Update API documentation
-- Write migration guides for breaking changes
+It writes `docs/screenshots/*.png`, which the README embeds. A screenshot that shows a
+blank page or a raw error is worse than none, which is why the script asserts rather than
+just capturing.
 
-## 🔀 Pull Request Process
+CI runs the same suite in the [`Screenshots`](.github/workflows/screenshots.yml) workflow:
+it starts a server, creates an account with a password generated per run, captures every
+view and fails on any assertion. The job never commits the images. If the capture changes a
+*deterministic* view (login, login-error, not-found, mobile-login) it fails the job, because
+a warning cannot establish that the committed images still depict the current UI. The
+dashboard views embed the live secret count and move on their own, so their drift warns and
+uploads the new images as an artifact for a human to judge. Regenerate and commit
+deliberately with the commands above.
 
-### Before Submitting
+## Commits and pull requests
 
-1. **Ensure Tests Pass**
-   ```bash
-   cargo test --workspace --all-features
-   cargo clippy --workspace --all-targets --all-features -- -D warnings
-   cargo fmt --all -- --check
-   ```
+Conventional-commit titles (`feat:`, `fix:`, `refactor:`, …) with a capitalised subject.
 
-2. **Update Documentation**
-   - Add/update inline documentation
-   - Update README if needed
-   - Add examples for new features
+Before opening a PR:
 
-3. **Update Release Notes (if applicable)**
-   - If the project uses a changelog or release-notes file, document user-visible changes.
-   - Call out any breaking changes clearly.
+- [ ] `cargo fmt --all`
+- [ ] `cargo clippy --workspace --locked --all-targets -- -D warnings`
+- [ ] `cargo test --workspace --locked`
+- [ ] The wasm check above
+- [ ] You ran the app and exercised the change
+- [ ] No new build-time network access
+- [ ] No secret, token or key material in a log line, `Debug` impl or error message
+- [ ] Secret-touching paths emit an audit event, including on denial
 
-4. **Rebase on Latest**
-   ```bash
-   git fetch upstream
-   git rebase upstream/main
-   ```
+State in the description what you verified and what you did not. An unticked box is
+information, not a failure — claiming verification you did not perform is the actual
+problem.
 
-### Submitting PR
+## Reporting bugs and security issues
 
-1. **Push to Your Fork**
-   ```bash
-   git push origin feature/your-feature-name
-   ```
+Open a GitHub issue for bugs; include what you expected, what happened, and the smallest
+reproduction you have.
 
-2. **Open Pull Request**
-   - Use descriptive title (conventional commits format)
-   - Fill out PR template completely
-   - Link related issues
-   - Add screenshots for UI changes
-   - Mark as draft if work in progress
+For a vulnerability, **do not open a public issue** — follow [SECURITY.md](SECURITY.md) and
+report it privately. That file also documents the project's design commitments and its
+known limitations, which is the honest place to look before concluding that something is a
+bug.
 
-3. **PR Description Should Include**:
-   - Summary of changes
-   - Motivation and context
-   - Testing performed
-   - Breaking changes (if any)
-   - Related issues
+## Community
 
-### PR Review Process
-
-1. **Automated Checks**: CI must pass (GitHub Actions)
-2. **Code Review**: At least one approval required
-3. **Changes Requested**: Address feedback promptly
-4. **Approval**: Maintainer will merge
-
-### After Merge
-
-1. **Delete Branch**
-   ```bash
-   git branch -d feature/your-feature-name
-   git push origin --delete feature/your-feature-name
-   ```
-
-2. **Sync Your Fork**
-   ```bash
-   git checkout main
-   git pull upstream main
-   git push origin main
-   ```
-
-## 🐛 Issue Guidelines
-
-### Reporting Bugs
-
-**Before Opening an Issue:**
-- Search existing issues
-- Check if it's already fixed in latest version
-- Reproduce with minimal example
-
-**Bug Report Should Include:**
-- Clear, descriptive title
-- Steps to reproduce
-- Expected behavior
-- Actual behavior
-- Environment (OS, Rust version, etc.)
-- Logs and error messages
-- Minimal reproducible example
-
-**Template:**
-```markdown
-### Description
-Brief description of the bug.
-
-### Steps to Reproduce
-1. Step one
-2. Step two
-3. Step three
-
-### Expected Behavior
-What should happen.
-
-### Actual Behavior
-What actually happened.
-
-### Environment
-- OS: Ubuntu 22.04
-- Rust: 1.90.0
-- Secreton: 0.1.0
-
-### Logs
-```
-Error logs here
-```
-
-### Minimal Example
-```rust
-// Code to reproduce
-```
-```
-
-### Feature Requests
-
-**Template:**
-```markdown
-### Feature Description
-Clear description of the feature.
-
-### Use Case
-Why is this feature needed? What problem does it solve?
-
-### Proposed Solution
-How should this feature work?
-
-### Alternatives Considered
-Other approaches you've considered.
-
-### Additional Context
-Any other relevant information.
-```
-
-## 🔒 Security
-
-### Security Policy
-
-- **DO NOT** open public issues for security vulnerabilities
-- Prefer opening a private security advisory in GitHub ("Security" tab → "Advisories"), or contact the maintainer via the email listed in `Cargo.toml` (currently `zynqrs@gmail.com`).
-- We will review reports and work on a fix as soon as reasonably possible.
-- Follow a coordinated disclosure process where appropriate.
-
-### Security Testing
-
-Before submitting security-related PRs:
-
-1. **Run Security Audit**
-   ```bash
-   cargo audit
-   cargo deny check advisories
-   ```
-
-2. **Check for Secrets**
-   ```bash
-   # Never commit secrets or credentials
-   git log -p | grep -i "password\|secret\|key" --color
-   ```
-
-3. **Test Cryptography**
-   ```bash
-   cargo test -p secreton-crypto --all-features
-   cargo bench -p secreton-crypto
-   ```
-
-### Secure Coding Checklist
-
-- [ ] Input validation on all user inputs
-- [ ] Output encoding to prevent injection
-- [ ] Use parameterized queries (no SQL injection)
-- [ ] Sensitive data wiped from memory (`zeroize`)
-- [ ] Constant-time operations for crypto
-- [ ] No secrets in logs or error messages
-- [ ] TLS for all network communication
-- [ ] Authentication and authorization checks
-
-## 🤝 Community
-
-### Getting Help
-
-- **GitHub Discussions**: For questions and design discussions
-- **GitHub Issues**: For bugs and feature requests
-- **Contact**: Use Issues/Discussions or the maintainer email from `Cargo.toml` for more detailed support.
-
-### Resources
-
-- **Documentation**: The `docs/` directory in this repository (work in progress)
-- **API Reference**: Generated with `cargo doc` and via the OpenAPI endpoints exposed by the API server (see README for URLs)
-- **Examples / Blog**: Planned for future releases.
-
-### Recognition
-
-Contributors are:
-- Listed in GitHub's contributors graph
-- Mentioned in release notes when appropriate
-
-## 📋 Checklist for Contributors
-
-Before submitting your PR, ensure:
-
-- [ ] Code follows Rust style guidelines
-- [ ] All tests pass (`cargo test --workspace --all-features`)
-- [ ] Code is formatted (`cargo fmt --all`)
-- [ ] No clippy warnings (`cargo clippy --workspace -- -D warnings`)
-- [ ] Documentation is updated
-- [ ] Changelog entry added (if applicable)
-- [ ] Commit messages follow conventional format
-- [ ] PR description is complete
-- [ ] Tests cover new functionality (>80% coverage)
-- [ ] Security considerations addressed
-- [ ] No secrets or credentials in code
-- [ ] Branch is up to date with main
-
-## 🎉 Thank You!
-
-Thank you for contributing to Secreton! Your efforts help make enterprise-grade security accessible to everyone.
-
-Questions? Feel free to ask in GitHub Discussions or reach out to the maintainers.
-
-**Happy Coding! 🚀🔒**
+Be decent to each other; the standards are in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Report unacceptable behaviour to the maintainer address in `Cargo.toml`.

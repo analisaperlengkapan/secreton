@@ -62,6 +62,12 @@ jobs:
         options: >-
           --health-cmd "healthcheck.sh --connect --innodb_initialized"
           --health-interval 10s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 10s
+          --health-timeout 5s --health-retries 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -75,6 +81,10 @@ jobs:
           # rather than a fabricated one, so CI must actually run them.
           SECRETON_TEST_POSTGRES_URL: postgres://secreton:secreton@localhost:5432/secreton_test
           SECRETON_TEST_MYSQL_URL: mysql://root:secreton@127.0.0.1:3306/secreton_test
+          # Redis is a shared backend the seal service takes a cross-process lease on.
+          # Its path-keyed delete and its compare-and-set are only meaningful against the
+          # real server, so these run here rather than being asserted against a double.
+          SECRETON_TEST_REDIS_URL: redis://127.0.0.1:6379
       - run: cargo test --doc --workspace --locked
 
   wasm:
@@ -167,9 +177,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Build only — no registry push from a pull request.
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: false

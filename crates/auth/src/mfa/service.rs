@@ -154,10 +154,28 @@ impl CombinedMfaService {
         entity_id: Uuid,
         account_name: String,
     ) -> AuthMethodResult<TotpEnrollment> {
+        self.enable_totp_owned(entity_id, account_name, None, None)
+            .await
+    }
+
+    /// Enable TOTP for an entity, stamping the persisted enrollment with `owner`.
+    ///
+    /// Initialization uses this so the enrollment it creates is removable by the same
+    /// ownership-conditional cleanup that removes the rest of a failed attempt's artifacts.
+    /// Passing `fence` also makes the write itself conditional on the attempt still holding
+    /// its lease, so an attempt that has lost it cannot create the enrollment at all — see
+    /// [`TotpService::enroll_owned`].
+    pub async fn enable_totp_owned(
+        &self,
+        entity_id: Uuid,
+        account_name: String,
+        owner: Option<&str>,
+        fence: Option<secreton_storage::StorageFence<'_>>,
+    ) -> AuthMethodResult<TotpEnrollment> {
         // Enroll in TOTP service
         let enrollment = self
             .totp_service
-            .enroll(entity_id, account_name)
+            .enroll_owned(entity_id, account_name, owner, fence)
             .await
             .map_err(|e| SecretonError::Internal {
                 message: e.to_string(),

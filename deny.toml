@@ -100,17 +100,13 @@ ignore = [
     # RUSTSEC-2026-0253 — use-after-free in `lru`'s `LruCache::pop()` when a stored key's
     # `Drop` panics, leaving a dangling node linked in the LRU list.
     #
-    # This repository no longer uses `lru`. It was declared in crates/engines and never
-    # referenced there, and the one file that did use it —
-    # crates/server/src/middleware/legacy.rs — was an orphan from the restructure that no
-    # module declared, so it had never been compiled. Both are gone.
-    #
-    # It remains in the lockfile through mysql_async, which requires `lru = "0.16.3"` and
-    # so cannot take the patched 0.18.2; that sits behind the off-by-default `mysql`
-    # feature, so a stock build does not contain it. Reaching the bug needs a stored key
-    # whose `Drop` panics, and mysql_async's statement cache is keyed by strings, whose
-    # `Drop` cannot. Revisit when mysql_async widens its requirement.
-    { id = "RUSTSEC-2026-0253", reason = "unsound (not vulnerable); transitive through mysql_async behind an off-by-default feature, which pins ^0.16.3 and cannot take the patched 0.18.2" },
+    # No exception is needed any more. This repository never depended on `lru` directly —
+    # it arrived transitively through `mysql_async`, and this entry used to record that
+    # `mysql_async` pinned `^0.16.3` and so could not take the patched 0.18.2. The
+    # `mysql_async` upgrade to 0.37 widens that to `^0.18`, and the committed lockfile now
+    # resolves `lru` 0.18.5, which is inside the patched range. Keeping the ignore would
+    # suppress a real finding if the crate ever regressed; cargo-deny also reports an
+    # unmatched ignore as a warning, which is how the staleness surfaced.
     # RUSTSEC-2025-0057 (fxhash, via wasmtime) was ignored here for a wasmtime dependency
     # this repository no longer has — the experimental WebAssembly modules were deleted.
     # cargo-deny reports an unmatched ignore as a warning, which is how it was found.

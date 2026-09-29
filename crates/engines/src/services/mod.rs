@@ -100,21 +100,18 @@ impl Services {
         // A missing JWT secret must stop the process at startup rather than panic deep
         // inside service construction, and must never be silently generated: a secret
         // invented at boot invalidates every token the moment the process restarts.
-        let jwt_secret = config.auth.jwt.secret.clone().ok_or_else(|| {
+        // The value itself is read by the auth and token services; this call only asserts
+        // that it is present.
+        config.auth.jwt.secret.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "auth.jwt.secret is not configured. Set SECRETON__AUTH__JWT__SECRET or the \
                  `secret` key under [auth.jwt]; refusing to start with a generated one."
             )
         })?;
 
-        // Initialize seal service
-        let seal = Arc::new(SealService::new(
-            storage.clone(),
-            crypto.clone(),
-            jwt_secret,
-            config.auth.jwt.issuer.clone(),
-            config.auth.jwt.audience.clone(),
-        ));
+        // Initialize seal service. It is handed the auth service below, once that exists,
+        // because it needs it to record the session behind the root token it issues.
+        let seal = Arc::new(SealService::new(storage.clone(), crypto.clone()));
 
         // Initialize audit logger
         let audit = Arc::new(
@@ -199,6 +196,13 @@ impl Services {
                 .with_audit(audit.clone())
                 .with_mfa(mfa.clone()),
         );
+
+        // Give the seal service the auth service, so a successful unseal can issue a root
+        // token that is bound to a real session and therefore actually usable.
+        let seal = seal.with_auth(auth.clone());
+        // And the audit logger, so both the success and the failure of an unseal are
+        // recorded — the failure is the one a reviewer needs to see.
+        let seal = seal.with_audit(audit.clone());
 
         // Initialize policy service
         let policy_service = Arc::new(PolicyService::new());

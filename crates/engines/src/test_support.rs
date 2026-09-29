@@ -56,3 +56,19 @@ pub(crate) fn without_root_key() -> RootKeyEnv {
     }
     RootKeyEnv(guard)
 }
+
+/// A random, valid-looking password for a test account.
+///
+/// Tests that exercise a password path need a value a real verifier would accept. Writing
+/// one as a literal makes the source read — to a person and to a scanner — like a committed
+/// credential, and models production wrongly: an operator, not the repository, chooses the
+/// password. A fresh value per call keeps no fixed secret in the tree and no generated value
+/// is ever logged, asserted on, or embedded in an error.
+pub(crate) fn generated_password() -> String {
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}

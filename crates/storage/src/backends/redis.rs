@@ -1,8 +1,8 @@
 //! Modern Redis storage backend implementation using redis v0.1.0-alpha.1
 
 use crate::{
-    HealthStatus, QueryParams, SecretEntry, StorageBackend, StorageError, StorageResult,
-    StorageStats, StorageTransaction,
+    Coordination, HealthStatus, QueryParams, SecretEntry, StorageBackend, StorageError,
+    StorageFence, StorageResult, StorageStats, StorageTransaction,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -13,9 +13,32 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// How many times a conditional write re-reads and retries when the path's identity moved
+/// between its read and the atomic script. A benign single replacement is absorbed on the
+/// first retry; the bound turns a path under pathological churn into an error rather than a
+/// livelock.
+const CONDITIONAL_WRITE_MAX_ATTEMPTS: usize = 5;
+
+/// Build the record a replacement should write, preserving the identity and creation time
+/// the path already had — matching the memory, file and PostgreSQL backends, which all keep
+/// the existing `id` and `created_at` and overwrite the rest.
+fn plan_replacement(existing: &Option<SecretEntry>, entry: &SecretEntry) -> SecretEntry {
+    match existing {
+        Some(old) => {
+            let mut updated = entry.clone();
+            updated.id = old.id;
+            updated.created_at = old.created_at;
+            updated
+        }
+        None => entry.clone(),
+    }
+}
+
 /// Modern Redis storage backend with connection pooling
 pub struct RedisBackend {
     manager: Arc<Mutex<ConnectionManager>>,
+    #[cfg(test)]
+    pause: Option<Arc<crate::test_support::WritePause>>,
 }
 
 /// Redis transaction implementation using pipelines
@@ -32,12 +55,150 @@ enum RedisTransactionOp {
     Delete(Uuid),
 }
 
+/// The key used in place of a path key for an entry that has no path.
+///
+/// Lua indexes `KEYS` positionally and Redis rejects an empty key name, so the "no path"
+/// case needs a real, never-written key. A `GET` of it returns nil, which is exactly how
+/// the script treats "this record has no mapping".
+const NO_PATH_KEY: &str = "secreton:_no_path_";
+
+/// The Lua script a transaction commit runs, once for the *whole* operation list.
+///
+/// A commit previously invoked one independent script per operation, holding this process's
+/// manager mutex only around each call. Two defects followed. First, a later operation that
+/// failed left the earlier scripts' writes published — Redis cannot roll back a script that
+/// already returned — so the transaction contract ("a failed commit publishes nothing") was
+/// broken. Running every operation inside one script makes the commit one atomic unit:
+/// Redis executes a script without interleaving other commands, and no error path in this
+/// script occurs after a write has been applied. Second, the superseded entry key was
+/// resolved from a read in Rust before the script ran and then deleted unconditionally; a
+/// concurrent writer that moved the path to a new id in that window had its record deleted
+/// even though it belonged elsewhere. The script now resolves the mapping itself and removes
+/// the superseded record only while that record still names this path.
+///
+/// The delete branch removes the mapping only while it still names the id being deleted, the
+/// same guard `delete_by_id` uses.
+///
+/// A write is also a possible *relocation*: the id may already have a record naming a
+/// different path. The script reads that record first and, before installing the new
+/// mapping, removes the old path's mapping while it still names this id — the same cleanup
+/// `store` does, done here so a transaction cannot leave an id reachable from two paths.
+/// The old path is resolved from the record itself, not from a pre-read, so it cannot be
+/// stale; the entry key is the only other key the script touches, which is why it is
+/// declared.
+///
+/// An already-expired write is a pure no-op: it stores nothing and removes nothing. A
+/// deliberate removal goes through the `delete` mode.
+///
+/// KEYS: two per operation, in order — `[path_key, entry_key]`; `path_key` is
+/// [`NO_PATH_KEY`] when the entry has no path.
+/// ARGV: `[1]`=operation count, then five per operation:
+/// `[mode]` (`write`|`delete`), `[entry json]`, `[id]`, `[absolute expiry or '']`,
+/// `[path]` (`''` for none).
+const TRANSACTION_SCRIPT: &str = r"
+    local n = tonumber(ARGV[1])
+
+    -- Write a key with an optional precomputed TTL. The deadline is resolved once by the
+    -- caller; this helper never deletes. An expired write is a no-op, not a removal.
+    local write = function(key, value, ttl)
+        redis.call('SET', key, value)
+        if ttl then
+            redis.call('PEXPIRE', key, ttl * 1000)
+        end
+    end
+
+    -- Decode the path embedded in a stored record, or nil when it is absent or unreadable.
+    local stored_path = function(entry_key)
+        local stored = redis.call('GET', entry_key)
+        if not stored then
+            return nil
+        end
+        local ok, decoded = pcall(cjson.decode, stored)
+        if ok and type(decoded) == 'table' then
+            return decoded.path
+        end
+        return nil
+    end
+
+    for i = 1, n do
+        local base = 2 + (i - 1) * 5
+        local mode = ARGV[base]
+        local value = ARGV[base + 1]
+        local id = ARGV[base + 2]
+        local expires = ARGV[base + 3]
+        local path = ARGV[base + 4]
+        local path_key = KEYS[(i - 1) * 2 + 1]
+        local entry_key = KEYS[(i - 1) * 2 + 2]
+
+        if mode == 'write' then
+            local existing_path = stored_path(entry_key)
+
+            -- Resolve the destination's deadline once, here. A write whose deadline has
+            -- elapsed stores nothing and — the defect this guards — removes nothing either.
+            -- In the common case the id and path are the live record's own (an expired update
+            -- of a stored secret), so treating the expired branch as cleanup erased a live
+            -- secret the rejected write never replaced. A deliberate removal is the `delete`
+            -- mode below.
+            local ttl = nil
+            if expires ~= '' then
+                ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
+            end
+
+            if ttl == nil or ttl > 0 then
+                -- Resolve the superseded record at this path here, not from a pre-read the
+                -- caller did. The mapping must currently name a different id for this path,
+                -- and that id's record must still name this path: a record moved to another
+                -- path by a concurrent writer must not be deleted out from under that path.
+                local mapping = redis.call('GET', path_key)
+                if mapping and mapping ~= id then
+                    local superseded_path = stored_path('secreton:entry:' .. mapping)
+                    if superseded_path ~= nil and superseded_path == path then
+                        redis.call('DEL', 'secreton:entry:' .. mapping)
+                    end
+                end
+                -- Relocation cleanup: if this id already named a different path, remove that
+                -- path's mapping while it still names this id. Leaving it behind would make
+                -- the id reachable from both paths, and a later fenced or conditional write
+                -- at the old path would resolve to this record and delete it.
+                if existing_path ~= nil and existing_path ~= '' and existing_path ~= path then
+                    local old_path_key = 'secreton:path:' .. existing_path
+                    if redis.call('GET', old_path_key) == id then
+                        redis.call('DEL', old_path_key)
+                    end
+                end
+                write(entry_key, value, ttl)
+                -- Guard on the path string, not the key: a pathless entry's key is the
+                -- sentinel and must never be written as though it were a mapping.
+                if path ~= '' then
+                    write(path_key, id, ttl)
+                end
+            end
+        else
+            local mapping = redis.call('GET', path_key)
+            local removed = redis.call('DEL', entry_key)
+            if removed > 0 and mapping == id then
+                redis.call('DEL', path_key)
+            end
+        end
+    end
+    return 1
+";
+
 impl RedisTransaction {
     pub fn new(manager: Arc<Mutex<ConnectionManager>>) -> Self {
         Self {
             manager,
             operations: Vec::new(),
             committed: false,
+        }
+    }
+
+    /// The key to pass as a path key for an entry that has no path.
+    fn path_key_for(path: &str) -> String {
+        if path.is_empty() {
+            NO_PATH_KEY.to_string()
+        } else {
+            format!("secreton:path:{}", path)
         }
     }
 }
@@ -83,44 +244,116 @@ impl StorageTransaction for RedisTransaction {
             });
         }
 
-        // Get Redis connection from backend and execute all operations
+        // Build the script inputs *before* any write. Serialisation and path policy run
+        // client-side, so a failure here happens with nothing published; the script itself
+        // has no error path after a write, which is what makes the commit all-or-nothing.
+        // The operation count, the key list and the argument list are assembled together so
+        // the script's positional indexing cannot drift.
         let mut conn = self.manager.lock().await;
-        let mut pipe = redis::pipe();
-        pipe.atomic();
 
-        for op in self.operations {
+        let script = redis::Script::new(TRANSACTION_SCRIPT);
+        // Exactly two keys per operation, in the order the script indexes them:
+        // `[path_key, entry_key]`. The entry key is derived from the id here rather than in
+        // the script so both key names are declared to Redis (Cluster would otherwise reject
+        // the in-script `secreton:entry:<id>` access) and so the positional indexing is
+        // assembled in one place.
+        let mut keys: Vec<String> = Vec::with_capacity(self.operations.len() * 2);
+        let mut args: Vec<String> = Vec::with_capacity(1 + self.operations.len() * 5);
+        args.push(self.operations.len().to_string());
+
+        // Paths written earlier in this same operation list. A delete's mapping key cannot
+        // be discovered by reading Redis: the store it follows is still staged, so the
+        // backend read finds no entry and the delete would be handed the sentinel key. The
+        // script would then remove the record but not the mapping the staged write
+        // established, leaving `exists` true over a path whose record is gone. Resolving
+        // against the staged writes closes that, and keeps every key declared to Redis.
+        let mut staged_paths: std::collections::HashMap<Uuid, String> =
+            std::collections::HashMap::new();
+
+        for op in &self.operations {
             match op {
                 RedisTransactionOp::Store(entry) | RedisTransactionOp::Update(entry) => {
-                    let key = format!("secreton:entry:{}", entry.id);
-                    let value = serde_json::to_string(&entry).map_err(|e| {
+                    staged_paths.insert(entry.id, entry.path.clone());
+                    let value = serde_json::to_string(entry).map_err(|e| {
                         StorageError::SerializationError {
                             message: e.to_string(),
                         }
                     })?;
-
-                    if let Some(expires_at) = entry.expires_at {
-                        let ttl = (expires_at - Utc::now()).num_seconds();
-                        if ttl > 0 {
-                            pipe.set_ex(&key, value, u64::try_from(ttl).unwrap_or(0));
-                        } else {
-                            // Already expired, ensure it is removed
-                            pipe.del(&key);
-                        }
-                    } else {
-                        pipe.set(&key, value);
-                    }
+                    // An already-expired write must not resurrect the path: the script's
+                    // `live` check finds a non-positive deadline and skips the whole branch,
+                    // storing nothing and removing nothing. It must not be turned into a
+                    // delete either — the id and path are usually the live record's own.
+                    let expires = entry
+                        .expires_at
+                        .map(|at| at.timestamp().to_string())
+                        .unwrap_or_default();
+                    keys.push(Self::path_key_for(&entry.path));
+                    keys.push(format!("secreton:entry:{}", entry.id));
+                    args.push("write".to_string());
+                    args.push(value);
+                    args.push(entry.id.to_string());
+                    args.push(expires);
+                    args.push(entry.path.clone());
                 }
                 RedisTransactionOp::Delete(id) => {
-                    let key = format!("secreton:entry:{}", id);
-                    pipe.del(&key);
+                    // The mapping key cannot be derived from the id alone — Redis has no
+                    // index from entry to path — so learn the path from the staged writes
+                    // first, then from committed storage. The read is safe to do before the
+                    // script: the script only uses it as a hint and re-checks the mapping
+                    // against the id before removing it. A delete with no path at all (the
+                    // record never existed and was never staged) can only have come from the
+                    // sentinel, which the script never treats as a mapping.
+                    let entry_key = format!("secreton:entry:{}", id);
+                    let path = match staged_paths.get(id) {
+                        Some(path) => path.clone(),
+                        None => {
+                            let stored: Option<String> =
+                                conn.get(&entry_key).await.map_err(|e| {
+                                    StorageError::QueryFailed {
+                                        message: format!(
+                                            "Failed to read entry for transaction: {}",
+                                            e
+                                        ),
+                                    }
+                                })?;
+                            stored
+                                .as_deref()
+                                .and_then(|json| serde_json::from_str::<SecretEntry>(json).ok())
+                                .map(|entry| entry.path)
+                                .unwrap_or_default()
+                        }
+                    };
+                    keys.push(Self::path_key_for(&path));
+                    keys.push(entry_key);
+                    args.push("delete".to_string());
+                    args.push(String::new());
+                    args.push(id.to_string());
+                    args.push(String::new());
+                    args.push(path);
                 }
             }
         }
 
-        pipe.query_async::<()>(&mut *conn)
+        // One script invocation for the whole list, so every write, mapping update and
+        // superseded-record removal either all happen or none do. The previous per-operation
+        // invocations left earlier writes published when a later one failed.
+        //
+        // The keys and args must be accumulated on the *invocation*, not the `Script`:
+        // `Script::key`/`Script::arg` return a fresh `ScriptInvocation` each call, so
+        // dropping the result leaves the script with no keys or arguments and the commit
+        // runs `EVALSHA <sha> 0` against a nil operation count.
+        let mut invocation = script.prepare_invoke();
+        for key in &keys {
+            invocation.key(key);
+        }
+        for arg in &args {
+            invocation.arg(arg);
+        }
+        invocation
+            .invoke_async::<i64>(&mut *conn)
             .await
             .map_err(|e| StorageError::QueryFailed {
-                message: format!("Failed to execute transaction pipeline: {}", e),
+                message: format!("Failed to execute transaction commit: {}", e),
             })?;
 
         self.committed = true;
@@ -149,7 +382,164 @@ impl RedisBackend {
 
         Ok(Self {
             manager: Arc::new(Mutex::new(manager)),
+            #[cfg(test)]
+            pause: None,
         })
+    }
+
+    /// Test-only: force this backend's conditional writes to park just before their script
+    /// the first time one runs, so a test can replace the path's record in the window
+    /// between the read and the write. Returns the rendezvous handle.
+    #[cfg(test)]
+    pub(crate) fn arm_compare_and_set_pause(&mut self) -> Arc<crate::test_support::WritePause> {
+        let pause = Arc::new(crate::test_support::WritePause::new());
+        self.pause = Some(pause.clone());
+        pause
+    }
+
+    /// Test-only: the pause for the first attempt, taken once.
+    #[cfg(test)]
+    async fn take_pause(&self) {
+        if let Some(pause) = &self.pause {
+            pause.park().await;
+        }
+    }
+
+    /// Insert-if-absent that is also fenced on a still-held lease, in one script.
+    ///
+    /// Both preconditions and the write run server-side as one atomic unit, which is what
+    /// closes the registration race: a plain `exists` check on the caller's side and a later
+    /// `store` are two steps, and a concurrent ordinary registration can pass the same check
+    /// in between and have its account replaced. Here the path mapping is read (KEYS[1]) and
+    /// the fence record is read (KEYS[2] -> entry) inside the same script that writes, so
+    /// either the path is empty and the lease still names this attempt, or nothing is written.
+    ///
+    /// Returns `1` written, `0` lost lease, `2` path already occupied — the occupied result
+    /// is mapped to [`StorageError::Duplicate`] by the caller so "someone else registered
+    /// this name" is never confused with "this attempt's lease expired".
+    ///
+    /// KEYS[1]=entry path key, KEYS[2]=fence path key.
+    /// ARGV[1]=entry value, ARGV[2]=entry id, ARGV[3]=absolute expiry second or '',
+    /// ARGV[4]=fence owner token.
+    async fn compare_and_set_absent_fenced(
+        &self,
+        entry: &SecretEntry,
+        fence: StorageFence<'_>,
+    ) -> StorageResult<bool> {
+        let entry_path_key = if entry.path.is_empty() {
+            String::new()
+        } else {
+            format!("secreton:path:{}", entry.path)
+        };
+        // A pathless entry has no mapping to contend over; that is a programming error for
+        // this operation rather than something to silently treat as absent.
+        if entry_path_key.is_empty() {
+            return Err(StorageError::Unsupported {
+                operation: "compare_and_set(AbsentFenced) on a pathless entry".to_string(),
+                backend: "redis".to_string(),
+            });
+        }
+
+        let value = serde_json::to_string(entry).map_err(|e| StorageError::SerializationError {
+            message: e.to_string(),
+        })?;
+        let fence_path_key = format!("secreton:path:{}", fence.path);
+        let expires = entry
+            .expires_at
+            .map(|at| at.timestamp().to_string())
+            .unwrap_or_default();
+
+        let script = redis::Script::new(
+            r"
+            local expires = ARGV[3]
+
+            local function write(key, value)
+                if expires ~= '' then
+                    local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
+                    if ttl <= 0 then
+                        redis.call('DEL', key)
+                        return 0
+                    end
+                    redis.call('SET', key, value)
+                    redis.call('PEXPIRE', key, ttl * 1000)
+                    return 1
+                end
+                redis.call('SET', key, value)
+                return 1
+            end
+
+            -- Occupancy first: a live record at the path means another registration won,
+            -- which the caller must see as a duplicate rather than a lost lease.
+            if redis.call('GET', KEYS[1]) then
+                return 2
+            end
+
+            -- Then the fence: the lease record must still exist and carry this token.
+            local fence_id = redis.call('GET', KEYS[2])
+            if not fence_id then
+                return 0
+            end
+            local fence_entry = redis.call('GET', 'secreton:entry:' .. fence_id)
+            if not fence_entry then
+                return 0
+            end
+            local ok, decoded = pcall(cjson.decode, fence_entry)
+            if not ok or type(decoded) ~= 'table' or type(decoded.metadata) ~= 'table'
+                or decoded.metadata['storage_owner'] ~= ARGV[4] then
+                return 0
+            end
+
+            -- An expired lease is not a held lease. The owner token alone is not enough:
+            -- the lease's own deadline may have passed before any takeover, and a write
+            -- authorised in that window is exactly what the expiry exists to prevent. The
+            -- deadline is compared against the server clock in this same script, so the
+            -- check is part of the same indivisible step as the write. A missing or
+            -- non-numeric deadline fails closed.
+            local fence_expires = tonumber(decoded.metadata['lease_expires_at'])
+            if not fence_expires or fence_expires <= tonumber(redis.call('TIME')[1]) then
+                return 0
+            end
+
+            -- A write whose own deadline has already elapsed stores nothing; reporting 1
+            -- would tell the caller a record exists that the script deliberately dropped.
+            if write('secreton:entry:' .. ARGV[2], ARGV[1]) == 0 then
+                return 0
+            end
+            if write(KEYS[1], ARGV[2]) == 0 then
+                redis.call('DEL', 'secreton:entry:' .. ARGV[2])
+                return 0
+            end
+            return 1
+            ",
+        );
+
+        let outcome: i64 = {
+            let mut conn = self.manager.lock().await;
+            script
+                .key(&entry_path_key)
+                .key(&fence_path_key)
+                .arg(&value)
+                .arg(entry.id.to_string())
+                .arg(&expires)
+                .arg(fence.token)
+                .invoke_async(&mut *conn)
+                .await
+                .map_err(|e| StorageError::QueryFailed {
+                    message: format!("Failed to fenced insert entry: {}", e),
+                })?
+        };
+
+        match outcome {
+            1 => Ok(true),
+            0 => Ok(false),
+            2 => Err(StorageError::Duplicate {
+                resource_type: "SecretEntry".to_string(),
+                id: entry.path.clone(),
+            }),
+            other => Err(StorageError::QueryFailed {
+                message: format!("fenced insert returned an unexpected outcome: {other}"),
+            }),
+        }
     }
 }
 
@@ -178,6 +568,24 @@ impl StorageBackend for RedisBackend {
         })?;
 
         let mut conn = self.manager.lock().await;
+
+        // Learn the path this id currently names *before* overwriting the record. Storing an
+        // existing id at a new path is a relocation, and it leaves the old path's mapping
+        // pointing at this id — an index entry for a path the record no longer names. That
+        // stale mapping is what lets a later fenced or conditional write at the old path
+        // resolve to this record and delete it, losing it from the path that now names it.
+        let previous_path: Option<String> = {
+            let stored: Option<String> =
+                conn.get(&key)
+                    .await
+                    .map_err(|e| StorageError::QueryFailed {
+                        message: format!("Failed to read entry before store: {}", e),
+                    })?;
+            stored
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<SecretEntry>(json).ok())
+                .map(|stored| stored.path)
+        };
 
         if let Some(expires_at) = entry.expires_at {
             let ttl = (expires_at - Utc::now()).num_seconds();
@@ -235,6 +643,32 @@ impl StorageBackend for RedisBackend {
             }
         }
 
+        // A relocation leaves the old path's mapping behind. Remove it only while it still
+        // points at this id, so a concurrent writer that has already repointed the old path
+        // at its own record keeps that mapping.
+        if let Some(previous) = previous_path
+            && !previous.is_empty()
+            && previous != entry.path
+        {
+            let previous_key = format!("secreton:path:{}", previous);
+            let script = redis::Script::new(
+                r"
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    redis.call('DEL', KEYS[1])
+                end
+                return 1
+                ",
+            );
+            script
+                .key(&previous_key)
+                .arg(entry.id.to_string())
+                .invoke_async::<i64>(&mut *conn)
+                .await
+                .map_err(|e| StorageError::QueryFailed {
+                    message: format!("Failed to clear the relocated path mapping: {}", e),
+                })?;
+        }
+
         Ok(())
     }
 
@@ -264,14 +698,17 @@ impl StorageBackend for RedisBackend {
 
     async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
         let key = format!("secreton:path:{}", path);
-        let mut conn = self.manager.lock().await;
 
-        let entry_id: Option<String> =
+        // Resolve the id and release the connection before reading the entry: `get_by_id`
+        // takes the same non-reentrant lock, so holding it across that call deadlocks.
+        let entry_id: Option<String> = {
+            let mut conn = self.manager.lock().await;
             conn.get(&key)
                 .await
                 .map_err(|e| StorageError::QueryFailed {
                     message: format!("Failed to get path mapping: {}", e),
-                })?;
+                })?
+        };
 
         match entry_id {
             Some(id_str) => {
@@ -290,28 +727,655 @@ impl StorageBackend for RedisBackend {
         self.store(entry).await
     }
 
-    async fn delete_by_id(&self, _id: Uuid) -> StorageResult<bool> {
-        Ok(false)
+    async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+        let entry_key = format!("secreton:entry:{}", id);
+        let mut conn = self.manager.lock().await;
+
+        // One server-side script removes the entry and the path mapping that points at it,
+        // and it removes the mapping only while the mapping still resolves to this id.
+        //
+        // The previous implementation read the entry, deleted the entry key, and then
+        // unconditionally deleted `secreton:path:<entry.path>`. If the path had been
+        // rewritten between the read and the delete — a concurrent `store` or
+        // `compare_and_set` publishing a replacement — that second delete removed the
+        // *replacement's* mapping. The replacement's entry key survived, but nothing could
+        // reach it by path any more, so it was lost while `get_by_path` reported a missing
+        // record. Comparing the mapping's current value against the id being deleted is what
+        // keeps a replacement reachable.
+        let script = redis::Script::new(
+            r"
+            local mapping = redis.call('GET', KEYS[1])
+            local removed = redis.call('DEL', KEYS[2])
+            if removed > 0 and mapping == ARGV[1] then
+                redis.call('DEL', KEYS[1])
+            end
+            return removed
+            ",
+        );
+
+        // The path key is derived from the entry itself, which is what the mapping names,
+        // so it can be computed here without a read. A record whose path is empty has no
+        // mapping.
+        let path_key = {
+            let stored: Option<String> =
+                conn.get(&entry_key)
+                    .await
+                    .map_err(|e| StorageError::QueryFailed {
+                        message: format!("Failed to read entry before delete: {}", e),
+                    })?;
+            match stored.as_deref().and_then(|json| {
+                serde_json::from_str::<SecretEntry>(json)
+                    .ok()
+                    .map(|entry| entry.path)
+            }) {
+                Some(path) if !path.is_empty() => format!("secreton:path:{}", path),
+                _ => String::new(),
+            }
+        };
+
+        let removed: i64 = if path_key.is_empty() {
+            // No mapping to consider; delete the entry alone.
+            let removed: u64 =
+                conn.del(&entry_key)
+                    .await
+                    .map_err(|e| StorageError::QueryFailed {
+                        message: format!("Failed to delete entry: {}", e),
+                    })?;
+            removed as i64
+        } else {
+            script
+                .key(&path_key)
+                .key(&entry_key)
+                .arg(id.to_string())
+                .invoke_async(&mut *conn)
+                .await
+                .map_err(|e| StorageError::QueryFailed {
+                    message: format!("Failed to delete entry: {}", e),
+                })?
+        };
+
+        Ok(removed > 0)
     }
 
-    async fn delete_by_path(&self, _path: &str) -> StorageResult<bool> {
-        Ok(false)
+    async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+        // Resolve the path, remove its record and remove the mapping in one server-side
+        // script, rather than `get_by_path` followed by `delete_by_id` over two separate
+        // connections.
+        //
+        // The two-step version was not atomic: between the read and the delete, another
+        // writer could move the same id to a different path (the mapping is keyed by path,
+        // the record by id). `delete_by_id` then re-read the id's *new* path and deleted the
+        // record and mapping there, so the original path still mapped to a now-missing id
+        // while an unrelated path lost its record. One script removes the record the mapping
+        // currently names and that mapping together, with no window in between.
+        if path.is_empty() {
+            return Ok(false);
+        }
+        let path_key = format!("secreton:path:{}", path);
+        let mut conn = self.manager.lock().await;
+
+        // KEYS[1]=path key; ARGV[1]=the path being deleted. The script resolves the id from
+        // the mapping and removes both the mapping and the record — but only removes the
+        // record when that record still names *this* path. An id can be reachable from more
+        // than one mapping if it was stored under a new path without clearing the old one;
+        // deleting the record unconditionally would then erase it from the other path too.
+        // Removing only this path's mapping leaves the record for the path it actually
+        // names. A mapping that names a missing (or unreadable) record is removed either way.
+        let script = redis::Script::new(
+            r"
+            local id = redis.call('GET', KEYS[1])
+            if not id then
+                return 0
+            end
+            local entry_key = 'secreton:entry:' .. id
+            local current = redis.call('GET', entry_key)
+            local removed = 0
+            if current then
+                local ok, decoded = pcall(cjson.decode, current)
+                if ok and type(decoded) == 'table' and decoded.path == ARGV[1] then
+                    removed = redis.call('DEL', entry_key)
+                end
+            end
+            redis.call('DEL', KEYS[1])
+            return removed
+            ",
+        );
+
+        let removed: i64 = script
+            .key(&path_key)
+            .arg(path)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to delete entry by path: {}", e),
+            })?;
+
+        Ok(removed > 0)
     }
 
-    async fn list(&self, _params: &QueryParams) -> StorageResult<Vec<SecretEntry>> {
-        Ok(Vec::new())
+    async fn exists(&self, path: &str) -> StorageResult<bool> {
+        let key = format!("secreton:path:{}", path);
+        let mut conn = self.manager.lock().await;
+        let exists: bool = conn
+            .exists(&key)
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to check existence: {}", e),
+            })?;
+        Ok(exists)
     }
 
-    async fn count(&self, _params: &QueryParams) -> StorageResult<u64> {
-        Ok(0)
+    fn coordination(&self) -> Coordination {
+        // Redis is the shared backend in the deployments this repository actually runs, so
+        // its conditional operations are `SET ... NX` and `DEL` guarded by a Lua script:
+        // each is a single server-side operation that every replica observes.
+        Coordination::CrossProcess
     }
 
-    async fn exists(&self, _path: &str) -> StorageResult<bool> {
-        Ok(false)
+    /// Conditional write as a single server-side operation.
+    ///
+    /// Every precondition is evaluated against the *path* mapping, because the path is the
+    /// identity the caller is fencing on. Checking an entry key derived from the caller's
+    /// own id would find nothing for a fresh id and report success unconditionally — which
+    /// is how an insert-if-absent turns into a lock that does not lock.
+    ///
+    /// The record body is never re-encoded inside the script: Lua's `cjson` renders an
+    /// empty table as `{}`, so a round-trip turns an empty `tags` array into a map and the
+    /// entry stops deserialising. The caller hands over a fully-formed value and the script
+    /// only chooses to write it or not.
+    ///
+    /// A replacement preserves the identity the path already had, and the *expected* id is
+    /// carried into the script as a second precondition: the script writes only while the
+    /// path mapping still names that id. The id is chosen in Rust from a read that happens
+    /// before the script runs, so without that check a path replaced in between would let
+    /// this call publish a record whose id was chosen from a stale read — resurrecting an
+    /// identity that is no longer current and deleting the live record under the current
+    /// id. When the mapping has moved, the script writes nothing and signals the caller
+    /// (return `2`), which re-reads and rebuilds so the payload always carries the identity
+    /// that is current at the instant of the write. This is why the pre-read is a *hint*
+    /// that the script verifies, not an authority it trusts.
+    ///
+    /// `outcome` is the script's return value: `1` written, `0` precondition failed, `2`
+    /// identity moved since the read.
+    async fn compare_and_set(
+        &self,
+        entry: &SecretEntry,
+        expect: crate::Expect<'_>,
+    ) -> StorageResult<bool> {
+        // `AbsentFenced` combines insert-if-absent with a lease fence, and its two failure
+        // modes must be distinguishable, so it runs its own single script.
+        if let crate::Expect::AbsentFenced(fence) = expect {
+            return self.compare_and_set_absent_fenced(entry, fence).await;
+        }
+
+        let path_key = format!("secreton:path:{}", entry.path);
+
+        let expected_owner = match expect {
+            crate::Expect::Owner(token)
+            | crate::Expect::UnexpiredOwner(token)
+            | crate::Expect::ExpiredOwner(token) => Some(token.to_string()),
+            _ => None,
+        };
+
+        // KEYS[1]=path key; ARGV[1]=value, ARGV[2]=mode ("absent" | "any" | "owner" | "unexpired_owner" | "expired_owner"),
+        // ARGV[3]=owner token (owner mode only), ARGV[4]=the id the payload was built with,
+        // ARGV[5]=the os.time() at which the record expires, or '' for no expiry.
+        //
+        // The TTL is applied inside the script so both the entry and the path mapping carry
+        // the same absolute deadline. The previous script `SET` the value with no expiry, so a
+        // conditional write silently made an expiring record immortal: the caller asked for a
+        // deadline, the write dropped it, and Redis would then serve a record whose own body
+        // still says `expires_at` has passed. `SETEX`/`PEXPIREAT` closes that. The deadline is
+        // passed as an absolute Unix second so a retry after a "moved" signal cannot shorten
+        // the TTL by the time already spent.
+        //
+        // Outcome 3 exists because a write whose deadline has already elapsed must not be
+        // reported as landing. The `write` helper drops an already-expired key and the script
+        // used to return 1 regardless, so a caller was told its record was present when the
+        // script had actually deleted the destination. The caller can now tell "the write
+        // happened" (1) from "nothing was written because the deadline had passed" (3).
+        let script = redis::Script::new(
+            r"
+            local mode = ARGV[2]
+            local mapping = redis.call('GET', KEYS[1])
+            local expected = ARGV[4]
+            local expires = ARGV[5]
+
+            -- Decide the deadline once, before any mutation. A conditional write whose own
+            -- deadline has already elapsed must leave the destination exactly as it found
+            -- it. The write helper used to compute the TTL and `DEL` the target key when it
+            -- was already expired, and it was reachable from the `absent` and
+            -- missing-mapping branches as well as the replacement branch: a rejected write
+            -- at an occupied path deleted the live record and left the path mapping
+            -- dangling, so `get_by_path` returned nothing even though the write failed.
+            -- Folding the check in here makes every branch non-mutating on the expiry path.
+            local ttl = nil
+            if expires ~= '' then
+                ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
+                if ttl <= 0 then
+                    return 3
+                end
+            end
+
+            local function write(key, value)
+                redis.call('SET', key, value)
+                if ttl then
+                    redis.call('PEXPIRE', key, ttl * 1000)
+                end
+            end
+
+            if mode == 'absent' then
+                if mapping then
+                    return 0
+                end
+                write('secreton:entry:' .. expected, ARGV[1])
+                write(KEYS[1], expected)
+                return 1
+            end
+
+            if not mapping then
+                if mode == 'owner' or mode == 'unexpired_owner' or mode == 'expired_owner' then
+                    return 0
+                end
+                write('secreton:entry:' .. expected, ARGV[1])
+                write(KEYS[1], expected)
+                return 1
+            end
+
+            -- The mapping names an id. If the payload was built for a different one, the
+            -- path has been replaced since the read: a live record under the mapped id must
+            -- not be overwritten with a stale identity. A *dangling* mapping (no record
+            -- under the mapped id) is not a live record and may be repaired in place.
+            if mapping ~= expected then
+                if redis.call('GET', 'secreton:entry:' .. mapping) then
+                    return 2
+                end
+            end
+
+            if mode == 'owner' or mode == 'unexpired_owner' or mode == 'expired_owner' then
+                local current = redis.call('GET', 'secreton:entry:' .. mapping)
+                if not current then
+                    return 0
+                end
+                local ok, decoded = pcall(cjson.decode, current)
+                if not ok or type(decoded) ~= 'table' or type(decoded.metadata) ~= 'table'
+                    or decoded.metadata['storage_owner'] ~= ARGV[3] then
+                    return 0
+                end
+                -- An expired lease is not a held lease: `unexpired_owner` folds the deadline
+                -- into the same atomic step as the replacement, so a renewal cannot revive a
+                -- lease that lapsed before this instant. The deadline is compared against the
+                -- server clock; a missing or non-numeric deadline fails closed.
+                if mode == 'unexpired_owner' then
+                    local lease_expires = tonumber(decoded.metadata['lease_expires_at'])
+                    if not lease_expires or lease_expires <= tonumber(redis.call('TIME')[1]) then
+                        return 0
+                    end
+                end
+                -- The converse precondition, for reclaiming a lapsed reservation. Redis
+                -- enforces a record's deadline by expiring its keys, so a reservation that
+                -- has lapsed is simply absent here (the read above found no mapping) and a
+                -- record that *is* present is by definition not expired. There is therefore
+                -- nothing to reclaim in place: fail the precondition and let the caller's
+                -- insert-if-absent decide, which it does correctly because the slot is free.
+                if mode == 'expired_owner' then
+                    return 0
+                end
+            end
+
+            write('secreton:entry:' .. expected, ARGV[1])
+            write(KEYS[1], expected)
+            -- A replacement whose identity moved off the old id leaves that id's record
+            -- behind; drop it so a superseded record cannot outlive the path that named it.
+            if mapping ~= expected then
+                redis.call('DEL', 'secreton:entry:' .. mapping)
+            end
+            return 1
+            ",
+        );
+
+        let mode = match expect {
+            crate::Expect::Absent => "absent",
+            crate::Expect::Any => "any",
+            crate::Expect::Owner(_) => "owner",
+            crate::Expect::UnexpiredOwner(_) => "unexpired_owner",
+            crate::Expect::ExpiredOwner(_) => "expired_owner",
+            // Dispatched above; restated so the match stays exhaustive.
+            crate::Expect::AbsentFenced(_) => {
+                return Err(StorageError::Unsupported {
+                    operation: "compare_and_set".to_string(),
+                    backend: "redis".to_string(),
+                });
+            }
+        };
+
+        for _ in 0..CONDITIONAL_WRITE_MAX_ATTEMPTS {
+            // The identity and creation time the path currently has are what the replacement
+            // must keep, exactly as the memory and file backends do.
+            //
+            // Only a record whose *own* path field names this path may be normalized. A
+            // mapping left behind by a relocation (`store` of an existing id at a new path)
+            // resolves to a record that no longer names this path; keeping its id would make
+            // the replacement map this path to a record whose body says it lives elsewhere.
+            // Treat such a stale mapping as an absent record, so the replacement is written
+            // with the caller's own identity.
+            let existing = self
+                .get_by_path(&entry.path)
+                .await?
+                .filter(|record| record.path == entry.path);
+            let to_write = plan_replacement(&existing, entry);
+
+            let value =
+                serde_json::to_string(&to_write).map_err(|e| StorageError::SerializationError {
+                    message: e.to_string(),
+                })?;
+
+            // A test can park here to force a replacement into the read-to-script window.
+            #[cfg(test)]
+            self.take_pause().await;
+
+            // Absolute Unix-second deadline, so the entry and its mapping expire together and
+            // a retry after a "moved" signal cannot shorten the TTL by the elapsed time.
+            let expires_at = to_write
+                .expires_at
+                .map(|at| at.timestamp().to_string())
+                .unwrap_or_default();
+
+            let outcome: i64 = {
+                let mut conn = self.manager.lock().await;
+                script
+                    .key(&path_key)
+                    .arg(&value)
+                    .arg(mode)
+                    .arg(expected_owner.as_deref().unwrap_or_default())
+                    .arg(to_write.id.to_string())
+                    .arg(&expires_at)
+                    .invoke_async(&mut *conn)
+                    .await
+                    .map_err(|e| StorageError::QueryFailed {
+                        message: format!("Failed to compare-and-set entry: {}", e),
+                    })?
+            };
+
+            match outcome {
+                1 => return Ok(true),
+                0 => return Ok(false),
+                // The path's identity moved between the read and the script. Re-read and
+                // rebuild so the payload matches the record that is current at the write.
+                2 => continue,
+                // Nothing was written: the record's own deadline had already elapsed, so
+                // the script dropped the destination instead of storing an immortal record.
+                // Reporting `Ok(true)` would tell the caller its record is present when the
+                // write deliberately stored nothing.
+                3 => return Ok(false),
+                other => {
+                    return Err(StorageError::QueryFailed {
+                        message: format!("compare-and-set returned an unexpected outcome: {other}"),
+                    });
+                }
+            }
+        }
+
+        Err(StorageError::QueryFailed {
+            message: "the record at this path is being replaced too rapidly to \
+                      conditionally write it"
+                .to_string(),
+        })
+    }
+
+    async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
+        let path_key = format!("secreton:path:{}", path);
+        let mut conn = self.manager.lock().await;
+
+        // KEYS[1]=path key; ARGV[1]=owner token. Resolves the id, verifies ownership, and
+        // deletes both the entry and the mapping in one script.
+        let script = redis::Script::new(
+            r"
+            local id = redis.call('GET', KEYS[1])
+            if not id then
+                return 0
+            end
+            local entry_key = 'secreton:entry:' .. id
+            local current = redis.call('GET', entry_key)
+            if not current then
+                return 0
+            end
+            local ok, decoded = pcall(cjson.decode, current)
+            if not ok or not decoded.metadata or decoded.metadata['storage_owner'] ~= ARGV[1] then
+                return 0
+            end
+            redis.call('DEL', entry_key)
+            redis.call('DEL', KEYS[1])
+            return 1
+            ",
+        );
+
+        let removed: i64 = script
+            .key(&path_key)
+            .arg(token)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(|e| StorageError::QueryFailed {
+                message: format!("Failed to delete owned entry: {}", e),
+            })?;
+
+        Ok(removed == 1)
+    }
+
+    /// Fenced write as a single server-side script.
+    ///
+    /// The fence record and the artifact are two different keys, and Redis runs a Lua
+    /// script as one atomic unit, so the `GET` of the fence and the two `SET`s of the write
+    /// are indivisible: no other client can take the lease over between them. That is what
+    /// the previous `store` could not do — it unconditionally repointed
+    /// `secreton:path:<artifact>` at the writer's own id, so a holder that had lost the
+    /// lease still overwrote the winning initialization's path mapping and made the
+    /// winner's returned shares stop opening the stored root key.
+    ///
+    /// `KEYS[1]`=fence path key, `KEYS[2]`=artifact path key.
+    /// `ARGV[1]`=fence token, `ARGV[2]`=artifact value, `ARGV[3]`=artifact write id,
+    /// `ARGV[4]`=artifact absolute expiry (Unix seconds) or `''` for none.
+    ///
+    /// The expiry is applied in the script for the same reason the compare-and-set applies
+    /// it there: a fenced write that `SET` the artifact with no deadline would silently make
+    /// an expiring record immortal, and Redis would then serve a record whose body already
+    /// says it expired.
+    ///
+    /// The record the artifact path named is resolved *and its embedded path re-checked*
+    /// before it is deleted. An id can be named by more than one mapping: a `store` that
+    /// relocated an id to a new path left the old mapping behind, so a later fenced write at
+    /// the old path would otherwise read that stale mapping and delete a record another path
+    /// still names. Comparing the mapped record's own `path` field against the destination
+    /// keeps a relocated record intact; deleting that record's stale mapping (the one that
+    /// pointed at it from the old path) is what makes the relocation complete.
+    async fn store_fenced(
+        &self,
+        entry: &SecretEntry,
+        fence: StorageFence<'_>,
+    ) -> StorageResult<bool> {
+        let value = serde_json::to_string(entry).map_err(|e| StorageError::SerializationError {
+            message: e.to_string(),
+        })?;
+
+        let fence_path_key = format!("secreton:path:{}", fence.path);
+        let artifact_path_key = format!("secreton:path:{}", entry.path);
+
+        let script = redis::Script::new(
+            r"
+            local fence_id = redis.call('GET', KEYS[1])
+            if not fence_id then
+                return 0
+            end
+            local fence = redis.call('GET', 'secreton:entry:' .. fence_id)
+            if not fence then
+                return 0
+            end
+            local ok, decoded = pcall(cjson.decode, fence)
+            if not ok or type(decoded) ~= 'table' or type(decoded.metadata) ~= 'table'
+                or decoded.metadata['storage_owner'] ~= ARGV[1] then
+                return 0
+            end
+
+            -- An expired lease is not a held lease. The owner token alone is not enough:
+            -- the lease's own deadline may have passed before any takeover, and a write
+            -- authorised in that window is exactly what the expiry exists to prevent. The
+            -- deadline is compared against the server clock in this same script, so the
+            -- check is part of the same indivisible step as the write. A missing or
+            -- non-numeric deadline fails closed.
+            local fence_expires = tonumber(decoded.metadata['lease_expires_at'])
+            if not fence_expires or fence_expires <= tonumber(redis.call('TIME')[1]) then
+                return 0
+            end
+
+            local expires = ARGV[4]
+            local function write(key, value)
+                if expires ~= '' then
+                    local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
+                    if ttl <= 0 then
+                        redis.call('DEL', key)
+                        return 0
+                    end
+                    redis.call('SET', key, value)
+                    redis.call('PEXPIRE', key, ttl * 1000)
+                    return 1
+                end
+                redis.call('SET', key, value)
+                return 1
+            end
+
+            -- The value and the path mapping must name the same id, so the mapping never
+            -- resolves to a record whose own id disagrees. The id this replaces is read
+            -- before the mapping is overwritten, and its key is removed once the new value
+            -- has actually landed so a failed write leaves it untouched.
+            local existing_id = redis.call('GET', KEYS[2])
+            -- A write whose own deadline has already elapsed stores nothing; reporting a
+            -- success would tell the caller an artifact exists that the script deliberately
+            -- dropped.
+            if write('secreton:entry:' .. ARGV[3], ARGV[2]) == 0 then
+                return 0
+            end
+            if write(KEYS[2], ARGV[3]) == 0 then
+                redis.call('DEL', 'secreton:entry:' .. ARGV[3])
+                return 0
+            end
+            if existing_id and existing_id ~= ARGV[3] then
+                local superseded = redis.call('GET', 'secreton:entry:' .. existing_id)
+                if superseded then
+                    local sok, sdecoded = pcall(cjson.decode, superseded)
+                    -- Only drop the record when it still names *this* path. If a `store`
+                    -- relocated the id to another path, this mapping (KEYS[2]) was the stale
+                    -- one — but it has just been repointed at the new write, so there is
+                    -- nothing left to clean here and the relocated record must be left
+                    -- intact rather than deleted out from under the path that now names it.
+                    if sok and type(sdecoded) == 'table' and sdecoded.path == ARGV[5] then
+                        redis.call('DEL', 'secreton:entry:' .. existing_id)
+                    end
+                end
+            end
+            return 1
+            ",
+        );
+
+        let expires_at = entry
+            .expires_at
+            .map(|at| at.timestamp().to_string())
+            .unwrap_or_default();
+
+        let written: i64 = {
+            let mut conn = self.manager.lock().await;
+            script
+                .key(&fence_path_key)
+                .key(&artifact_path_key)
+                .arg(fence.token)
+                .arg(&value)
+                .arg(entry.id.to_string())
+                .arg(&expires_at)
+                .arg(&entry.path)
+                .invoke_async(&mut *conn)
+                .await
+                .map_err(|e| StorageError::QueryFailed {
+                    message: format!("Failed to fenced-store entry: {}", e),
+                })?
+        };
+
+        Ok(written == 1)
     }
 
     async fn begin_transaction(&self) -> StorageResult<Box<dyn StorageTransaction>> {
         Ok(Box::new(RedisTransaction::new(self.manager.clone())))
+    }
+
+    async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>> {
+        // Redis holds entries keyed by id with a separate path index. Scanning keys is
+        // the only way to enumerate them, and `SCAN` is the non-blocking cursor the
+        // server provides for exactly this; `KEYS` would stall the whole server.
+        let mut conn = self.manager.lock().await;
+        let mut cursor: u64 = 0;
+        let mut entries = Vec::new();
+
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("secreton:entry:*")
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| StorageError::QueryFailed {
+                    message: format!("Failed to scan entries: {}", e),
+                })?;
+
+            for key in keys {
+                let value: Option<String> =
+                    conn.get(&key)
+                        .await
+                        .map_err(|e| StorageError::QueryFailed {
+                            message: format!("Failed to read entry during scan: {}", e),
+                        })?;
+                if let Some(json_str) = value
+                    && let Ok(entry) = serde_json::from_str::<SecretEntry>(&json_str)
+                {
+                    entries.push(entry);
+                }
+            }
+
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+
+        // An entry key is only reachable through the path mapping that names it, so an entry
+        // whose path mapping now names a *different* id is superseded: a `store` that wrote a
+        // fresh record at an existing path repoints the mapping but leaves the previous entry
+        // key behind. Enumerating by key alone therefore reports records that `get_by_path`/
+        // `get_by_id` can no longer reach — a deleted secret that `list` still shows, and a
+        // `count` that grows on every update. Keep only the record each path currently
+        // resolves to; entries with no path have no mapping and are kept as they are.
+        let mut current = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.path.is_empty() {
+                current.push(entry);
+                continue;
+            }
+            let path_key = format!("secreton:path:{}", entry.path);
+            let mapped: Option<String> =
+                conn.get(&path_key)
+                    .await
+                    .map_err(|e| StorageError::QueryFailed {
+                        message: format!("Failed to read path mapping during scan: {}", e),
+                    })?;
+            if mapped.as_deref() == Some(entry.id.to_string().as_str()) {
+                current.push(entry);
+            }
+        }
+
+        Ok(params.apply_to(current))
+    }
+
+    async fn count(&self, params: &QueryParams) -> StorageResult<u64> {
+        Ok(self.list(params).await?.len() as u64)
     }
 
     async fn health_check(&self) -> StorageResult<HealthStatus> {
@@ -362,5 +1426,1108 @@ impl StorageBackend for RedisBackend {
 
     async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EncryptionMetadata, Expect, SecurityLevel, StorageBackend};
+
+    fn redis_url() -> Option<String> {
+        match std::env::var("SECRETON_TEST_REDIS_URL") {
+            Ok(url) if !url.trim().is_empty() => Some(url),
+            _ => {
+                eprintln!("skipping: SECRETON_TEST_REDIS_URL is not set");
+                None
+            }
+        }
+    }
+
+    fn entry_at(path: &str, payload: &[u8]) -> SecretEntry {
+        SecretEntry::new(
+            path.to_string(),
+            payload.to_vec(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+    }
+
+    /// A lease record carrying the deadline `store_fenced` requires, as the seal service writes.
+    fn lease_entry(path: &str, owner: &str) -> SecretEntry {
+        entry_at(path, b"lease").owned_by(owner).add_metadata(
+            crate::LEASE_EXPIRES_AT_KEY.to_string(),
+            (Utc::now().timestamp() + 300).to_string(),
+        )
+    }
+
+    /// Regression (severe): the conditional write chose the replacement's `id` from a read
+    /// that happened *before* the atomic script, and the script trusted it — including a
+    /// `DEL` of whatever id the path happened to name at script time. A path replaced in
+    /// that window had its live record deleted and its identity overwritten by one taken
+    /// from a stale read, so `get_by_path` resolved to a record other writers had already
+    /// moved past.
+    ///
+    /// The interleaving is *forced*, not raced: the first conditional write is parked by
+    /// `arm_compare_and_set_pause` after its read and before its script, a second backend
+    /// replaces the path while it is parked, and only then is it released. The write must
+    /// not publish its stale identity, must not delete the replacement's record, and must
+    /// leave the key, the body id and the path mapping naming one consistent record.
+    #[tokio::test]
+    async fn a_replacement_racing_the_read_cannot_publish_a_stale_identity() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/contract/raced");
+
+        // The seed establishes the identity the racing write will read first.
+        let mut writer_backend = RedisBackend::new(&url).await.expect("connect");
+        let pause = writer_backend.arm_compare_and_set_pause();
+        let writer_backend = Arc::new(writer_backend);
+
+        let seeded = entry_at(&path, b"seeded");
+        let seeded_id = seeded.id;
+        writer_backend.store(&seeded).await.expect("seed");
+
+        // Begin the conditional write and wait until it has read the seeded record and
+        // parked, so the replacement below lands strictly inside the read-to-script window.
+        let writer = {
+            let backend = writer_backend.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                backend
+                    .compare_and_set(&entry_at(&path, b"raced-payload"), Expect::Any)
+                    .await
+            })
+        };
+        pause.wait_reached().await;
+
+        // A separate backend replaces the path with a new identity while the first write is
+        // parked. This is the concurrent replacement the stale read must not clobber.
+        let other = RedisBackend::new(&url).await.expect("connect");
+        let winner = entry_at(&path, b"winner");
+        let winner_id = winner.id;
+        assert_ne!(
+            winner_id, seeded_id,
+            "the replacement must be a distinct record, or this proves nothing"
+        );
+        other.store(&winner).await.expect("concurrent replacement");
+
+        // Release the parked write. It must detect that the path moved, re-read and rebuild,
+        // so the record it publishes carries the *current* identity — never the stale one.
+        pause.release();
+        let outcome = writer.await.expect("task must not panic");
+        assert!(
+            outcome.expect("conditional write must succeed"),
+            "an unconditional replacement must eventually succeed, retrying past the race"
+        );
+
+        // The live record must not have been deleted by the racing write.
+        let winner_record = writer_backend
+            .get_by_id(winner_id)
+            .await
+            .expect("read winner by id");
+        assert!(
+            winner_record.is_some(),
+            "the path's live record must not be deleted by a write that read it stalely"
+        );
+
+        // The path must resolve to the current identity, not the one read before the race.
+        let resolved = writer_backend
+            .get_by_path(&path)
+            .await
+            .expect("read by path")
+            .expect("the path must still resolve");
+        assert_ne!(
+            resolved.id, seeded_id,
+            "the write must not republish the identity it read before the path moved"
+        );
+        assert_eq!(
+            resolved.id, winner_id,
+            "the replacement must keep the identity the path had at write time"
+        );
+
+        // No key/body id mismatch: the entry key, the body's own id and the path mapping
+        // must all name the same record.
+        let entry_key = format!("secreton:entry:{}", resolved.id);
+        let body: SecretEntry = {
+            let mut conn = writer_backend.manager.lock().await;
+            let raw: String = conn.get(&entry_key).await.expect("raw entry body");
+            serde_json::from_str(&raw).expect("entry body must deserialise")
+        };
+        assert_eq!(
+            body.id, resolved.id,
+            "the body's id must equal the id its key and the path mapping name"
+        );
+        let mapped: String = {
+            let mut conn = writer_backend.manager.lock().await;
+            conn.get(format!("secreton:path:{}", path))
+                .await
+                .expect("path mapping")
+        };
+        assert_eq!(
+            mapped,
+            resolved.id.to_string(),
+            "the path mapping must name the record it resolves to"
+        );
+
+        // `get_by_path` and `get_by_id` must name the same record.
+        let by_id = writer_backend
+            .get_by_id(resolved.id)
+            .await
+            .expect("read by id")
+            .expect("the resolved id must exist");
+        assert_eq!(
+            by_id.id, resolved.id,
+            "get_by_path and get_by_id must agree on the record"
+        );
+
+        // A following delete must remain correct: it removes this record and leaves no
+        // mapping behind that resolves to nothing (no orphan).
+        assert!(
+            writer_backend
+                .delete_by_id(resolved.id)
+                .await
+                .expect("delete resolved id"),
+            "the resolved record must be deletable"
+        );
+        assert!(
+            writer_backend
+                .get_by_path(&path)
+                .await
+                .expect("read after delete")
+                .is_none(),
+            "deleting the record must not leave a mapping that resolves to nothing"
+        );
+    }
+
+    /// The owner-conditional `compare_and_set` contract against a real server, matching the
+    /// PostgreSQL and in-process suites. `SealService::acquire_init_lease` takes over an
+    /// expired lease through this operation; a backend that refused while it actually held
+    /// would make a vault left by a dead process unrecoverable.
+    #[tokio::test]
+    async fn owner_conditional_replacement_is_atomic_and_fails_closed() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/contract/owner-cas");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        // An owner precondition on an absent path must refuse and create nothing.
+        assert!(
+            !backend
+                .compare_and_set(&entry_at(&path, b"absent"), Expect::Owner("a"))
+                .await
+                .expect("owner-conditional write to an absent path"),
+            "an owner precondition must not be satisfied by the absence of the record"
+        );
+        assert!(
+            backend.get_by_path(&path).await.expect("read").is_none(),
+            "an owner-conditional write to an absent path must not create a record"
+        );
+
+        // The recorded owner can replace an existing record, preserving its identity.
+        let seeded = entry_at(&path, b"first").owned_by("a");
+        let seeded_id = seeded.id;
+        assert!(
+            backend
+                .compare_and_set(&seeded, Expect::Absent)
+                .await
+                .expect("insert-if-absent")
+        );
+        assert!(
+            backend
+                .compare_and_set(
+                    &entry_at(&path, b"replaced").owned_by("a"),
+                    Expect::Owner("a")
+                )
+                .await
+                .expect("owner-conditional replacement"),
+            "the recorded owner must be able to replace an existing record"
+        );
+        let replaced = backend
+            .get_by_path(&path)
+            .await
+            .expect("read")
+            .expect("still present");
+        assert_eq!(replaced.encrypted_data, b"replaced");
+        assert_eq!(
+            replaced.id, seeded_id,
+            "a replacement must preserve the existing record's identity"
+        );
+
+        // A caller without the recorded token is refused and the record is untouched.
+        assert!(
+            !backend
+                .compare_and_set(
+                    &entry_at(&path, b"stolen").owned_by("b"),
+                    Expect::Owner("b")
+                )
+                .await
+                .expect("owner-conditional write by a non-owner"),
+            "a caller that does not hold the recorded token must not replace the record"
+        );
+        assert_eq!(
+            backend
+                .get_by_path(&path)
+                .await
+                .expect("read")
+                .expect("still present")
+                .encrypted_data,
+            b"replaced",
+            "a refused owner-conditional write must not change the record"
+        );
+
+        backend.delete_by_id(seeded_id).await.expect("cleanup");
+    }
+
+    /// Regression: `RedisTransaction::commit` wrote only `secreton:entry:*`. The path
+    /// mapping `secreton:path:*` — the only way `get_by_path`, `exists`, `list` and `count`
+    /// reach a record — was never written by a transaction, so a committed store was
+    /// invisible to every read that resolves by path, and a committed delete left a mapping
+    /// pointing at a missing entry.
+    #[tokio::test]
+    async fn a_committed_transaction_writes_and_removes_the_path_mapping() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/contract/transaction-mapping");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        // `list`/`count` are database-wide, and other tests may share this server, so scope
+        // the enumeration assertions to this test's own namespace.
+        let scoped = || QueryParams {
+            path_prefix: Some(namespace.clone()),
+            ..QueryParams::default()
+        };
+
+        // Store through a transaction, then commit.
+        let stored = entry_at(&path, b"via-transaction");
+        let stored_id = stored.id;
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&stored).await.expect("stage store");
+        tx.commit().await.expect("commit");
+
+        // Every path-resolving read must see it.
+        let by_path = backend
+            .get_by_path(&path)
+            .await
+            .expect("read by path")
+            .expect("a committed transaction write must be reachable by path");
+        assert_eq!(by_path.id, stored_id);
+        assert!(
+            backend.exists(&path).await.expect("exists"),
+            "a committed transaction write must be reported by exists"
+        );
+        let listed = backend.list(&scoped()).await.expect("list");
+        assert!(
+            listed.iter().any(|e| e.id == stored_id),
+            "a committed transaction write must appear in list"
+        );
+        assert_eq!(
+            backend.count(&scoped()).await.expect("count"),
+            1,
+            "count must include the committed transaction write exactly once"
+        );
+
+        // A transaction delete must remove the mapping too, leaving nothing orphaned.
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.delete(stored_id).await.expect("stage delete");
+        tx.commit().await.expect("commit delete");
+
+        assert!(
+            backend
+                .get_by_path(&path)
+                .await
+                .expect("read after delete")
+                .is_none(),
+            "a committed transaction delete must remove the path mapping"
+        );
+        let mapping: Option<String> = {
+            let mut conn = backend.manager.lock().await;
+            conn.get(format!("secreton:path:{}", path))
+                .await
+                .expect("read mapping")
+        };
+        assert!(
+            mapping.is_none(),
+            "a committed transaction delete must not leave an orphaned mapping"
+        );
+        assert_eq!(backend.count(&scoped()).await.expect("count"), 0);
+    }
+
+    /// A transaction that rewrites a path under a fresh id must supersede the previous
+    /// record: repoint the mapping and drop the old entry key, so an enumeration does not
+    /// report both and the old id does not resolve.
+    #[tokio::test]
+    async fn a_committed_transaction_rewrite_supersedes_the_previous_record() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/contract/transaction-rewrite");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let first = entry_at(&path, b"first");
+        let first_id = first.id;
+        backend.store(&first).await.expect("seed");
+
+        let second = entry_at(&path, b"second");
+        let second_id = second.id;
+        assert_ne!(first_id, second_id);
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&second).await.expect("stage rewrite");
+        tx.commit().await.expect("commit rewrite");
+
+        let resolved = backend
+            .get_by_path(&path)
+            .await
+            .expect("read by path")
+            .expect("the rewrite must resolve");
+        assert_eq!(
+            resolved.id, second_id,
+            "the path must resolve to the rewritten record"
+        );
+        assert!(
+            backend.get_by_id(first_id).await.expect("by id").is_none(),
+            "the superseded entry key must be dropped"
+        );
+        let scoped = QueryParams {
+            path_prefix: Some(namespace.clone()),
+            ..QueryParams::default()
+        };
+        assert_eq!(
+            backend.count(&scoped).await.expect("count"),
+            1,
+            "the superseded record must not be counted as well"
+        );
+    }
+
+    /// A single transaction that mixes operations must apply them as one unit: a store, a
+    /// delete of a *different* record, and a rewrite that repoints a path. Each op is a
+    /// separate script invocation, so the mapping state a later op reads must reflect what
+    /// an earlier op in the same commit wrote — otherwise a rewrite deletes the wrong entry
+    /// or a delete clears a mapping that has already moved on.
+    #[tokio::test]
+    async fn a_mixed_operation_transaction_applies_every_operation_exactly_once() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let backend = RedisBackend::new(&url).await.expect("connect");
+        let scoped = || QueryParams {
+            path_prefix: Some(namespace.clone()),
+            ..QueryParams::default()
+        };
+
+        // Seed a record the transaction will delete, and one it will rewrite.
+        let doomed_path = format!("{namespace}/mixed/doomed");
+        let doomed = entry_at(&doomed_path, b"doomed");
+        let doomed_id = doomed.id;
+        backend.store(&doomed).await.expect("seed doomed");
+
+        let rewritten_path = format!("{namespace}/mixed/rewritten");
+        let original = entry_at(&rewritten_path, b"original");
+        let original_id = original.id;
+        backend.store(&original).await.expect("seed original");
+
+        let replacement = entry_at(&rewritten_path, b"replacement");
+        let replacement_id = replacement.id;
+        assert_ne!(original_id, replacement_id);
+
+        let fresh_path = format!("{namespace}/mixed/fresh");
+        let fresh = entry_at(&fresh_path, b"fresh");
+        let fresh_id = fresh.id;
+
+        // One commit, three different operations.
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.delete(doomed_id).await.expect("stage delete");
+        tx.store(&replacement).await.expect("stage rewrite");
+        tx.store(&fresh).await.expect("stage store");
+        tx.commit().await.expect("commit mixed");
+
+        // The delete removed exactly its record, mapping included.
+        assert!(
+            backend.get_by_id(doomed_id).await.expect("by id").is_none(),
+            "the deleted entry key must be gone"
+        );
+        assert!(
+            backend
+                .get_by_path(&doomed_path)
+                .await
+                .expect("by path")
+                .is_none(),
+            "the deleted record's path mapping must be gone"
+        );
+
+        // The rewrite repointed the path and dropped the superseded key.
+        let resolved = backend
+            .get_by_path(&rewritten_path)
+            .await
+            .expect("by path")
+            .expect("the rewrite must resolve");
+        assert_eq!(resolved.id, replacement_id);
+        assert!(
+            backend
+                .get_by_id(original_id)
+                .await
+                .expect("by id")
+                .is_none(),
+            "the superseded key must be dropped, not left for an enumeration"
+        );
+
+        // The fresh store is visible and counted.
+        assert_eq!(
+            backend
+                .get_by_path(&fresh_path)
+                .await
+                .expect("by path")
+                .expect("the store must resolve")
+                .id,
+            fresh_id
+        );
+        assert_eq!(
+            backend.count(&scoped()).await.expect("count"),
+            2,
+            "only the replacement and the fresh store remain in this namespace"
+        );
+    }
+
+    /// Storing a record and then deleting that same id within one transaction must leave
+    /// nothing behind — in particular not the path mapping the store installed.
+    ///
+    /// The delete's mapping key cannot be found by reading Redis before the commit: the
+    /// store it follows is still staged, so the read finds no record and the delete was
+    /// handed the sentinel key. The script then removed the entry but not the mapping, so
+    /// `exists` reported a path whose record was gone.
+    #[tokio::test]
+    async fn a_transaction_that_stores_then_deletes_the_same_record_leaves_no_phantom_path() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/contract/transaction-store-then-delete");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let entry = entry_at(&path, b"staged-then-deleted");
+        let id = entry.id;
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&entry).await.expect("stage store");
+        tx.delete(id).await.expect("stage delete");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            backend.get_by_id(id).await.expect("by id").is_none(),
+            "the deleted record must be gone"
+        );
+        assert!(
+            backend
+                .get_by_path(&path)
+                .await
+                .expect("read by path")
+                .is_none(),
+            "the path must not resolve after its record was deleted"
+        );
+        assert!(
+            !backend.exists(&path).await.expect("exists"),
+            "the mapping the staged write installed must not survive the delete"
+        );
+        let mapping: Option<String> = {
+            let mut conn = backend.manager.lock().await;
+            conn.get(format!("secreton:path:{}", path))
+                .await
+                .expect("read mapping")
+        };
+        assert!(
+            mapping.is_none(),
+            "no orphaned mapping may remain for a record deleted in the same transaction"
+        );
+    }
+
+    /// A rolled-back transaction must leave no trace, whatever mix of operations it staged.
+    /// The staging is in-process, so a rollback must not have touched Redis at all — this
+    /// pins that no operation is applied before commit.
+    #[tokio::test]
+    async fn a_rolled_back_mixed_transaction_leaves_no_trace() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let kept_path = format!("{namespace}/rollback/kept");
+        let kept = entry_at(&kept_path, b"kept");
+        let kept_id = kept.id;
+        backend.store(&kept).await.expect("seed kept");
+
+        let staged_path = format!("{namespace}/rollback/staged");
+        let staged = entry_at(&staged_path, b"staged");
+        let staged_id = staged.id;
+
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&staged).await.expect("stage store");
+        tx.delete(kept_id).await.expect("stage delete");
+        tx.rollback().await.expect("rollback");
+
+        assert!(
+            backend
+                .get_by_path(&staged_path)
+                .await
+                .expect("by path")
+                .is_none(),
+            "a rolled-back store must not reach Redis"
+        );
+        assert!(
+            backend.exists(&kept_path).await.expect("exists"),
+            "a rolled-back delete must not remove the record"
+        );
+        assert_eq!(
+            backend
+                .get_by_path(&kept_path)
+                .await
+                .expect("by path")
+                .expect("kept record")
+                .id,
+            kept_id
+        );
+        assert!(
+            backend.get_by_id(staged_id).await.expect("by id").is_none(),
+            "the staged entry key must never have been written"
+        );
+    }
+
+    /// The last write to a path within one commit wins, and only the winner is reachable.
+    /// A transaction may stage two rewrites of the same path; the mapping must end up
+    /// pointing at the second, with neither the seed nor the intermediate record left for
+    /// an enumeration to find.
+    #[tokio::test]
+    async fn the_last_write_to_a_path_in_one_transaction_wins() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/ordering/winner");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+        let scoped = QueryParams {
+            path_prefix: Some(namespace.clone()),
+            ..QueryParams::default()
+        };
+
+        let seed = entry_at(&path, b"seed");
+        let seed_id = seed.id;
+        backend.store(&seed).await.expect("seed");
+
+        let first = entry_at(&path, b"first");
+        let first_id = first.id;
+        let second = entry_at(&path, b"second");
+        let second_id = second.id;
+        assert_ne!(seed_id, first_id);
+        assert_ne!(first_id, second_id);
+
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&first).await.expect("stage first rewrite");
+        tx.store(&second).await.expect("stage second rewrite");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            backend
+                .get_by_path(&path)
+                .await
+                .expect("by path")
+                .expect("the path must resolve")
+                .id,
+            second_id,
+            "the path must resolve to the last write in the commit"
+        );
+        for superseded in [seed_id, first_id] {
+            assert!(
+                backend
+                    .get_by_id(superseded)
+                    .await
+                    .expect("by id")
+                    .is_none(),
+                "a superseded record must be dropped so it cannot surface in an enumeration"
+            );
+        }
+        assert_eq!(
+            backend.count(&scoped).await.expect("count"),
+            1,
+            "only the winning record may remain in this namespace"
+        );
+    }
+
+    /// Deleting an id that does not exist is a no-op that reports success and leaves every
+    /// live mapping untouched. A commit that errored, or that cleared a mapping it did not
+    /// own, would make a caller's cleanup of an already-removed record destructive.
+    #[tokio::test]
+    async fn deleting_an_unknown_id_is_a_harmless_no_op() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let survivor_path = format!("{namespace}/noop/survivor");
+        let survivor = entry_at(&survivor_path, b"survivor");
+        let survivor_id = survivor.id;
+        let backend = RedisBackend::new(&url).await.expect("connect");
+        backend.store(&survivor).await.expect("seed");
+
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.delete(Uuid::new_v4())
+            .await
+            .expect("stage unknown delete");
+        tx.commit()
+            .await
+            .expect("deleting an unknown id must not fail the commit");
+
+        assert!(
+            backend.exists(&survivor_path).await.expect("exists"),
+            "an unrelated live record must be untouched"
+        );
+        assert_eq!(
+            backend
+                .get_by_path(&survivor_path)
+                .await
+                .expect("by path")
+                .expect("survivor")
+                .id,
+            survivor_id
+        );
+    }
+
+    /// Regression: storing an existing id at a new path left the old path's mapping pointing
+    /// at that id. A fenced write at the old path then read the stale mapping and deleted the
+    /// record the new path still named, so `get_by_path(new)` returned nothing.
+    ///
+    /// The property: relocating an id, then fenced-writing at the old path, leaves the
+    /// relocated record reachable from its current path.
+    #[tokio::test]
+    async fn a_fenced_write_at_a_relocated_ids_old_path_does_not_erase_it() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let old_path = format!("{namespace}/relocate/old");
+        let new_path = format!("{namespace}/relocate/new");
+        let lease = format!("{namespace}/relocate/lease");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        backend
+            .store(&lease_entry(&lease, "owner"))
+            .await
+            .expect("store lease");
+
+        // One id, stored first at `old_path`, then relocated to `new_path`.
+        let relocated = entry_at(&old_path, b"relocated");
+        let relocated_id = relocated.id;
+        backend.store(&relocated).await.expect("store at old path");
+        let mut moved = relocated.clone();
+        moved.path = new_path.clone();
+        backend.store(&moved).await.expect("relocate to new path");
+        assert_eq!(
+            backend
+                .get_by_path(&new_path)
+                .await
+                .expect("read")
+                .expect("the relocated record must resolve at its new path")
+                .id,
+            relocated_id
+        );
+
+        // A fenced write at the old path must not erase the record the new path names.
+        assert!(
+            backend
+                .store_fenced(
+                    &entry_at(&old_path, b"fresh"),
+                    StorageFence::new(&lease, "owner")
+                )
+                .await
+                .expect("fenced write at the old path"),
+            "the fence holds, so the write must land"
+        );
+
+        let still_there = backend
+            .get_by_path(&new_path)
+            .await
+            .expect("read new path")
+            .expect("a fenced write at the old path must not erase the relocated record");
+        assert_eq!(still_there.id, relocated_id);
+        assert_eq!(still_there.encrypted_data, b"relocated");
+    }
+
+    /// The same stale-mapping assumption reached `compare_and_set`, which normalized its
+    /// input against the record a stale mapping returned. A conditional write at the old
+    /// path must not adopt the relocated record's identity, and must not delete it.
+    #[tokio::test]
+    async fn a_conditional_write_at_a_relocated_ids_old_path_does_not_erase_it() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let old_path = format!("{namespace}/cas-relocate/old");
+        let new_path = format!("{namespace}/cas-relocate/new");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let relocated = entry_at(&old_path, b"relocated");
+        let relocated_id = relocated.id;
+        backend.store(&relocated).await.expect("store at old path");
+        let mut moved = relocated.clone();
+        moved.path = new_path.clone();
+        backend.store(&moved).await.expect("relocate to new path");
+
+        let candidate = entry_at(&old_path, b"candidate");
+        let candidate_id = candidate.id;
+        assert_ne!(candidate_id, relocated_id);
+        assert!(
+            backend
+                .compare_and_set(&candidate, Expect::Any)
+                .await
+                .expect("conditional write at the old path"),
+            "an unconditional replacement must land"
+        );
+
+        // The relocated record must survive at its new path under its own identity.
+        let survived = backend
+            .get_by_path(&new_path)
+            .await
+            .expect("read new path")
+            .expect("the relocated record must survive a conditional write at the old path");
+        assert_eq!(
+            survived.id, relocated_id,
+            "the relocated record must keep its identity"
+        );
+        // And the conditional write must have adopted the caller's identity, not the stale
+        // mapping's, so the path is not mapped to a record whose body names another path.
+        let resolved = backend
+            .get_by_path(&old_path)
+            .await
+            .expect("read old path")
+            .expect("the conditional write must be present");
+        assert_eq!(resolved.id, candidate_id);
+        assert_eq!(resolved.path, old_path);
+    }
+
+    /// Regression: a transaction storing an already-expired record at a path occupied by an
+    /// unrelated live record deleted the path mapping. The live record stayed in storage but
+    /// became unreachable by path after the commit.
+    #[tokio::test]
+    async fn an_expired_transaction_write_does_not_unlink_the_live_record_at_the_path() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/expired-write/live");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let live = entry_at(&path, b"live");
+        let live_id = live.id;
+        backend.store(&live).await.expect("seed live record");
+
+        // A transaction stages an already-expired record under its own id at the same path.
+        let mut expired = entry_at(&path, b"expired");
+        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        assert_ne!(expired.id, live_id);
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&expired).await.expect("stage expired write");
+        tx.commit().await.expect("commit");
+
+        // The expired write stores nothing, so the live record must still resolve by path.
+        let resolved = backend
+            .get_by_path(&path)
+            .await
+            .expect("read by path")
+            .expect("an expired transaction write must not unlink the live record");
+        assert_eq!(resolved.id, live_id);
+        assert_eq!(resolved.encrypted_data, b"live");
+        // The expired record itself must not have been persisted.
+        assert!(
+            backend
+                .get_by_id(expired.id)
+                .await
+                .expect("by id")
+                .is_none(),
+            "an expired transaction write must not persist its record"
+        );
+    }
+
+    /// Regression: a transaction that stored an id at a *new* path installed the new mapping
+    /// but left the old path's mapping behind. The record was reachable from two paths, and
+    /// a later fenced or conditional write at the stale path would resolve to it and delete
+    /// it from the path that now names it. The property: after a transactional relocation the
+    /// id resolves only at its new path.
+    #[tokio::test]
+    async fn a_committed_transaction_relocation_clears_the_old_path_mapping() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let old_path = format!("{namespace}/relocate/old");
+        let new_path = format!("{namespace}/relocate/new");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let mut entry = entry_at(&old_path, b"payload");
+        let id = entry.id;
+        backend.store(&entry).await.expect("seed");
+        assert!(
+            backend
+                .get_by_path(&old_path)
+                .await
+                .expect("read")
+                .is_some(),
+            "the seed must be reachable at the old path"
+        );
+
+        // Move the same id to a new path through a transaction.
+        entry.path = new_path.clone();
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&entry).await.expect("stage store");
+        tx.commit().await.expect("commit");
+
+        let moved = backend
+            .get_by_path(&new_path)
+            .await
+            .expect("read")
+            .expect("the relocated record must resolve at its new path");
+        assert_eq!(moved.id, id);
+        assert!(
+            backend
+                .get_by_path(&old_path)
+                .await
+                .expect("read")
+                .is_none(),
+            "a transactional relocation must clear the old path's mapping"
+        );
+        assert!(
+            !backend.exists(&old_path).await.expect("exists"),
+            "exists must not report a relocated record at the old path"
+        );
+    }
+
+    /// Regression: an already-expired transaction write whose id already had a live record at
+    /// a *different* path deleted that live record. Its current path kept a dangling mapping,
+    /// so a live secret disappeared. The property: the live record survives, reachable at the
+    /// path it actually names.
+    #[tokio::test]
+    async fn an_expired_transaction_write_does_not_delete_a_record_moved_to_another_path() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let current_path = format!("{namespace}/expired-relocate/current");
+        let stale_path = format!("{namespace}/expired-relocate/stale");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let live = entry_at(&current_path, b"live");
+        let live_id = live.id;
+        backend.store(&live).await.expect("seed live record");
+
+        // An expired write reuses the live id but names a different path. The existing record
+        // is therefore not this write's to remove.
+        let mut expired = entry_at(&stale_path, b"expired");
+        expired.id = live_id;
+        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&expired).await.expect("stage expired write");
+        tx.commit().await.expect("commit");
+
+        let resolved = backend
+            .get_by_path(&current_path)
+            .await
+            .expect("read by path")
+            .expect("a live record must survive an expired write targeting another path");
+        assert_eq!(resolved.id, live_id);
+        assert_eq!(resolved.encrypted_data, b"live");
+    }
+
+    /// Regression: an `Expect::Owner`-conditioned renewal revived a lease whose deadline had
+    /// already passed, because the owner token alone still matched. `UnexpiredOwner` checks
+    /// the recorded deadline in the same Lua step as the replacement, so a lapsed lease is
+    /// not revived. Falsified by treating the new variant like `Owner`.
+    #[tokio::test]
+    async fn an_unexpired_owner_write_refuses_to_revive_a_lapsed_lease() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/lease/unexpired");
+        let now = Utc::now().timestamp();
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        // A lapsed lease owned by `attempt-a`: the deadline is in the past, but the token
+        // still matches, which is exactly what an owner-only precondition cannot see.
+        let lapsed = entry_at(&path, b"lapsed")
+            .owned_by("attempt-a")
+            .add_metadata(
+                crate::LEASE_EXPIRES_AT_KEY.to_string(),
+                (now - 1).to_string(),
+            );
+        backend.store(&lapsed).await.expect("store lapsed lease");
+        let renewal = entry_at(&path, b"renewed")
+            .owned_by("attempt-a")
+            .add_metadata(
+                crate::LEASE_EXPIRES_AT_KEY.to_string(),
+                (now + 300).to_string(),
+            );
+
+        assert!(
+            !backend
+                .compare_and_set(&renewal, Expect::UnexpiredOwner("attempt-a"))
+                .await
+                .expect("conditional renewal"),
+            "a renewal must not revive a lease whose deadline has already passed"
+        );
+
+        // The positive control: a live owned lease is renewable through the same path.
+        let live = entry_at(&path, b"live").owned_by("attempt-b").add_metadata(
+            crate::LEASE_EXPIRES_AT_KEY.to_string(),
+            (now + 300).to_string(),
+        );
+        backend.store(&live).await.expect("store live lease");
+        assert!(
+            backend
+                .compare_and_set(
+                    &renewal.owned_by("attempt-b"),
+                    Expect::UnexpiredOwner("attempt-b")
+                )
+                .await
+                .expect("conditional renewal"),
+            "a live owned lease must be renewable"
+        );
+    }
+
+    /// Regression: reclaiming a lapsed reservation with `Expect::Owner` could overwrite a
+    /// claim the holder had extended back to life, because the owner token does not change on
+    /// extension. On Redis the reservation's deadline is enforced by key expiry, so a claim
+    /// that is present is never expired and the reclaim must always fail, leaving the caller
+    /// to the insert-if-absent (correct here because a lapsed claim's keys are gone). The
+    /// property: an `ExpiredOwner` write against a present, live record reports `Ok(false)`.
+    #[tokio::test]
+    async fn an_expired_owner_write_refuses_a_live_record() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/claim/expired-owner");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        // A live owned claim: its keys are present, so its deadline has not passed.
+        let live = entry_at(&path, b"live")
+            .owned_by("attempt-a")
+            .with_expiration(Utc::now() + chrono::Duration::days(8));
+        backend.store(&live).await.expect("store live claim");
+
+        let overwrite = entry_at(&path, b"overwrite")
+            .owned_by("attempt-b")
+            .with_expiration(Utc::now() + chrono::Duration::seconds(120));
+        assert!(
+            !backend
+                .compare_and_set(&overwrite, Expect::ExpiredOwner("attempt-a"))
+                .await
+                .expect("conditional reclaim"),
+            "a reclaim must not overwrite a live claim, whose owner token still matches"
+        );
+        assert_eq!(
+            backend
+                .get_by_path(&path)
+                .await
+                .expect("read")
+                .expect("the live claim must survive")
+                .owner_token(),
+            Some("attempt-a"),
+            "the live claim must be left in place"
+        );
+    }
+
+    /// Regression (severe): a conditional write whose own deadline has already elapsed
+    /// returned `Ok(false)` but still deleted the destination. The script's `write` helper
+    /// dropped an already-expired target key, and the `absent`, missing-mapping and
+    /// replacement branches all called it. A rejected replacement at an occupied path
+    /// therefore removed the live record and left the path mapping dangling, so
+    /// `get_by_path` returned nothing even though the write had failed. The deadline must be
+    /// decided before any mutation, and the expiry path must touch nothing.
+    #[tokio::test]
+    async fn an_expired_conditional_write_does_not_delete_the_live_record() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/contract/expired-replacement");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let live = entry_at(&path, b"live");
+        let live_id = live.id;
+        backend.store(&live).await.expect("store the live record");
+
+        // The proposed replacement is already expired when the script runs.
+        let expired =
+            entry_at(&path, b"expired").with_expiration(Utc::now() - chrono::Duration::seconds(30));
+        assert!(
+            !backend
+                .compare_and_set(&expired, Expect::Any)
+                .await
+                .expect("conditional replacement"),
+            "a write whose own deadline has elapsed must be reported as not landing"
+        );
+
+        let surviving = backend
+            .get_by_path(&path)
+            .await
+            .expect("read")
+            .expect("the rejected write must leave the live record in place");
+        assert_eq!(
+            surviving.id, live_id,
+            "the rejected write must not have removed the live record"
+        );
+        assert_eq!(
+            surviving.encrypted_data, b"live",
+            "the rejected write must not have changed the payload"
+        );
+    }
+
+    /// Regression: an expired *transaction* update of a live secret carried the live record's
+    /// own id and path, and the script's expired branch treated that as a cleanup target — it
+    /// saw `existing_path == path` and deleted the entry and its mapping. The update never
+    /// landed, so a stored secret disappeared. The property: an expired staged write is a
+    /// no-op, and the live record it named stays readable by both path and id.
+    #[tokio::test]
+    async fn an_expired_transaction_write_does_not_delete_the_live_record_it_targets() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/expired-update/self");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let live = entry_at(&path, b"live");
+        let live_id = live.id;
+        backend.store(&live).await.expect("seed live record");
+
+        // Stage an update of the *same* record that is already expired when the commit runs.
+        let mut expired = entry_at(&path, b"expired-update");
+        expired.id = live_id;
+        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&expired).await.expect("stage expired write");
+        tx.commit().await.expect("commit");
+
+        let by_path = backend
+            .get_by_path(&path)
+            .await
+            .expect("read by path")
+            .expect("an expired transaction write must leave the live record reachable");
+        assert_eq!(by_path.id, live_id);
+        assert_eq!(
+            by_path.encrypted_data, b"live",
+            "the rejected update must not have replaced or removed the stored value"
+        );
+        let by_id = backend
+            .get_by_id(live_id)
+            .await
+            .expect("read by id")
+            .expect("the live record must stay reachable by id");
+        assert_eq!(by_id.path, path);
     }
 }

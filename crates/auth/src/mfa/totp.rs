@@ -50,6 +50,50 @@ pub trait TotpService: Send + Sync {
         issuer: String,
     ) -> Result<TotpEnrollment, SecretonError>;
 
+    /// Enroll an entity for TOTP, stamping the persisted enrollment with an owner token.
+    ///
+    /// Initialization enrolls the root account's TOTP through this, so the record carries
+    /// the same fencing token as the rest of the attempt. Cleanup removes an attempt's
+    /// artifacts with `delete_owned`, which matches on that token; an enrollment written
+    /// without one is invisible to that path on a shared backend, which is what left an
+    /// orphaned second factor behind a rollback that reported success. Backends without a
+    /// conditional delete ignore the token and delegate to `enroll`.
+    ///
+    /// When `fence` is supplied the write is performed *through* it — the enrollment lands
+    /// only while the named durable record still carries the token — so a caller that has
+    /// lost its lease cannot write an enrollment at all. `owner` alone would only make the
+    /// record removable afterwards; it would not stop the stale write. Backends without a
+    /// fenced write must refuse rather than fall back to an unconditional store.
+    ///
+    /// This default implements exactly that refusal: a fence is a promise the trait cannot
+    /// keep without a conditional write, so honouring it by delegating to `enroll` would
+    /// silently discard it. The callers that pass a fence are the initialization sequence,
+    /// where the fence is the only thing standing between a stale attempt and an orphaned
+    /// second factor for a privileged account — a service that inherited this default and
+    /// ignored the fence would create that enrollment anyway. A fence-free call (the
+    /// ordinary user enrollment, and every single-process backend where no lease record
+    /// exists) is unaffected. The persistent service in `secreton-engines` overrides this
+    /// with a real fenced write; `InMemoryTotpService` does not, and is therefore only
+    /// usable where no fence is ever supplied.
+    async fn enroll_owned(
+        &self,
+        entity_id: Uuid,
+        account_name: String,
+        owner: Option<&str>,
+        fence: Option<secreton_storage::StorageFence<'_>>,
+    ) -> Result<TotpEnrollment, SecretonError> {
+        let _ = owner;
+        if fence.is_some() {
+            return Err(SecretonError::Internal {
+                message: "this TOTP service has no fenced write, so it cannot honour a \
+                          lease fence; refusing rather than creating an unfenced \
+                          enrollment for an initialization attempt"
+                    .to_string(),
+            });
+        }
+        self.enroll(entity_id, account_name).await
+    }
+
     /// Validate a TOTP code
     async fn validate(&self, request: TotpValidationRequest) -> Result<bool, SecretonError>;
 

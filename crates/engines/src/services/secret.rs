@@ -46,6 +46,34 @@ pub struct SignResult {
     pub algorithm: String,
 }
 
+/// Exact paths the seal service owns and writes directly through the storage backend.
+///
+/// The secret API resolves a path to whatever record is newest at it, so an ordinary write
+/// to one of these names would silently replace an initialization artifact — or race the
+/// initialization that is writing it. `store`/`upsert` on the file backend are not serialised
+/// by the advisory lock the seal's fenced writes hold, so a concurrent ordinary write could
+/// interleave with `init` and publish over its config, root key, staging marker, lease or
+/// root identity. Rejecting these paths at the secret API boundary keeps initialization
+/// artifacts reachable only by the seal service, which is the only writer that fences them.
+const RESERVED_INITIALIZATION_PATHS: &[&str] = &[
+    "sys/init",
+    "sys/init_staging",
+    "sys/init_lease",
+    "sys/root_key_enc",
+    "sys/root_identity",
+];
+
+/// Reject an ordinary secret write or delete aimed at an initialization artifact path.
+fn reject_reserved_initialization_path(path: &str) -> Result<(), SecretError> {
+    if RESERVED_INITIALIZATION_PATHS.contains(&path) {
+        return Err(SecretError::InvalidOperation(format!(
+            "'{}' is a reserved initialization path and cannot be written through the secret API",
+            path
+        )));
+    }
+    Ok(())
+}
+
 /// Policy definition
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Policy {
@@ -153,7 +181,45 @@ impl SecretService {
         Uuid::parse_str(&user.id).unwrap_or_default()
     }
 
-    /// Check permission for an action on a path
+    /// Reject a reserved initialization path, recording the denial in the audit log.
+    ///
+    /// The plain helper returns before storage is touched, so without this the attempt
+    /// leaves no audit event — an operator could not tell that someone tried to overwrite a
+    /// seal artifact through the secret API. The denial is audited here, at the service
+    /// boundary, so every caller of the internal put/delete path is covered.
+    async fn reject_reserved_path_with_audit(
+        &self,
+        path: &str,
+        user: &secreton_auth::User,
+        action: &str,
+    ) -> Result<(), SecretError> {
+        match reject_reserved_initialization_path(path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A durable audit event is the primary record, but the audit device can be
+                // disabled by configuration; the attempt to write a seal artifact through the
+                // secret API must still be observable, so it is always logged as well.
+                warn!(
+                    path = %path,
+                    user = %user.id,
+                    action = %action,
+                    "Refused access to a reserved initialization path: {}",
+                    e
+                );
+                let _ = self
+                    .audit
+                    .log_event(SecurityEventType::SecretAccessDenied {
+                        secret_path: path.to_string(),
+                        user: user.id.to_string(),
+                        action: action.to_string(),
+                        reason: e.to_string(),
+                    })
+                    .await;
+                Err(e)
+            }
+        }
+    }
+
     async fn check_permission(
         &self,
         user: &secreton_auth::User,
@@ -322,6 +388,21 @@ impl SecretService {
                                 .record_access(path, AccessType::Read, start_time.elapsed(), true)
                                 .await;
 
+                            // Audit the read here too. The cache-hit branch returns early,
+                            // so without this a read served from cache left no `SecretAccess`
+                            // event — the read path an operator can repeat to keep a secret
+                            // out of the audit trail entirely. The event is identical to the
+                            // cache-miss one below; the cache only shortens the fetch, it
+                            // does not change what was accessed.
+                            let _ = self
+                                .audit
+                                .log_event(SecurityEventType::SecretAccess {
+                                    secret_path: path.to_string(),
+                                    user: user.id.to_string(),
+                                    action: "read".to_string(),
+                                })
+                                .await;
+
                             let metadata = SecretMetadata {
                                 description: encrypted_entry.metadata.get("description").cloned(),
                                 tags: encrypted_entry.tags.clone(),
@@ -480,6 +561,8 @@ impl SecretService {
         expires_at_override: Option<Option<chrono::DateTime<chrono::Utc>>>,
     ) -> Result<SecretData, SecretError> {
         let start_time = std::time::Instant::now();
+        self.reject_reserved_path_with_audit(path, user, "write")
+            .await?;
         self.check_permission(user, path, "write").await?;
 
         // Validate TTL upper bound before any unchecked numeric casts below
@@ -814,6 +897,8 @@ impl SecretService {
         check_perms: bool,
     ) -> Result<(), SecretError> {
         let start_time = std::time::Instant::now();
+        self.reject_reserved_path_with_audit(path, user, "delete")
+            .await?;
 
         if check_perms {
             self.check_permission(user, path, "delete").await?;
@@ -2695,7 +2780,7 @@ pub struct DecryptResult {
 mod tests {
     use super::*;
     use secreton_storage::{
-        EncryptionMetadata, MemoryBackend, SecretEntry, SecurityLevel, StorageBackend,
+        EncryptionMetadata, MemoryBackend, QueryParams, SecretEntry, SecurityLevel, StorageBackend,
     };
 
     use crate::services::audit::AuditLogger;
@@ -2722,6 +2807,7 @@ mod tests {
             mfa_enabled: false,
             mfa_secret: None,
             password_hash: "".to_string(),
+            password_login_disabled: false,
             disabled: false,
             enabled: true,
             is_active: true,
@@ -2862,6 +2948,75 @@ mod tests {
         assert!(secret.data.contains_key("key1"));
     }
 
+    /// Regression: a read served from the plaintext cache returned before logging a
+    /// `SecretAccess` event, so a caller could read a secret repeatedly without leaving an
+    /// audit trail — the cache-hit path evaded auditing entirely. The property: the second,
+    /// cache-served read is audited exactly like the first.
+    #[tokio::test]
+    async fn a_cache_hit_read_is_audited() {
+        let _env = crate::test_support::with_root_key();
+        let storage = Arc::new(MemoryBackend::new());
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        let audit = Arc::new(
+            AuditLogger::new(storage.clone(), 2555, 1, true)
+                .await
+                .unwrap(),
+        );
+        let identity = Arc::new(secreton_auth::InMemoryIdentityService::new());
+        let policy_service = Arc::new(secreton_auth::PolicyService::new());
+        let performance = Arc::new(SecretPerformanceOptimizer::default());
+        seed_admin_policy(&policy_service).await;
+
+        let user = mock_user();
+        let user_uuid = Uuid::parse_str(&user.id).unwrap();
+        let mut data = HashMap::new();
+        data.insert("key1".to_string(), "value1".to_string());
+        let secret_entry = SecretEntry::new(
+            "app/cache-audit".to_string(),
+            crypto
+                .encrypt_data(&serde_json::to_vec(&data).unwrap())
+                .await
+                .unwrap(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Secret,
+            user_uuid,
+        );
+        storage.store(&secret_entry).await.expect("seed");
+
+        let service = SecretService::new(
+            storage.clone(),
+            crypto,
+            audit,
+            identity,
+            policy_service,
+            performance,
+        )
+        .await
+        .unwrap();
+
+        // First read decrypts and populates the plaintext cache.
+        service
+            .get_secret("app/cache-audit", &user, None)
+            .await
+            .expect("first read");
+        // The second read is served from that cache.
+        service
+            .get_secret("app/cache-audit", &user, None)
+            .await
+            .expect("cache-served read");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let logs = audit_entries(&storage).await;
+        let reads = logs
+            .iter()
+            .filter(|l| l.contains("app/cache-audit") && l.contains("\"operation\":\"read\""))
+            .count();
+        assert_eq!(
+            reads, 2,
+            "a read served from the cache must be audited like any other read, got {logs:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_put_secret_placeholder() {
         let _env = crate::test_support::with_root_key();
@@ -2899,6 +3054,71 @@ mod tests {
             .unwrap();
         assert_eq!(secret.path, "app/admin");
         assert!(secret.data.contains_key("username"));
+    }
+
+    #[tokio::test]
+    async fn secret_api_cannot_write_or_delete_an_initialization_artifact() {
+        // Regression: the secret API wrote through `store`/`upsert`, which the file backend
+        // does not serialise with the seal's fenced writes. An ordinary `put_secret` at
+        // `sys/init` (or `sys/init_staging`, `sys/init_lease`, `sys/root_key_enc`,
+        // `sys/root_identity`) could therefore overwrite or race an initialization artifact
+        // — replacing the init config, the lease, or the root identity of a live vault.
+        // Those paths are reachable only by the seal service, so the secret API must refuse
+        // them before doing any work.
+        let _env = crate::test_support::with_root_key();
+        let storage = Arc::new(MemoryBackend::new());
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        let audit = Arc::new(
+            AuditLogger::new(storage.clone(), 2555, 1000, true)
+                .await
+                .unwrap(),
+        );
+        let identity = Arc::new(secreton_auth::InMemoryIdentityService::new());
+        let policy_service = Arc::new(secreton_auth::PolicyService::new());
+        let performance = Arc::new(SecretPerformanceOptimizer::default());
+        seed_admin_policy(&policy_service).await;
+
+        let service = SecretService::new(
+            storage.clone(),
+            crypto,
+            audit,
+            identity,
+            policy_service,
+            performance,
+        )
+        .await
+        .unwrap();
+        let user = mock_user();
+
+        for path in [
+            "sys/init",
+            "sys/init_staging",
+            "sys/init_lease",
+            "sys/root_key_enc",
+            "sys/root_identity",
+        ] {
+            let mut data = HashMap::new();
+            data.insert("tampered".to_string(), "true".to_string());
+            let put = service.put_secret(path, data, None, &user, None).await;
+            assert!(
+                matches!(put, Err(SecretError::InvalidOperation(_))),
+                "a write to the reserved initialization path '{}' must be refused, got {:?}",
+                path,
+                put.as_ref().map(|_| ())
+            );
+            let delete = service.delete_secret(path, &user).await;
+            assert!(
+                matches!(delete, Err(SecretError::InvalidOperation(_))),
+                "a delete of the reserved initialization path '{}' must be refused, got {:?}",
+                path,
+                delete.as_ref().map(|_| ())
+            );
+            assert!(
+                storage.get_by_path(path).await.expect("storage").is_none(),
+                "the refused write must not have created '{}'",
+                path
+            );
+        }
     }
 
     #[tokio::test]
@@ -3027,6 +3247,7 @@ mod tests {
             display_name: None,
             full_name: None,
             password_hash: "".to_string(),
+            password_login_disabled: false,
             is_active: true,
             is_superuser: false,
             disabled: false,
@@ -3116,6 +3337,7 @@ mod tests {
             display_name: None,
             full_name: None,
             password_hash: "".to_string(),
+            password_login_disabled: false,
             is_active: true,
             is_superuser: false,
             disabled: false,
@@ -3271,6 +3493,118 @@ mod tests {
         let cached_ver = u32::from_be_bytes(ver_bytes.try_into().unwrap());
         assert_eq!(cached_ver, 1);
     }
+
+    /// Count the audit records the logger has persisted under `sys/audit/`.
+    async fn audit_entries(storage: &Arc<MemoryBackend>) -> Vec<String> {
+        let params = QueryParams {
+            path_prefix: Some("sys/audit/".to_string()),
+            ..Default::default()
+        };
+        storage
+            .list(&params)
+            .await
+            .expect("list audit entries")
+            .into_iter()
+            .filter_map(|entry| entry.metadata.get("log_data").cloned())
+            .collect()
+    }
+
+    /// Regression: `put_secret_internal` returned on a reserved initialization path before
+    /// any audit event, so an attempt to overwrite a seal artifact through the secret API
+    /// left no trace. The denial must be recorded even though storage is never touched.
+    #[tokio::test]
+    async fn a_reserved_path_write_denial_is_audited() {
+        let _env = crate::test_support::with_root_key();
+        let storage = Arc::new(MemoryBackend::new());
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        let audit = Arc::new(
+            AuditLogger::new(storage.clone(), 2555, 1000, true)
+                .await
+                .unwrap(),
+        );
+        let identity = Arc::new(secreton_auth::InMemoryIdentityService::new());
+        let policy_service = Arc::new(secreton_auth::PolicyService::new());
+        let performance = Arc::new(SecretPerformanceOptimizer::default());
+
+        let service = SecretService::new(
+            storage.clone(),
+            crypto,
+            audit,
+            identity,
+            policy_service,
+            performance,
+        )
+        .await
+        .unwrap();
+
+        let user = mock_user();
+        let result = service
+            .put_secret(
+                "sys/init_staging",
+                HashMap::from([("k".to_string(), "v".to_string())]),
+                None,
+                &user,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SecretError::InvalidOperation(_))),
+            "a reserved initialization path must be refused"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let logs = audit_entries(&storage).await;
+        assert!(
+            logs.iter().any(|l| l.contains("sys/init_staging")
+                && l.contains("\"status\":\"Denied\"")
+                && l.contains("reserved initialization path")),
+            "the reserved-path write denial must be audited, got {logs:?}"
+        );
+    }
+
+    /// Regression: the delete counterpart of the same gap — a reserved-path delete denial
+    /// returned before storage and logged nothing.
+    #[tokio::test]
+    async fn a_reserved_path_delete_denial_is_audited() {
+        let _env = crate::test_support::with_root_key();
+        let storage = Arc::new(MemoryBackend::new());
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        let audit = Arc::new(
+            AuditLogger::new(storage.clone(), 2555, 1000, true)
+                .await
+                .unwrap(),
+        );
+        let identity = Arc::new(secreton_auth::InMemoryIdentityService::new());
+        let policy_service = Arc::new(secreton_auth::PolicyService::new());
+        let performance = Arc::new(SecretPerformanceOptimizer::default());
+
+        let service = SecretService::new(
+            storage.clone(),
+            crypto,
+            audit,
+            identity,
+            policy_service,
+            performance,
+        )
+        .await
+        .unwrap();
+
+        let user = mock_user();
+        let result = service.delete_secret("sys/root_key_enc", &user).await;
+        assert!(
+            matches!(result, Err(SecretError::InvalidOperation(_))),
+            "a reserved initialization path must be refused"
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let logs = audit_entries(&storage).await;
+        assert!(
+            logs.iter().any(|l| l.contains("sys/root_key_enc")
+                && l.contains("\"status\":\"Denied\"")
+                && l.contains("reserved initialization path")),
+            "the reserved-path delete denial must be audited, got {logs:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3294,6 +3628,7 @@ mod list_secrets_tests {
             display_name: None,
             full_name: None,
             password_hash: "".to_string(),
+            password_login_disabled: false,
             is_active: true,
             is_superuser: false, // Strict check
             disabled: false,
