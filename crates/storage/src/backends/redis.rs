@@ -87,9 +87,8 @@ const NO_PATH_KEY: &str = "secreton:_no_path_";
 /// stale; the entry key is the only other key the script touches, which is why it is
 /// declared.
 ///
-/// An already-expired write is a no-op for the destination, but it must not remove a live
-/// record that merely *shares this id* and now belongs to another path. The script only
-/// cleans up an existing record when that record still names the write's own destination.
+/// An already-expired write is a pure no-op: it stores nothing and removes nothing. A
+/// deliberate removal goes through the `delete` mode.
 ///
 /// KEYS: two per operation, in order — `[path_key, entry_key]`; `path_key` is
 /// [`NO_PATH_KEY`] when the entry has no path.
@@ -99,19 +98,13 @@ const NO_PATH_KEY: &str = "secreton:_no_path_";
 const TRANSACTION_SCRIPT: &str = r"
     local n = tonumber(ARGV[1])
 
-    local write = function(key, value, expires)
-        if expires ~= '' then
-            local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
-            if ttl <= 0 then
-                redis.call('DEL', key)
-                return false
-            end
-            redis.call('SET', key, value)
-            redis.call('PEXPIRE', key, ttl * 1000)
-            return true
-        end
+    -- Write a key with an optional precomputed TTL. The deadline is resolved once by the
+    -- caller; this helper never deletes. An expired write is a no-op, not a removal.
+    local write = function(key, value, ttl)
         redis.call('SET', key, value)
-        return true
+        if ttl then
+            redis.call('PEXPIRE', key, ttl * 1000)
+        end
     end
 
     -- Decode the path embedded in a stored record, or nil when it is absent or unreadable.
@@ -138,33 +131,20 @@ const TRANSACTION_SCRIPT: &str = r"
         local entry_key = KEYS[(i - 1) * 2 + 2]
 
         if mode == 'write' then
-            -- Resolve the destination's expiry and the id's current record in the same
-            -- atomic step, so neither the expiry decision nor the relocation cleanup can
-            -- race a concurrent writer.
-            local live = true
-            if expires ~= '' then
-                live = tonumber(expires) > tonumber(redis.call('TIME')[1])
-            end
-
             local existing_path = stored_path(entry_key)
 
-            if not live then
-                -- An already-expired write stores nothing. Do not delete a live record just
-                -- because it shares this id: a record that now names a *different* path
-                -- belongs to that path, and removing it here would erase a live secret while
-                -- leaving its current mapping dangling. Only a record still at the write's
-                -- own destination is this transaction's to clean up, and its mapping only
-                -- while the mapping still names this id.
-                if existing_path ~= nil and existing_path == path then
-                    redis.call('DEL', entry_key)
-                    if path ~= '' then
-                        local mapped = redis.call('GET', path_key)
-                        if mapped == id then
-                            redis.call('DEL', path_key)
-                        end
-                    end
-                end
-            else
+            -- Resolve the destination's deadline once, here. A write whose deadline has
+            -- elapsed stores nothing and — the defect this guards — removes nothing either.
+            -- In the common case the id and path are the live record's own (an expired update
+            -- of a stored secret), so treating the expired branch as cleanup erased a live
+            -- secret the rejected write never replaced. A deliberate removal is the `delete`
+            -- mode below.
+            local ttl = nil
+            if expires ~= '' then
+                ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
+            end
+
+            if ttl == nil or ttl > 0 then
                 -- Resolve the superseded record at this path here, not from a pre-read the
                 -- caller did. The mapping must currently name a different id for this path,
                 -- and that id's record must still name this path: a record moved to another
@@ -186,11 +166,11 @@ const TRANSACTION_SCRIPT: &str = r"
                         redis.call('DEL', old_path_key)
                     end
                 end
-                write(entry_key, value, expires)
+                write(entry_key, value, ttl)
                 -- Guard on the path string, not the key: a pathless entry's key is the
                 -- sentinel and must never be written as though it were a mapping.
                 if path ~= '' then
-                    write(path_key, id, expires)
+                    write(path_key, id, ttl)
                 end
             end
         else
@@ -299,9 +279,10 @@ impl StorageTransaction for RedisTransaction {
                             message: e.to_string(),
                         }
                     })?;
-                    // An already-expired write must not resurrect the path: the empty deadline
-                    // makes the script's TTL branch see a non-positive ttl and delete both
-                    // keys.
+                    // An already-expired write must not resurrect the path: the script's
+                    // `live` check finds a non-positive deadline and skips the whole branch,
+                    // storing nothing and removing nothing. It must not be turned into a
+                    // delete either — the id and path are usually the live record's own.
                     let expires = entry
                         .expires_at
                         .map(|at| at.timestamp().to_string())
@@ -2504,5 +2485,49 @@ mod tests {
             surviving.encrypted_data, b"live",
             "the rejected write must not have changed the payload"
         );
+    }
+
+    /// Regression: an expired *transaction* update of a live secret carried the live record's
+    /// own id and path, and the script's expired branch treated that as a cleanup target — it
+    /// saw `existing_path == path` and deleted the entry and its mapping. The update never
+    /// landed, so a stored secret disappeared. The property: an expired staged write is a
+    /// no-op, and the live record it named stays readable by both path and id.
+    #[tokio::test]
+    async fn an_expired_transaction_write_does_not_delete_the_live_record_it_targets() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/expired-update/self");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let live = entry_at(&path, b"live");
+        let live_id = live.id;
+        backend.store(&live).await.expect("seed live record");
+
+        // Stage an update of the *same* record that is already expired when the commit runs.
+        let mut expired = entry_at(&path, b"expired-update");
+        expired.id = live_id;
+        expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        let mut tx = backend.begin_transaction().await.expect("begin");
+        tx.store(&expired).await.expect("stage expired write");
+        tx.commit().await.expect("commit");
+
+        let by_path = backend
+            .get_by_path(&path)
+            .await
+            .expect("read by path")
+            .expect("an expired transaction write must leave the live record reachable");
+        assert_eq!(by_path.id, live_id);
+        assert_eq!(
+            by_path.encrypted_data, b"live",
+            "the rejected update must not have replaced or removed the stored value"
+        );
+        let by_id = backend
+            .get_by_id(live_id)
+            .await
+            .expect("read by id")
+            .expect("the live record must stay reachable by id");
+        assert_eq!(by_id.path, path);
     }
 }
