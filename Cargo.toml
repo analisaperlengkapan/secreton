@@ -200,7 +200,7 @@ config = { version = "0.15", default-features = false, features = ["toml"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 comfy-table = "7"
-dirs = "5"
+dirs = "7"
 rpassword = "7"
 
 # ---- Policy grammar --------------------------------------------------------
