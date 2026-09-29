@@ -54,7 +54,7 @@ ssh-key = { version = "0.6", features = ["ed25519", "alloc", "std", "rand_core"]
 const-oid = "0.9"
 der = "0.7"
 time = "0.3"
-x509-cert = "0.2"
+x509-cert = "0.3"
 x509-parser.workspace = true
 
 # Tokens
