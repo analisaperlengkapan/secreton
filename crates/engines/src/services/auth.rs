@@ -19,7 +19,7 @@ use secreton_auth::{
     User, UserPassAuthMethod,
 };
 use secreton_storage::{
-    EncryptionMetadata, QueryParams, SecretEntry, SecurityLevel, StorageBackend,
+    EncryptionMetadata, QueryParams, SecretEntry, SecurityLevel, StorageBackend, StorageFence,
 };
 use thiserror::Error;
 
@@ -30,6 +30,36 @@ const SESSION_STORAGE_PREFIX: &str = "sys/auth/sessions/";
 /// storage.  Entries carry `expires_at` equal to the token's own expiry and
 /// are cleaned up via `delete_expired`.
 const REVOKED_TOKEN_STORAGE_PREFIX: &str = "sys/auth/revoked-tokens/";
+
+/// Storage prefix for refresh-token *reservations*: the single-use slot claimed before a
+/// refresh exchange does its fallible work, and converted into a permanent revocation once
+/// a new session exists.
+///
+/// Keyed, like [`REVOKED_TOKEN_STORAGE_PREFIX`], by the SHA-256 hash of the token, so no
+/// token material is written. It is a distinct path from the revocation entry because the
+/// two states are different: a reservation can still be released, a revocation cannot.
+const REFRESH_RESERVATION_STORAGE_PREFIX: &str = "sys/auth/refresh-reservations/";
+
+/// How long the initial single-use claim over a refresh token lasts.
+///
+/// The claim is taken before the exchange's fallible work and — on a successful exchange —
+/// extended to the token's own `exp` once, and only once, a new session is durable. If the
+/// exchange dies between the claim and the extension, the claim lapses after this window
+/// instead of occupying the slot for the token's whole (potentially multi-day) lifetime, so
+/// a later retry is not refused by an orphaned claim. It is deliberately short: the window
+/// only has to cover a single exchange's work, and a longer one re-creates the lockout the
+/// short TTL exists to avoid.
+const REFRESH_CLAIM_TTL_SECS: i64 = 120;
+
+/// How long a bootstrap credential stays valid: the token an unseal hands back, and the
+/// session record behind it.
+///
+/// Fixed rather than taken from the interactive session policy, because the two are not
+/// the same credential. `system/config` can raise an ordinary session timeout to 24 hours,
+/// which is a defensible choice for a human at a keyboard; the root token returned by an
+/// unseal is the most privileged credential in the system and should not inherit it by
+/// accident. One hour matches the compiled-in default for `auth.jwt.expiration`.
+pub const BOOTSTRAP_TOKEN_TTL_SECS: u64 = 3600;
 
 #[derive(Debug, Deserialize)]
 pub struct ApiLoginRequest {
@@ -154,6 +184,21 @@ pub struct ApiLoginResponse {
     pub token: AuthToken,
 }
 
+/// An in-memory refresh-token reservation: the deadline for the single-use claim and the
+/// owner token of the attempt that holds it.
+///
+/// The owner is what lets an attempt clear only *its own* claim. The value used to be the
+/// deadline alone, so every attempt that touched an entry removed whatever was there — a
+/// losing or releasing attempt could delete a winner's claim (already upgraded to the
+/// token's full lifetime), and a third request would then re-claim and exchange the same
+/// token concurrently. `owner == None` marks a *revocation* (see [`revoke_token`]), which
+/// any attempt may remove; a claim with an owner is removed only by that owner.
+#[derive(Clone, Debug)]
+struct RefreshClaim {
+    expires_at: chrono::DateTime<chrono::Utc>,
+    owner: Option<String>,
+}
+
 /// Cached effective configuration (session timeout + global MFA flag).
 ///
 /// Avoids a storage round-trip on every authentication call by caching
@@ -181,8 +226,9 @@ pub struct AuthenticationService {
     /// Configuration
     config: AuthConfig,
 
-    /// Token blacklist
-    token_blacklist: Arc<tokio::sync::RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
+    /// Token blacklist: revoked tokens (`owner == None`) and live refresh claims
+    /// (`owner == Some`), both keyed by the token string.
+    token_blacklist: Arc<tokio::sync::RwLock<HashMap<String, RefreshClaim>>>,
 
     /// Crypto service
     crypto: Arc<CryptoService>,
@@ -197,6 +243,11 @@ pub struct AuthenticationService {
     /// Protected by an RwLock so concurrent auth calls can share the
     /// cached value; only one caller refreshes when the TTL expires.
     effective_config_cache: Arc<tokio::sync::RwLock<Option<CachedEffectiveConfig>>>,
+
+    /// Test-only override for [`REFRESH_CLAIM_TTL_SECS`], so a test can drive the claim past
+    /// its deadline without sleeping for the production two minutes.
+    #[cfg(test)]
+    refresh_claim_ttl_override: std::sync::atomic::AtomicI64,
 }
 
 /// TTL for the effective-config cache.  30 seconds is short enough that
@@ -460,6 +511,7 @@ impl AuthenticationService {
                             user.roles.clone(),
                             user.policies.clone(),
                             user.permissions.clone(),
+                            user.password_login_disabled,
                         )
                         .await;
                 }
@@ -477,6 +529,8 @@ impl AuthenticationService {
             mfa_service: None,
             crypto,
             effective_config_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            #[cfg(test)]
+            refresh_claim_ttl_override: std::sync::atomic::AtomicI64::new(REFRESH_CLAIM_TTL_SECS),
         })
     }
 
@@ -710,11 +764,54 @@ impl AuthenticationService {
         // Get effective config for session timeout and MFA enforcement
         let (session_timeout_secs, global_mfa_enabled) = self.get_effective_config().await;
 
-        // Root user cannot login via password (authentication is handled via unseal/SSS token)
-        if req.username == "root" {
-            return Err(secreton_domain::SecretonError::Authentication {
-                message: "Root login disabled via password. Use unseal process.".to_string(),
-            });
+        // The bootstrap root identity is barred from password login because the account is
+        // persisted as non-password-authenticatable, not because of how it is named.
+        //
+        // A literal `req.username == "root"` check used to stand here. It was the entire
+        // guard, and it stopped covering the account the moment `init` accepted a custom
+        // `root_username`: a root account created as, say, `vault-operator` walked straight
+        // through with its generated password hash. It also denied an ordinary admin who
+        // merely chose the name "root". The check below reads the account's own record, so
+        // it covers the identity `init` created under any name and leaves an ordinary
+        // account of the same name alone.
+        //
+        // A lookup that *fails* must deny the login, not be ignored. The check below is what
+        // enforces the bootstrap-root refusal, and the later durable read is only best-effort;
+        // if a transient storage error let this branch fall through, the in-memory
+        // `UserPassAuthMethod` identity — hydrated on an earlier request, before the account
+        // was disabled — could still verify a password. Fail closed, exactly as the lockout
+        // read below already does.
+        match self.find_user_by_username(&req.username).await {
+            Ok(Some(user)) if user.password_login_disabled => {
+                if let Some(audit) = &self.audit {
+                    let _ = audit
+                        .log_event(
+                            crate::services::audit::SecurityEventType::AuthenticationFailure {
+                                user: req.username.clone(),
+                                method: "userpass".to_string(),
+                                reason: "Account is not password-authenticatable".to_string(),
+                            },
+                        )
+                        .await;
+                }
+                // Generic, identical to a wrong password: the refusal must not become a
+                // username oracle that reveals which account is the bootstrap root.
+                return Err(secreton_domain::SecretonError::Authentication {
+                    message: "Invalid credentials".to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load account '{}' while checking password-authenticatability \
+                     during login: {}",
+                    req.username,
+                    e
+                );
+                return Err(secreton_domain::SecretonError::Internal {
+                    message: "An internal error occurred during authentication".to_string(),
+                });
+            }
         }
 
         // Check lockout status before attempting login.
@@ -744,6 +841,9 @@ impl AuthenticationService {
                 && let Ok(u) = serde_json::from_slice::<User>(&decrypted)
             {
                 stored_user = Some(u.clone());
+                // Republish the durable record so an account omitted by the capped startup
+                // hydration can still be verified by `UserPassAuthMethod`.
+                self.hydrate_userpass_identity(&u).await;
                 if let Some(locked_until) = u.locked_until
                     && locked_until > chrono::Utc::now()
                 {
@@ -848,6 +948,7 @@ impl AuthenticationService {
                 display_name: user_info.display_name.clone(),
                 full_name: user_info.display_name,
                 password_hash: "".to_string(), // Not used in API responses
+                password_login_disabled: false,
                 is_active: true,
                 is_superuser: false,
                 disabled: false,
@@ -1131,6 +1232,7 @@ impl AuthenticationService {
             username: claims.claims.username.clone(),
             email: claims.claims.email.clone(),
             password_hash: "".to_string(),
+            password_login_disabled: false,
             full_name: None,
             is_active: true,
             is_superuser: false,
@@ -1164,6 +1266,133 @@ impl AuthenticationService {
         format!("{}{}", REVOKED_TOKEN_STORAGE_PREFIX, hex::encode(digest))
     }
 
+    /// Record the in-memory half of a refresh-token claim under one write guard.
+    ///
+    /// Returns `false` when the token is already spoken for by a live claim or revocation, so
+    /// the caller must not proceed. The claim is inserted with `owner`, so a concurrent
+    /// loser's cleanup cannot remove it.
+    async fn try_claim_refresh_token_in_memory(
+        &self,
+        refresh_token: &str,
+        owner: &str,
+        claim_expiry: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let mut blacklist = self.token_blacklist.write().await;
+        if let Some(existing) = blacklist.get(refresh_token)
+            && existing.expires_at > chrono::Utc::now()
+        {
+            return false;
+        }
+        blacklist.insert(
+            refresh_token.to_string(),
+            RefreshClaim {
+                expires_at: claim_expiry,
+                owner: Some(owner.to_string()),
+            },
+        );
+        true
+    }
+
+    /// Remove an in-memory claim only if it is still the one `owner` took.
+    ///
+    /// A completed exchange upgrades the claim to the token's full lifetime; a losing or
+    /// releasing attempt must not clear that winner's claim, or a third request could
+    /// re-claim and exchange the same token. A *revocation* (`owner == None`) is never
+    /// cleared by this — it is a completed rotation, not a claim.
+    async fn clear_refresh_claim_if_owner(&self, refresh_token: &str, owner: &str) {
+        let mut blacklist = self.token_blacklist.write().await;
+        if blacklist
+            .get(refresh_token)
+            .and_then(|claim| claim.owner.as_deref())
+            == Some(owner)
+        {
+            blacklist.remove(refresh_token);
+        }
+    }
+
+    /// Mark a refresh token's in-memory claim as committed, extending it to the token's own
+    /// expiry so it cannot lapse before the token does.
+    ///
+    /// Owner-conditional, returning whether the extension was applied: the claim is upgraded
+    /// only while it is still absent or still `owner`'s. A *revocation* (owner `None`), or a
+    /// claim another attempt has since taken over, is not overwritten — the previous code
+    /// wrote the new owner's claim unconditionally, so a late exchange whose short claim had
+    /// already lapsed would revive a committed revocation and make the token claimable
+    /// again, and a takeover could be silently displaced. Reporting `false` for the same
+    /// case the durable extension reports `false` keeps the two halves of the claim in
+    /// agreement, so the caller fails closed instead of proceeding on an extension that did
+    /// not hold.
+    async fn commit_refresh_claim_in_memory(
+        &self,
+        refresh_token: &str,
+        owner: &str,
+        expiry: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let mut blacklist = self.token_blacklist.write().await;
+        if let Some(existing) = blacklist.get(refresh_token)
+            && existing.owner.as_deref() != Some(owner)
+        {
+            // A revocation, or another owner's claim: not this attempt's to extend.
+            return false;
+        }
+        blacklist.insert(
+            refresh_token.to_string(),
+            RefreshClaim {
+                expires_at: expiry,
+                owner: Some(owner.to_string()),
+            },
+        );
+        true
+    }
+
+    /// Reclaim a slow exchange's expired refresh claim, owner-conditional, on a shared
+    /// backend.
+    ///
+    /// An exchange that outran its short claim leaves the reservation record behind with the
+    /// old owner's token. Insert-if-absent will not reclaim a record that still exists, so
+    /// without this step the claim could not be retaken until `delete_expired` swept it —
+    /// but reading the record and deleting it by path is a read-then-delete window: between
+    /// the read and the delete a live holder can take the slot, and the delete then destroys
+    /// *its* reservation, letting a second exchange of the same token run concurrently with
+    /// the first. That is the overlap this closes.
+    ///
+    /// The takeover replaces the expired record with this attempt's own reservation using an
+    /// [`Expect::ExpiredOwner`] `compare_and_set` against the *expired owner's* token. That
+    /// precondition is a conjunction of three facts evaluated in the same indivisible step
+    /// as the write — the record still exists, still carries that owner, and is *still
+    /// expired*. The read above confirmed all three, but an arbitrary window separates it
+    /// from this write, and the owner alone is not enough: the original holder's extension
+    /// ([`Self::extend_refresh_claim`]) is itself an owner-conditional replacement that does
+    /// not change the token, so a reclaimer conditioned only on the token would replace a
+    /// claim that had just been extended back to life. The extended claim is then gone, and
+    /// the token it guarded — now the reclaimer's reservation, written with the short claim
+    /// deadline — becomes claimable and exchangeable again: the same refresh token exchanged
+    /// twice. Folding "still expired" into the precondition means an extension in that window
+    /// makes this write match no record, so it reports `false` and the caller falls through
+    /// to insert-if-absent, which correctly finds the slot occupied.
+    async fn reclaim_expired_refresh_claim(&self, path: &str, entry: &SecretEntry) -> bool {
+        let Ok(Some(existing)) = self.storage.get_by_path(path).await else {
+            // Absent or unreadable: fall through to the insert-if-absent, which is the
+            // authority either way.
+            return false;
+        };
+        if !existing.is_expired() {
+            return false;
+        }
+        let Some(existing_owner) = existing.owner_token().map(str::to_string) else {
+            return false;
+        };
+        matches!(
+            self.storage
+                .compare_and_set(
+                    entry,
+                    secreton_storage::Expect::ExpiredOwner(&existing_owner)
+                )
+                .await,
+            Ok(true)
+        )
+    }
+
     /// Revoke a token.
     ///
     /// Writes the revocation to both the in-memory blacklist (fast path for
@@ -1173,12 +1402,20 @@ impl AuthenticationService {
     /// this instance, and the session-binding check in `validate_token`
     /// provides additional defense when sessions are deleted.
     pub async fn revoke_token(&self, token: String, expires_at: chrono::DateTime<chrono::Utc>) {
-        // In-memory update (fast path).
+        // In-memory update (fast path). A revocation has no owner, so it outranks any live
+        // claim for the same token: `is_token_revoked` sees the deadline, and a later
+        // release sees `owner == None` and leaves it in place.
         {
             let mut blacklist = self.token_blacklist.write().await;
             // Clean up expired entries while we're at it
-            blacklist.retain(|_, &mut exp| exp > chrono::Utc::now());
-            blacklist.insert(token.clone(), expires_at);
+            blacklist.retain(|_, claim| claim.expires_at > chrono::Utc::now());
+            blacklist.insert(
+                token.clone(),
+                RefreshClaim {
+                    expires_at,
+                    owner: None,
+                },
+            );
         }
 
         // Persist the revocation so other instances see it.  We store an
@@ -1214,11 +1451,14 @@ impl AuthenticationService {
     /// every user — the session-binding check in `validate_token` remains
     /// the authoritative defense.
     pub async fn is_token_revoked(&self, token: &str) -> bool {
-        // In-memory fast path.
+        // In-memory fast path. A live entry — a claim or a revocation — means the token is
+        // spoken for. A claim carries an owner; `is_token_revoked` is used by
+        // `refresh_token`'s early reject, where "another attempt is mid-exchange" must
+        // refuse this one just as a completed revocation would.
         {
             let blacklist = self.token_blacklist.read().await;
-            if let Some(expires_at) = blacklist.get(token)
-                && *expires_at > chrono::Utc::now()
+            if let Some(claim) = blacklist.get(token)
+                && claim.expires_at > chrono::Utc::now()
             {
                 return true;
             }
@@ -1239,7 +1479,15 @@ impl AuthenticationService {
                 if still_valid {
                     if let Some(exp) = entry.expires_at {
                         let mut blacklist = self.token_blacklist.write().await;
-                        blacklist.insert(token.to_string(), exp);
+                        // A persisted revocation has no owner: it must never be cleared as a
+                        // claim by a later release.
+                        blacklist.insert(
+                            token.to_string(),
+                            RefreshClaim {
+                                expires_at: exp,
+                                owner: None,
+                            },
+                        );
                     }
                     return true;
                 }
@@ -1282,107 +1530,62 @@ impl AuthenticationService {
             .validate_refresh_token(refresh_token)
             .map_err(|_| AuthError::InvalidToken)?;
 
-        // Revoke the old refresh token so it cannot be reused.
-        // This implements single-use refresh token rotation: each refresh
-        // token can only be exchanged once.  Without this, a captured
-        // refresh token could be replayed indefinitely to generate new
-        // sessions without invalidating previous ones.
+        // Reserve the single-use slot atomically, before the fallible work below.
         //
-        // We also attempt to find and revoke the old session that was
-        // associated with this refresh token, so that the old access token
-        // is invalidated as well.
-        let refresh_expiry = chrono::Utc::now() + chrono::Duration::days(8);
-        // Atomically check-and-insert the refresh token into the in-memory
-        // blacklist while holding the write lock across both operations.
-        // This closes the TOCTOU window between the `is_token_revoked` call
-        // above and the `revoke_token` insert below: two concurrent requests
-        // for the same refresh token will both pass the fast-path check, but
-        // only the first one to acquire the write lock will find the slot
-        // empty and insert — the second will observe the existing entry and
-        // be rejected with `InvalidToken`.
+        // This is the authority for reuse detection. The in-memory check-and-insert was
+        // sufficient for one process, but two replicas sharing a backend each have their own
+        // map: both pass the fast-path check and both believe they won, so the same refresh
+        // token was exchanged twice and two token pairs were issued. The reservation is
+        // therefore taken in the *shared* backend first, as an insert-if-absent write at a
+        // path derived from the token's hash, and only a caller that actually created the
+        // record may proceed. The in-memory map is kept as a fast path for this process.
         //
-        // The shared storage layer is still updated via `revoke_token` below
-        // so that cross-instance revocation continues to work; that call is
-        // idempotent on the storage side (same hash-keyed path).
-        {
-            let mut blacklist = self.token_blacklist.write().await;
-            if let Some(expires_at) = blacklist.get(refresh_token)
-                && *expires_at > chrono::Utc::now()
-            {
-                return Err(AuthError::InvalidToken);
-            }
-            blacklist.insert(refresh_token.to_string(), refresh_expiry);
-        }
-        {
-            // Revoke the refresh token itself (add to blacklist with a
-            // generous expiry — refresh tokens are long-lived).
-            //
-            // The in-memory insert was already done atomically above; this
-            // call re-inserts the same entry (idempotent) and additionally
-            // persists the revocation to shared storage for cross-instance
-            // propagation.
-            self.revoke_token(refresh_token.to_string(), refresh_expiry)
-                .await;
+        // A reservation is not a revocation: it is released if the exchange ends without a
+        // new session (see `release_refresh_token_reservation`), and only a completed
+        // exchange commits the permanent revocation. Writing the revocation here instead, as
+        // this used to, meant a later failure (a storage hiccup loading the user, an MFA
+        // service error, a failed session write) returned an error while the old token was
+        // already blacklisted: the caller held no new token and could never retry with the
+        // old one, so a transient fault permanently logged them out.
+        // The reservation and the later revocation must outlive the token they guard for the
+        // token's whole life. A fixed eight-day window did not: when an operator configured
+        // `auth.jwt.refresh_expiration` longer than eight days, an exchanged token outlived
+        // both records, and once they expired a replay won the insert-if-absent race and was
+        // issued a fresh session — a reuse window that grew with the configured lifetime.
+        // Deriving the deadline from the token's own `exp` makes the guard last exactly as
+        // long as the token; `validate_refresh_token` already rejects the token past that
+        // point, so this can never under-reserve. The fallback is effectively unreachable
+        // (validation proved `exp` a live timestamp), but it is kept so a malformed value
+        // cannot shorten the guard.
+        let refresh_expiry = i64::try_from(claims.exp)
+            .ok()
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+            .filter(|exp| *exp > chrono::Utc::now())
+            .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(8));
+        let Some(reservation_owner) = self
+            .reserve_refresh_token(refresh_token, refresh_expiry)
+            .await?
+        else {
+            // Another caller — in this process or another replica sharing the backend —
+            // holds the single-use slot, so this must not exchange the token again.
+            return Err(AuthError::InvalidToken);
+        };
 
-            // Best-effort: find and delete the old session whose refresh_token
-            // matches the one being exchanged.  This is a scan over the
-            // session prefix — acceptable because refresh is infrequent.
-            //
-            // Cap the scan with an explicit upper bound.  Before the
-            // PostgreSQL backend's default `LIMIT 100` was removed (in the
-            // lifecycle PR), this scan was implicitly bounded; without an
-            // explicit limit it would now load every active session into
-            // memory on every refresh.
-            //
-            // TODO: Index sessions by refresh-token hash so this scan can be
-            // replaced with a direct lookup.
-            const SESSION_REFRESH_SCAN_MAX_ENTRIES: u32 = 10_000;
-            let params = secreton_storage::QueryParams {
-                path_prefix: Some(SESSION_STORAGE_PREFIX.to_string()),
-                include_expired: false,
-                limit: Some(SESSION_REFRESH_SCAN_MAX_ENTRIES),
-                ..Default::default()
-            };
-            if let Ok(entries) = self.storage.list(&params).await {
-                for entry in entries {
-                    let session_bytes = match self.crypto.decrypt(&entry.encrypted_data).await {
-                        Ok(decrypted) => decrypted,
-                        Err(decrypt_err) => {
-                            // Only fall back to raw bytes if they look like
-                            // valid JSON (legacy plaintext session).
-                            if serde_json::from_slice::<serde_json::Value>(&entry.encrypted_data)
-                                .is_ok()
-                            {
-                                tracing::warn!(
-                                    "Session '{}': decryption failed, using legacy plaintext fallback",
-                                    entry.path
-                                );
-                                entry.encrypted_data.clone()
-                            } else {
-                                tracing::warn!(
-                                    "Session '{}': decryption failed ({}) and raw data is not valid JSON; \
-                                     skipping corrupt entry",
-                                    entry.path,
-                                    decrypt_err
-                                );
-                                continue; // skip corrupt entries
-                            }
-                        }
-                    };
-                    if let Ok(session) = serde_json::from_slice::<Session>(&session_bytes)
-                        && session.refresh_token.as_deref() == Some(refresh_token)
-                    {
-                        // Revoke the old access token
-                        self.revoke_token(session.token.clone(), session.expires_at)
-                            .await;
-                        // Delete the old session record
-                        let _ = self.storage.delete_by_path(&entry.path).await;
-                        break;
-                    }
-                }
-            }
-        }
+        // Everything from here can fail for a non-security reason: reading the user,
+        // verifying MFA, minting the pair, persisting the new session. The reservation above
+        // must be released if the caller ends up with no new token, or a transient fault
+        // consumes the refresh token and logs them out permanently. The `Err` arm below is
+        // the only place that releases it; a security denial returns from inside without a
+        // reservation leak because those paths deliberately keep the token revoked.
+        // The replacement session's path, published by the closure once it is durable. The
+        // commit phase needs it to remove the session again if the claim extension fails
+        // after the session was stored: without that, a failed extension would return
+        // `InvalidToken` while the session record stayed behind, and retries would accumulate
+        // unreachable active sessions until they expired.
+        let new_session_path: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
 
+        let rotation: Result<AuthToken, AuthError> = async {
         // Get effective config for session timeout
         let (session_timeout_secs, _) = self.get_effective_config().await;
 
@@ -1539,6 +1742,7 @@ impl AuthenticationService {
             .map_err(|_| AuthError::InvalidToken)?;
 
         // Persist the session using the same ID bound to the token
+        let stored_session_path = format!("{}{}", SESSION_STORAGE_PREFIX, temp_session_id);
         let _ = self
             .create_and_store_session(
                 &claims.sub,
@@ -1550,6 +1754,9 @@ impl AuthenticationService {
                 session_timeout_secs,
             )
             .await?;
+        // The session is durable now, so record its path for the commit phase to remove if
+        // the claim extension below fails.
+        *new_session_path.lock().expect("session path lock") = Some(stored_session_path);
 
         // Build the User from the data we already loaded from storage
         // (or from the token claims as a fallback).
@@ -1570,6 +1777,7 @@ impl AuthenticationService {
             display_name: None,
             disabled: false,
             password_hash: "".to_string(),
+            password_login_disabled: false,
             full_name: None,
             is_active: true,
             is_superuser: false,
@@ -1594,6 +1802,445 @@ impl AuthenticationService {
             expires_in: token_pair.expires_in,
             user,
         })
+        }
+        .await;
+
+        match rotation {
+            Ok(token) => {
+                // The new session is durable, so the old refresh token can be revoked for
+                // real. This is the step that makes reuse fail: `commit_refresh_token_rotation`
+                // persists the revocation and invalidates the old session that carried this
+                // token, so a replay after a successful exchange is rejected by both the
+                // in-memory reservation and the durable record.
+                //
+                // The claim is extended to the token's own `exp` here, after the session
+                // exists and before the token is returned. Until this point the claim carried
+                // only the short `REFRESH_CLAIM_TTL_SECS` deadline, so an exchange that died
+                // mid-flight would stop locking the token out. The extension closes the
+                // single-use window: a subsequent claim must fail until the token's own
+                // expiry, not merely until the short claim lapses.
+                if !self
+                    .extend_refresh_claim(refresh_token, &reservation_owner, refresh_expiry)
+                    .await
+                {
+                    // The claim is no longer ours to extend — another attempt took the slot,
+                    // which means a concurrent rotation is in progress. Do not return a
+                    // second token: the whole point of the single-use claim is that only one
+                    // exchange can commit, and this one can no longer prove it holds the
+                    // slot. Fail closed and surface a token error.
+                    //
+                    // The replacement session is already durable and the caller is about to
+                    // receive no token pair, so remove it first. Leaving it behind would let
+                    // repeated extension failures accumulate unreachable active sessions —
+                    // each retry stores one and abandons it — inflating the session count
+                    // until they expire. A cleanup that itself fails is surfaced, not
+                    // swallowed, so the abandoned session stays observable.
+                    // Take the path out under the lock, then release it: the guard must not
+                    // live across the `delete_by_path` await.
+                    let aborted_session_path =
+                        new_session_path.lock().expect("session path lock").take();
+                    if let Some(path) = aborted_session_path
+                        && let Err(e) = self.storage.delete_by_path(&path).await
+                    {
+                        tracing::error!(
+                            "Failed to remove the aborted refresh session at '{}' after the \
+                             claim extension was lost; an orphaned session may remain until it \
+                             expires: {e}",
+                            path
+                        );
+                    }
+                    self.release_refresh_token_reservation(refresh_token, &reservation_owner)
+                        .await;
+                    return Err(AuthError::InvalidToken);
+                }
+                self.commit_refresh_token_rotation(refresh_token, refresh_expiry)
+                    .await;
+                Ok(token)
+            }
+            Err(e) => {
+                // Nothing was issued, so the reservation must not consume the token: release
+                // the in-memory slot and remove any durable shadow a racing attempt may have
+                // written, then return the original error. A retry with the same refresh
+                // token succeeds if the fault was transient; a genuine reuse still fails,
+                // because a successful rotation would have committed the revocation.
+                self.release_refresh_token_reservation(refresh_token, &reservation_owner)
+                    .await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Persist a completed refresh rotation: revoke the exchanged refresh token durably and
+    /// invalidate the old session that carried it.
+    async fn commit_refresh_token_rotation(
+        &self,
+        refresh_token: &str,
+        refresh_expiry: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.revoke_token(refresh_token.to_string(), refresh_expiry)
+            .await;
+
+        // The reservation is deliberately *not* removed here. Deleting it on success would
+        // reopen the very window this fix closes: a second replica whose claim attempt
+        // arrives after the delete but before it has observed the revocation would win the
+        // insert-if-absent race and exchange the token again. Leaving the reservation in
+        // place keeps the slot occupied for the token's whole lifetime, so the shared
+        // backend refuses every later claim; it expires with the token, exactly as the
+        // revocation entry does.
+
+        // Best-effort: find and delete the old session whose refresh_token
+        // matches the one being exchanged.  This is a scan over the
+        // session prefix — acceptable because refresh is infrequent.
+        //
+        // Cap the scan with an explicit upper bound.  Before the
+        // PostgreSQL backend's default `LIMIT 100` was removed (in the
+        // lifecycle PR), this scan was implicitly bounded; without an
+        // explicit limit it would now load every active session into
+        // memory on every refresh.
+        //
+        // TODO: Index sessions by refresh-token hash so this scan can be
+        // replaced with a direct lookup.
+        const SESSION_REFRESH_SCAN_MAX_ENTRIES: u32 = 10_000;
+        let params = secreton_storage::QueryParams {
+            path_prefix: Some(SESSION_STORAGE_PREFIX.to_string()),
+            include_expired: false,
+            limit: Some(SESSION_REFRESH_SCAN_MAX_ENTRIES),
+            ..Default::default()
+        };
+        if let Ok(entries) = self.storage.list(&params).await {
+            for entry in entries {
+                let session_bytes = match self.crypto.decrypt(&entry.encrypted_data).await {
+                    Ok(decrypted) => decrypted,
+                    Err(decrypt_err) => {
+                        // Only fall back to raw bytes if they look like
+                        // valid JSON (legacy plaintext session).
+                        if serde_json::from_slice::<serde_json::Value>(&entry.encrypted_data)
+                            .is_ok()
+                        {
+                            tracing::warn!(
+                                "Session '{}': decryption failed, using legacy plaintext fallback",
+                                entry.path
+                            );
+                            entry.encrypted_data.clone()
+                        } else {
+                            tracing::warn!(
+                                "Session '{}': decryption failed ({}) and raw data is not valid JSON; \
+                                 skipping corrupt entry",
+                                entry.path,
+                                decrypt_err
+                            );
+                            continue; // skip corrupt entries
+                        }
+                    }
+                };
+                if let Ok(session) = serde_json::from_slice::<Session>(&session_bytes)
+                    && session.refresh_token.as_deref() == Some(refresh_token)
+                {
+                    // Revoke the old access token
+                    self.revoke_token(session.token.clone(), session.expires_at)
+                        .await;
+                    // Delete the old session record
+                    let _ = self.storage.delete_by_path(&entry.path).await;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The storage path of the reservation slot for a refresh token.
+    ///
+    /// Derived from the SHA-256 hash of the token, exactly like
+    /// [`Self::revoked_token_path`], so the reservation is content-addressed and no token
+    /// material reaches storage. It is deliberately a different prefix from the revocation
+    /// path: the two records mean different things and are removed by different code.
+    fn refresh_reservation_path(token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let digest = hasher.finalize();
+        format!(
+            "{}{}",
+            REFRESH_RESERVATION_STORAGE_PREFIX,
+            hex::encode(digest)
+        )
+    }
+
+    /// Claim the single-use reservation for a refresh token, in shared storage.
+    ///
+    /// Returns the reservation's owner token when *this* call created it and may proceed,
+    /// or `None` when another holder (in this process or another replica) already has it and
+    /// the caller must be refused. On a backend that reports
+    /// [`secreton_storage::Coordination::SingleProcess`] the atomic insert is not
+    /// available, so the in-process blacklist is the reservation — the same guarantee the
+    /// service already had, and the honest one for a backend no second replica can share.
+    ///
+    /// The claim is written with a *short* deadline ([`REFRESH_CLAIM_TTL_SECS`], capped by
+    /// the token's own expiry) rather than the token's whole lifetime. The exchange extends
+    /// it to the token's `exp` only once a new session is durable (see
+    /// [`Self::commit_refresh_token_rotation`]). A claim that never reaches that point — the
+    /// exchange died, or its release failed — therefore lapses on its own and stops locking
+    /// the token out, instead of occupying the slot for days until `delete_expired` sweeps
+    /// it.
+    async fn reserve_refresh_token(
+        &self,
+        refresh_token: &str,
+        refresh_expiry: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<String>, AuthError> {
+        // In-memory fast path and single-process authority. Check and insert under one
+        // write guard, so two tasks on this instance cannot both win. The in-memory slot
+        // carries the *claim* TTL too, so a claim whose durable counterpart lapses is also
+        // claimable again on this instance after the same window.
+        let claim_ttl = self.refresh_claim_ttl();
+        let claim_expiry =
+            (chrono::Utc::now() + chrono::Duration::seconds(claim_ttl)).min(refresh_expiry);
+
+        // The owner token is unique to this claim, so a release can never remove a
+        // reservation another attempt re-took after this one's record expired. Generate it
+        // before the in-memory claim so the claim records who owns it.
+        let owner = Uuid::new_v4().to_string();
+
+        if !self
+            .try_claim_refresh_token_in_memory(refresh_token, &owner, claim_expiry)
+            .await
+        {
+            return Ok(None);
+        }
+
+        if self.storage.coordination() == secreton_storage::Coordination::SingleProcess {
+            // A process-local backend is a separate map per process, so no second replica
+            // can hold this token. The in-memory reservation above is the complete
+            // guarantee, and pretending to take a durable one would be the fake lock the
+            // storage trait refuses to fake.
+            return Ok(Some(owner));
+        }
+
+        let path = Self::refresh_reservation_path(refresh_token);
+        let entry = SecretEntry::new(
+            path.clone(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by(&owner)
+        .with_expiration(claim_expiry);
+
+        // A completed rotation revokes the refresh token durably at a *different* path from
+        // the reservation, and that revocation outlives the short claim window (it is written
+        // with the token's own expiry). Reclaiming a lapsed reservation must therefore not be
+        // enough to exchange the token again: a replay whose `is_token_revoked` fast path
+        // missed (a different replica, or a storage read that failed open) would otherwise
+        // delete the expired reservation and re-claim the slot, and be handed a second session
+        // for a token that was already exchanged. Check the durable revocation here, at the
+        // point of reclaiming, and refuse — fail *closed* on a read error, because the
+        // alternative is admitting a replay of a single-use token.
+        match self
+            .storage
+            .get_by_path(&Self::revoked_token_path(refresh_token))
+            .await
+        {
+            Ok(Some(revocation)) => {
+                let live = revocation
+                    .expires_at
+                    .map(|exp| exp > chrono::Utc::now())
+                    .unwrap_or(true);
+                if live {
+                    // Undo the in-memory claim this call just took, exactly as the
+                    // `Ok(false)` arm below does, so this process does not carry a reservation
+                    // for a token it must refuse. Owner-scoped: a revocation with no owner is
+                    // never cleared this way.
+                    self.clear_refresh_claim_if_owner(refresh_token, &owner)
+                        .await;
+                    return Ok(None);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read the durable revocation record while reserving a refresh \
+                     token; refusing the exchange rather than risk replaying an already-rotated \
+                     token: {e}"
+                );
+                self.clear_refresh_claim_if_owner(refresh_token, &owner)
+                    .await;
+                return Err(AuthError::Storage(e));
+            }
+        }
+
+        // A lapsed claim must not block a retry. `compare_and_set(Absent)` does not by
+        // itself reclaim a record at the path, and the reservation is deliberately *not*
+        // deleted on a successful exchange, so a claim whose short deadline passed — an
+        // exchange that died before it could be extended — would otherwise keep the slot
+        // occupied until `delete_expired` happened to sweep it.
+        //
+        // The reclaim is an owner-conditional *takeover* rather than a read-then-delete. A
+        // delete opened a window in which a concurrent reclaimer took the slot after this
+        // read but before the delete, so the delete removed the new holder's record and two
+        // exchanges of the same token proceeded at once. Replacing the expired record with
+        // this attempt's reservation only succeeds while the record still carries the expired
+        // owner's token; a concurrent winner has already changed it, so this reports `false`
+        // and the insert-if-absent below then correctly fails. A takeover that succeeds has
+        // already claimed the slot, so the insert-if-absent is skipped.
+        if self.reclaim_expired_refresh_claim(&path, &entry).await {
+            // The expired record was replaced with this attempt's reservation in one
+            // conditional step, so the slot is claimed and the insert-if-absent is skipped.
+            return Ok(Some(owner));
+        }
+
+        // Insert-if-absent is the atomic claim. A backend that reports cross-process
+        // coordination but cannot perform it returns `Unsupported`, and this fails closed:
+        // refusing the refresh is correct, silently falling back to a per-process check
+        // would reopen the race.
+        match self
+            .storage
+            .compare_and_set(&entry, secreton_storage::Expect::Absent)
+            .await
+        {
+            Ok(true) => Ok(Some(owner)),
+            Ok(false) => {
+                // Another replica already holds it. Drop the in-memory claim this call just
+                // took — owner-scoped, so it cannot clear a claim the winner has since
+                // upgraded — so this process does not carry a reservation it did not win.
+                self.clear_refresh_claim_if_owner(refresh_token, &owner)
+                    .await;
+                Ok(None)
+            }
+            Err(e) => {
+                // The shared claim did not complete, so this process did not win the slot
+                // either. The in-memory insert above must be undone, exactly as the
+                // `Ok(false)` arm does: leaving it behind made a transient storage fault —
+                // a brief Redis or PostgreSQL disconnect — consume the refresh token on this
+                // instance for the reservation's whole lifetime, so every retry returned
+                // `InvalidToken` without ever consulting the recovered backend.
+                self.clear_refresh_claim_if_owner(refresh_token, &owner)
+                    .await;
+                Err(AuthError::Storage(e))
+            }
+        }
+    }
+
+    /// Drop the single-use reservation for a refresh token whose exchange failed.
+    ///
+    /// Only called when the exchange issued no session; a completed rotation never releases.
+    /// Both the in-memory slot and the durable reservation are removed — the latter only
+    /// through the owner-conditional delete, so a reservation another attempt re-took after
+    /// this one's record expired is never destroyed. A durable revocation a racing attempt
+    /// may have written for this token is left in place: that is a completed rotation by
+    /// someone else, and releasing it would revive a token that was successfully exchanged.
+    ///
+    /// There is deliberately **no** read-then-unconditional-delete fallback. Reading the
+    /// record and then deleting by path reopens the exact window `delete_owned` closes: a
+    /// second replica can take the slot in between, and the unconditional delete removes
+    /// *its* reservation, letting the same token be exchanged twice. When the conditional
+    /// delete does not complete — an unsupported backend, or a transient fault — the record
+    /// is left in place and this logs the fact. That is not a lockout: the claim carries the
+    /// short [`REFRESH_CLAIM_TTL_SECS`] deadline, so it lapses on its own and the token
+    /// becomes claimable again. Logs never include token material.
+    async fn release_refresh_token_reservation(&self, refresh_token: &str, owner: &str) {
+        // Owner-scoped: clear the in-memory claim only if it is still this attempt's. Doing
+        // it unconditionally let a loser's release delete the winner's claim, and a third
+        // request then re-claimed and exchanged the same token. A revocation has no owner and
+        // is left in place — it marks a completed rotation, not a claim.
+        self.clear_refresh_claim_if_owner(refresh_token, owner)
+            .await;
+        let path = Self::refresh_reservation_path(refresh_token);
+
+        match self.storage.delete_owned(&path, owner).await {
+            // Removed, or there was nothing of ours to remove.
+            Ok(_) => {}
+            Err(secreton_storage::StorageError::Unsupported { .. }) => {
+                tracing::warn!(
+                    "Backend cannot delete a refresh-token reservation conditionally; \
+                     leaving the claim in place to lapse on its own rather than risking \
+                     another attempt's reservation"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to release the refresh-token reservation with an owner-conditional \
+                     delete; leaving the claim in place to lapse on its own: {e}"
+                );
+            }
+        }
+    }
+
+    /// The claim TTL in force: the production constant, or the test override.
+    fn refresh_claim_ttl(&self) -> i64 {
+        #[cfg(test)]
+        {
+            self.refresh_claim_ttl_override
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            REFRESH_CLAIM_TTL_SECS
+        }
+    }
+
+    /// Extend the single-use claim on a refresh token to the token's own expiry, once its
+    /// exchange has produced a durable session.
+    ///
+    /// The claim is taken with the short [`REFRESH_CLAIM_TTL_SECS`] window so a stalled
+    /// exchange cannot lock the token out for days. Once a new session exists, the claim
+    /// must last as long as the token it guards, or the same refresh token could be claimed
+    /// and exchanged *again* after the short window elapsed — the exact reuse the
+    /// reservation exists to prevent. The extension is owner-conditional
+    /// ([`secreton_storage::Expect::Owner`]), so a slot another attempt has taken over is
+    /// not rewritten and this reports `false` for the caller to fail closed on. Never logs
+    /// token material.
+    async fn extend_refresh_claim(
+        &self,
+        refresh_token: &str,
+        owner: &str,
+        refresh_expiry: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        // In-memory slot: the whole guarantee on a single-process backend, and the fast
+        // path on a shared one. Upgrade it to the token's expiry so it cannot lapse early.
+        // The committed claim keeps `owner`, so a losing or releasing attempt cannot clear
+        // it; only this owner can. A `false` means the claim is no longer this attempt's —
+        // it lapsed and was reclaimed, or a revocation replaced it — so the extension must
+        // not be reported as held.
+        let in_memory_extended = self
+            .commit_refresh_claim_in_memory(refresh_token, owner, refresh_expiry)
+            .await;
+
+        if self.storage.coordination() == secreton_storage::Coordination::SingleProcess {
+            // The in-memory claim is the whole guarantee here; its owner-conditional result is
+            // the answer, so a lapsed-and-reclaimed or revoked claim still fails closed.
+            return in_memory_extended;
+        }
+
+        if !in_memory_extended {
+            // On a shared backend too, an in-memory claim that is no longer ours means a
+            // concurrent attempt or a revocation has taken over; refuse rather than extend.
+            return false;
+        }
+
+        let path = Self::refresh_reservation_path(refresh_token);
+        let entry = SecretEntry::new(
+            path,
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by(owner)
+        .with_expiration(refresh_expiry);
+
+        match self
+            .storage
+            .compare_and_set(&entry, secreton_storage::Expect::Owner(owner))
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to extend the refresh-token claim; refusing the exchange: {e}"
+                );
+                false
+            }
+        }
     }
 
     /// Register a new user
@@ -1605,41 +2252,28 @@ impl AuthenticationService {
         roles: Vec<String>,
         permissions: Vec<String>,
     ) -> Result<User, AuthError> {
-        // Check if user exists
         let path = format!("{}{}", USER_STORAGE_PREFIX, username);
-        if self.storage.exists(&path).await? {
-            return Err(AuthError::UserAlreadyExists);
-        }
-
         let user_id = Uuid::new_v4().to_string();
 
-        // Create in UserPass method (generates hash)
-        let password_hash = self
-            .userpass_method
-            .create_user(
-                username.to_string(),
-                password,
-                user_id.clone(),
-                roles.clone(),
-                vec!["default".to_string()],
-                permissions.clone(),
-            )
-            .await
-            .map_err(|_| {
-                AuthError::Internal(anyhow::anyhow!("Failed to create user in auth method"))
-            })?;
+        // Hash first: hashing is expensive and must not run while another writer is
+        // committing the same username, and it must not register anything in memory before
+        // storage has decided whether the name is free.
+        let password_hash = self.userpass_method.hash_password(password).map_err(|_| {
+            AuthError::Internal(anyhow::anyhow!("Failed to hash the user password"))
+        })?;
 
         let user = User {
-            id: user_id,
+            id: user_id.clone(),
             username: username.to_string(),
             email: email.clone(),
-            password_hash,
+            password_hash: password_hash.clone(),
+            password_login_disabled: false,
             full_name: None,
             is_active: true,
             is_superuser: roles.contains(&"admin".to_string())
                 || roles.contains(&"root".to_string()),
-            roles,
-            permissions,
+            roles: roles.clone(),
+            permissions: permissions.clone(),
             policies: vec!["default".to_string()],
             enabled: true,
             disabled: false,
@@ -1654,11 +2288,8 @@ impl AuthenticationService {
             locked_until: None,
         };
 
-        // Store user
         let user_data = serde_json::to_vec(&user)
             .map_err(|e| AuthError::Internal(anyhow::anyhow!("Serialization error: {}", e)))?;
-
-        // Encrypt user data
         let encrypted_data = self.crypto.encrypt_data(&user_data).await.map_err(|e| {
             AuthError::Crypto(secreton_crypto::CryptoError::Internal(e.to_string()))
         })?;
@@ -1671,7 +2302,39 @@ impl AuthenticationService {
             Uuid::parse_str(&user.id).unwrap_or_default(),
         );
 
-        self.storage.store(&entry).await?;
+        // The existence check and the write are one atomic insert-if-absent, not a read
+        // followed by a `store`. The read-then-write let an ordinary registration and the
+        // bootstrap-root registration both pass the same `exists` check and then both write
+        // the path: whichever landed last silently replaced the other identity — for the
+        // bootstrap path that meant an attacker's concurrent registration could displace the
+        // privileged account initialized moments earlier (or vice versa), with no error
+        // reported to either caller. `compare_and_set(Absent)` makes the second writer see
+        // the occupied path and stop.
+        match self
+            .storage
+            .compare_and_set(&entry, secreton_storage::Expect::Absent)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(AuthError::UserAlreadyExists),
+            Err(e) if e.is_precondition_failure() => return Err(AuthError::UserAlreadyExists),
+            Err(e) => return Err(AuthError::Storage(e)),
+        }
+
+        // Publish the in-memory login identity only after the durable write wins. Registering
+        // it before the write would leave a login that works until the process restarts when
+        // the write then fails or loses the race.
+        self.userpass_method
+            .add_user(
+                username.to_string(),
+                password_hash,
+                user_id,
+                roles,
+                vec!["default".to_string()],
+                permissions,
+                false,
+            )
+            .await;
 
         Ok(user)
     }
@@ -1693,6 +2356,306 @@ impl AuthenticationService {
             permissions,
         )
         .await
+    }
+
+    /// Create the bootstrap root identity `init` owns the vault through.
+    ///
+    /// Deliberately not `register_user` with a random password. That is what the previous
+    /// implementation did, and it left a privileged account holding an active password
+    /// hash: the only thing keeping it out of the password path was a literal `"root"`
+    /// username check, which stopped covering the account the moment `init` accepted a
+    /// custom `root_username`. This creates the account with an explicitly
+    /// non-password-authenticatable identity instead — no hash is generated or stored, and
+    /// `password_login_disabled` is persisted — so the boundary is the account's own
+    /// property rather than its name.
+    pub async fn register_bootstrap_root(
+        &self,
+        username: &str,
+        email: Option<String>,
+        roles: Vec<String>,
+        permissions: Vec<String>,
+    ) -> Result<User, AuthError> {
+        self.register_bootstrap_root_owned(username, email, roles, permissions, None, None)
+            .await
+    }
+
+    /// [`Self::register_bootstrap_root`], stamping the persisted account with an owner
+    /// token and optionally fencing the write.
+    ///
+    /// Initialization passes its cross-process lease token here so a failed attempt's
+    /// cleanup can remove the account it created: on a shared backend the cleanup deletes
+    /// with `delete_owned`, which only removes records carrying that token. An account
+    /// written without one is invisible to that path, so the rollback would leave a
+    /// privileged account behind while reporting success. Callers outside initialization
+    /// pass `None`, the same way the ordinary MFA setup path leaves an enrollment unowned.
+    ///
+    /// When `fence` is supplied the account is written through an atomic
+    /// insert-if-absent that also evaluates the fence, so the write only lands while the
+    /// initialization still holds the lease it names *and* only while the path is free. The
+    /// owner token alone would only make the account removable afterwards; the fence is what
+    /// stops an attempt that has already lost the lease from creating a privileged account
+    /// at all, and the insert-if-absent is what stops a concurrent ordinary registration of
+    /// the same username from replacing the account after initialization commits.
+    pub async fn register_bootstrap_root_owned(
+        &self,
+        username: &str,
+        email: Option<String>,
+        roles: Vec<String>,
+        permissions: Vec<String>,
+        owner: Option<&str>,
+        fence: Option<StorageFence<'_>>,
+    ) -> Result<User, AuthError> {
+        let path = format!("{}{}", USER_STORAGE_PREFIX, username);
+        let user_id = Uuid::new_v4().to_string();
+
+        // Register the identity with the userpass method so token issuance sees it, but
+        // with no password hash and the flag set: there is nothing for a verifier to
+        // accept even if the in-memory entry were tampered with.
+        let account = User {
+            id: user_id.clone(),
+            username: username.to_string(),
+            email: email.clone(),
+            password_hash: String::new(),
+            password_login_disabled: true,
+            full_name: None,
+            is_active: true,
+            is_superuser: true,
+            roles: roles.clone(),
+            permissions: permissions.clone(),
+            policies: vec!["default".to_string()],
+            enabled: true,
+            disabled: false,
+            display_name: None,
+            mfa_enabled: false,
+            mfa_secret: None,
+            last_login: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: HashMap::new(),
+            failed_login_attempts: 0,
+            locked_until: None,
+        };
+        let user_id = account.id.clone();
+
+        let user_data = serde_json::to_vec(&account)
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("Serialization error: {}", e)))?;
+        let encrypted_data = self.crypto.encrypt_data(&user_data).await.map_err(|e| {
+            AuthError::Crypto(secreton_crypto::CryptoError::Internal(e.to_string()))
+        })?;
+        let entry = SecretEntry::new(
+            path,
+            encrypted_data,
+            EncryptionMetadata::default(),
+            SecurityLevel::Secret,
+            Uuid::parse_str(&account.id).unwrap_or_default(),
+        );
+        let entry = match owner {
+            Some(owner) => entry.owned_by(owner),
+            None => entry,
+        };
+
+        // The write comes first, and the in-memory userpass identity only second. The other
+        // order registers a login identity in memory for an account whose durable write then
+        // fails — a login that works until the process restarts, and, on the fenced path, a
+        // login for an attempt that had already lost its lease.
+        //
+        // The write is an atomic insert-if-absent in both arms. With a fence it is
+        // `AbsentFenced`, which evaluates the path's emptiness and the lease together:
+        // `store_fenced` alone would overwrite a user registered concurrently under the same
+        // username, and a separate `exists` check followed by `store_fenced` would reopen the
+        // check-then-write window the fence exists to close.
+        let expectation = match fence {
+            Some(fence) => secreton_storage::Expect::AbsentFenced(fence),
+            None => secreton_storage::Expect::Absent,
+        };
+        match self.storage.compare_and_set(&entry, expectation).await {
+            Ok(true) => {}
+            // The path is already occupied: an ordinary account of this username exists, or
+            // won the race to create it. Never replace it.
+            Ok(false) if fence.is_none() => return Err(AuthError::UserAlreadyExists),
+            // A fenced `Ok(false)` means the lease is gone, not that the name is taken; the
+            // two must not be conflated, so it stays an internal failure.
+            Ok(false) => {
+                return Err(AuthError::Internal(anyhow::anyhow!(
+                    "the initialization lease was lost before the root account could \
+                     be written"
+                )));
+            }
+            Err(e) if e.is_precondition_failure() => return Err(AuthError::UserAlreadyExists),
+            Err(e) => return Err(AuthError::Storage(e)),
+        }
+
+        self.userpass_method
+            .add_bootstrap_root(
+                username.to_string(),
+                user_id,
+                roles,
+                vec!["default".to_string()],
+                permissions,
+            )
+            .await;
+
+        Ok(account)
+    }
+
+    /// Mark an existing account as not password-authenticatable, in storage *and* in the
+    /// in-memory userpass cache the login path reads.
+    ///
+    /// Used by the seal service to upgrade a vault initialised before the flag existed:
+    /// that vault's root account was created with a generated password and can only be
+    /// identified by reading the real record, so the upgrade persists the same boundary a
+    /// fresh `init` now writes directly.
+    pub async fn mark_password_login_disabled(&self, username: &str) -> Result<(), AuthError> {
+        let path = format!("{}{}", USER_STORAGE_PREFIX, username);
+        let Some(entry) = self
+            .storage
+            .get_by_path(&path)
+            .await
+            .map_err(AuthError::Storage)?
+        else {
+            return Err(AuthError::UserNotFound);
+        };
+        let bytes = self.crypto.decrypt(&entry.encrypted_data).await?;
+        let mut user: User = serde_json::from_slice(&bytes)
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("corrupt user record: {}", e)))?;
+        if user.password_login_disabled {
+            return Ok(());
+        }
+        user.password_login_disabled = true;
+        user.updated_at = chrono::Utc::now();
+
+        let data = serde_json::to_vec(&user)
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("Serialization error: {}", e)))?;
+        let encrypted = self.crypto.encrypt_data(&data).await.map_err(|e| {
+            AuthError::Crypto(secreton_crypto::CryptoError::Internal(e.to_string()))
+        })?;
+        let mut updated = entry;
+        updated.encrypted_data = encrypted;
+        self.storage
+            .update(&updated)
+            .await
+            .map_err(AuthError::Storage)?;
+
+        // The login path checks the cached `UserEntry`, which was built at startup. With
+        // the hash cleared it cannot accept a password either way, but keeping the two in
+        // step is what makes the flags agree.
+        self.userpass_method
+            .add_bootstrap_root(
+                user.username.clone(),
+                user.id.clone(),
+                user.roles.clone(),
+                user.policies.clone(),
+                user.permissions.clone(),
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Ensure the in-memory userpass identity for `user` reflects its durable record.
+    ///
+    /// [`AuthenticationService::new`] hydrates `UserPassAuthMethod` from storage, but that
+    /// scan is capped (`USER_LOAD_MAX_ENTRIES`), so on a deployment with more accounts than
+    /// the cap the users beyond it are absent from the map. `UserPassAuthMethod` is the only
+    /// thing that verifies a password, so a stored account omitted at startup could never
+    /// sign in. The login paths already read the account's durable record for lockout and
+    /// status checks; re-publishing that same record into the map here makes authentication
+    /// independent of the startup cap.
+    async fn hydrate_userpass_identity(&self, user: &User) {
+        self.userpass_method
+            .add_user(
+                user.username.clone(),
+                user.password_hash.clone(),
+                user.id.clone(),
+                user.roles.clone(),
+                user.policies.clone(),
+                user.permissions.clone(),
+                user.password_login_disabled,
+            )
+            .await;
+    }
+
+    /// Look up a user by username, decrypting the stored record.
+    ///
+    /// `Ok(None)` means the record is absent; an error means it exists but could not be
+    /// read. Callers must not collapse the two — "no such user" and "storage is broken"
+    /// are different situations.
+    pub async fn find_user_by_username(&self, username: &str) -> Result<Option<User>, AuthError> {
+        let path = format!("{}{}", USER_STORAGE_PREFIX, username);
+        let Some(entry) = self
+            .storage
+            .get_by_path(&path)
+            .await
+            .map_err(AuthError::Storage)?
+        else {
+            return Ok(None);
+        };
+        let bytes = self.crypto.decrypt(&entry.encrypted_data).await?;
+        let user = serde_json::from_slice(&bytes)
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("corrupt user record: {}", e)))?;
+        Ok(Some(user))
+    }
+
+    /// Record a session and mint an access token bound to it, for a flow that has
+    /// already established the caller's identity.
+    ///
+    /// The returned token carries the session's `jti`, which is what `validate_token`
+    /// requires; a token minted without one is rejected on every request, so this is the
+    /// only supported way to hand out a credential outside the login path.
+    ///
+    /// `duration_secs` is explicit and *required*, deliberately. This method previously
+    /// read the effective session timeout, which an operator can raise to 24 hours through
+    /// `system/config`. That made the credential returned by an unseal silently inherit
+    /// whatever the interactive-session policy was, so the one credential that can
+    /// reconfigure the vault lived for a day. Bootstrap credentials take
+    /// [`BOOTSTRAP_TOKEN_TTL_SECS`] and the caller says so.
+    ///
+    /// The session is **access-only**: no refresh token is minted and none is stored. The
+    /// only caller is the unseal path, and the root bootstrap credential must not be
+    /// extendable — a refresh token would let the holder mint a fresh root access token
+    /// indefinitely, outliving the one-hour bootstrap TTL the whole design rests on. Because
+    /// the session record carries `refresh_token: None`, there is nothing to exchange, and
+    /// `refresh_token()` cannot rotate this credential.
+    pub async fn issue_session_token(
+        &self,
+        user: &User,
+        ip_address: String,
+        user_agent: String,
+        duration_secs: u64,
+    ) -> Result<String, AuthError> {
+        let session_duration =
+            chrono::Duration::from_std(std::time::Duration::from_secs(duration_secs))
+                .unwrap_or(chrono::Duration::hours(1));
+
+        let session_id = Uuid::new_v4().to_string();
+        // Mint the access token directly rather than a pair, so no refresh token exists even
+        // transiently. `create_token_pair_with_duration` would sign one that, while unstored,
+        // remains a valid signed refresh JWT to anyone who received it.
+        let access_token = self
+            .token_service
+            .create_access_token_with_duration(
+                &user.id,
+                &user.username,
+                user.email.as_deref(),
+                &user.roles,
+                &user.policies,
+                false,
+                Some(session_id.clone()),
+                Some(session_duration),
+            )
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("failed to mint token: {}", e)))?;
+
+        self.create_and_store_session(
+            &user.id,
+            session_id,
+            access_token.clone(),
+            None,
+            ip_address,
+            user_agent,
+            duration_secs,
+        )
+        .await?;
+
+        Ok(access_token)
     }
 
     /// Check if user has permission (simplified)
@@ -1915,11 +2878,48 @@ impl AuthenticationService {
             }
         }
 
+        // And prune expired refresh reservations. Each one carries the refresh token's own
+        // `exp`, so it is reclaimable once that passes. Without this sweep the prefix grew
+        // without bound on every backend that persists it: a reservation is deliberately
+        // left in place after a successful exchange (removing it re-opens the replay race
+        // it exists to close), so *every* refresh left a record behind and nothing ever
+        // removed it — not even `delete_expired`, which was only ever asked for the
+        // session and revocation prefixes.
+        match self
+            .storage
+            .delete_expired(Some(REFRESH_RESERVATION_STORAGE_PREFIX.to_string()))
+            .await
+        {
+            Ok(n) if n > 0 => {
+                tracing::info!("Cleaned up {} expired refresh reservations", n);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Failed to clean up expired refresh reservations: {}", e);
+            }
+        }
+
         Ok(deleted_count)
     }
 
     /// Verify password for a user
     pub async fn verify_password(&self, username: &str, password: &str) -> Result<bool, AuthError> {
+        // The bootstrap root identity has no password to verify, and asking must not
+        // become an oracle for which account it is: the answer is the same as a wrong
+        // password. The persisted flag is the boundary; a nil hash would already fail
+        // `check_password`, but relying on that alone would be relying on the absence of a
+        // value rather than on a stated property.
+        if let Ok(Some(user)) = self.find_user_by_username(username).await {
+            // Republish the durable record before the check: the capped startup hydration
+            // (`USER_LOAD_MAX_ENTRIES`) may have omitted this account, and
+            // `UserPassAuthMethod` is what verifies the password. Without this, a valid
+            // account beyond the cap is rejected here even though its stored hash matches.
+            self.hydrate_userpass_identity(&user).await;
+            if user.password_login_disabled {
+                return Ok(false);
+            }
+        }
+
         let request = LoginRequest {
             username: username.to_string(),
             password: password.to_string(),
@@ -2005,13 +3005,14 @@ impl AuthenticationService {
         ip_address: String,
         user_agent: String,
     ) -> Result<AuthResult, AuthError> {
-        // Root user cannot login via password — mirrors the check in `login()`
-        // so that the root account is consistently blocked from password-based
-        // authentication regardless of which code path is used.
-        if credentials.username == "root" {
-            return Err(AuthError::InvalidCredentials);
-        }
-
+        // Same boundary as `login()`: the bootstrap root identity is barred because the
+        // account is persisted as non-password-authenticatable, not by username. The
+        // literal check this replaces only covered the default name and let a root account
+        // created under a custom `root_username` authenticate with its generated password.
+        //
+        // Checked after the user is loaded below so the denial reads the real record; the
+        // generic error keeps it from revealing which account is the bootstrap root.
+        //
         // Load user from storage ONCE at the start so that lockout checks,
         // failed-attempt increments, policy loading, and counter resets all
         // operate on the same snapshot.  This eliminates the TOCTOU window
@@ -2057,6 +3058,32 @@ impl AuthenticationService {
             }
         };
 
+        // The bootstrap root identity cannot password-authenticate. Checked against the
+        // loaded record so the boundary follows the account, and answered with the same
+        // generic error a wrong password gets.
+        //
+        // Republish the durable record first: the capped startup hydration may have omitted
+        // this account, and `UserPassAuthMethod` is what verifies its password.
+        if let Some(ref u) = pre_auth_user {
+            self.hydrate_userpass_identity(u).await;
+        }
+        if let Some(ref u) = pre_auth_user
+            && u.password_login_disabled
+        {
+            if let Some(audit) = &self.audit {
+                let _ = audit
+                    .log_event(
+                        crate::services::audit::SecurityEventType::AuthenticationFailure {
+                            user: credentials.username.clone(),
+                            method: "userpass".to_string(),
+                            reason: "Account is not password-authenticatable".to_string(),
+                        },
+                    )
+                    .await;
+            }
+            return Err(AuthError::InvalidCredentials);
+        }
+
         // Check lockout status before attempting login — mirrors the check in
         // `login()` so that locked accounts cannot authenticate through this
         // code path.
@@ -2097,7 +3124,19 @@ impl AuthenticationService {
             .auth_service
             .login(&request)
             .await
-            .map_err(|e| AuthError::Internal(anyhow::anyhow!("Auth failed: {}", e)))?;
+            // A wrong password is a client error, not a fault. Folding it into
+            // `Internal` here made every failed login answer 500 — which is both the wrong
+            // status and a lie about the server's health, and it buried real login failures
+            // in the server-error log where nobody looks for a typo.
+            .map_err(|e| match e {
+                secreton_domain::SecretonError::InvalidCredentials
+                | secreton_domain::SecretonError::UserNotFound { .. }
+                | secreton_domain::SecretonError::AccountDisabled { .. }
+                | secreton_domain::SecretonError::AccountLocked { .. } => {
+                    AuthError::InvalidCredentials
+                }
+                other => AuthError::Internal(anyhow::anyhow!("Auth failed: {}", other)),
+            })?;
 
         if !result.success {
             // Increment failed_login_attempts and persist — mirrors the logic
@@ -2361,6 +3400,7 @@ impl AuthenticationService {
             display_name: (!oauth_user.name.is_empty()).then(|| oauth_user.name.clone()),
             disabled: false,
             password_hash: "".to_string(), // OAuth users don't have password
+            password_login_disabled: false,
             full_name: (!oauth_user.name.is_empty()).then(|| oauth_user.name.clone()),
             is_active: true,
             is_superuser: false,
@@ -2388,6 +3428,12 @@ mod tests {
 
     use crate::services::crypto::CryptoService;
     // use secreton_crypto::SecurityParams;
+    use crate::services::mfa_persistence::PersistentTotpService;
+    use secreton_auth::mfa::{
+        CombinedMfaService, DefaultPushService, DefaultRecoveryCodeService, DefaultWebAuthnService,
+        EmailConfig, InMemoryEmailService, InMemoryHardwareService, InMemorySmsService, SmsConfig,
+    };
+    use secreton_storage::StorageResult;
     use secreton_storage::backends::MemoryBackend;
 
     #[tokio::test]
@@ -2401,6 +3447,157 @@ mod tests {
 
         let auth_service = AuthenticationService::new(storage, crypto, &config).await;
         assert!(auth_service.is_ok());
+    }
+
+    /// A user absent from the capped startup hydration must still authenticate: the login
+    /// path re-publishes the durable record, so the `USER_LOAD_MAX_ENTRIES` scan cannot
+    /// exclude a valid account from password verification.
+    #[tokio::test]
+    async fn a_user_omitted_by_startup_hydration_can_still_authenticate() {
+        use secreton_storage::{EncryptionMetadata, SecurityLevel};
+        use uuid::Uuid;
+
+        let (storage, service, _root_key) = auth_with_open_barrier().await;
+
+        // Hash a password and persist a user record directly, without going through
+        // `register_user` — that would publish the in-memory identity and mask the bug.
+        let password = crate::test_support::generated_password();
+        let password_hash = service
+            .userpass_method
+            .hash_password(&password)
+            .expect("hash");
+        let user = User {
+            id: Uuid::new_v4().to_string(),
+            username: "beyond-the-cap".to_string(),
+            email: None,
+            password_hash,
+            password_login_disabled: false,
+            full_name: None,
+            is_active: true,
+            is_superuser: false,
+            roles: vec!["user".to_string()],
+            permissions: vec![],
+            policies: vec!["default".to_string()],
+            enabled: true,
+            disabled: false,
+            display_name: None,
+            mfa_enabled: false,
+            mfa_secret: None,
+            last_login: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: HashMap::new(),
+            failed_login_attempts: 0,
+            locked_until: None,
+        };
+        let path = format!("{}{}", USER_STORAGE_PREFIX, user.username);
+        let encrypted = service
+            .crypto
+            .encrypt_data(&serde_json::to_vec(&user).unwrap())
+            .await
+            .unwrap();
+        let entry = SecretEntry::new(
+            path,
+            encrypted,
+            EncryptionMetadata::default(),
+            SecurityLevel::Secret,
+            Uuid::new_v4(),
+        );
+        storage.store(&entry).await.unwrap();
+
+        // The service was constructed before the account existed, so its startup hydration
+        // never saw it — exactly the state of an account beyond `USER_LOAD_MAX_ENTRIES` on a
+        // fresh process. The durable record is readable by path but absent from the in-memory
+        // password map. Without on-demand hydration the password cannot be verified.
+        let result = service
+            .authenticate(
+                crate::services::auth::LoginRequest {
+                    username: user.username.clone(),
+                    password: password.to_string(),
+                    mfa_code: None,
+                    remember_me: Some(false),
+                },
+                "127.0.0.1".to_string(),
+                "test".to_string(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a stored account absent from the in-memory map must still authenticate: {result:?}"
+        );
+    }
+
+    /// `verify_password` backs re-authentication (for example before disabling MFA), so an
+    /// account beyond the capped startup hydration must pass it too. Otherwise the account
+    /// can sign in but cannot re-authenticate for a sensitive change.
+    #[tokio::test]
+    async fn verify_password_accepts_an_account_absent_from_startup_hydration() {
+        use secreton_storage::{EncryptionMetadata, SecurityLevel};
+        use uuid::Uuid;
+
+        let (storage, service, _root_key) = auth_with_open_barrier().await;
+
+        let password = crate::test_support::generated_password();
+        let wrong_password = crate::test_support::generated_password();
+        let password_hash = service
+            .userpass_method
+            .hash_password(&password)
+            .expect("hash");
+        let user = User {
+            id: Uuid::new_v4().to_string(),
+            username: "beyond-the-cap-verify".to_string(),
+            email: None,
+            password_hash,
+            password_login_disabled: false,
+            full_name: None,
+            is_active: true,
+            is_superuser: false,
+            roles: vec!["user".to_string()],
+            permissions: vec![],
+            policies: vec!["default".to_string()],
+            enabled: true,
+            disabled: false,
+            display_name: None,
+            mfa_enabled: false,
+            mfa_secret: None,
+            last_login: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: HashMap::new(),
+            failed_login_attempts: 0,
+            locked_until: None,
+        };
+        let path = format!("{}{}", USER_STORAGE_PREFIX, user.username);
+        let encrypted = service
+            .crypto
+            .encrypt_data(&serde_json::to_vec(&user).unwrap())
+            .await
+            .unwrap();
+        storage
+            .store(&SecretEntry::new(
+                path,
+                encrypted,
+                EncryptionMetadata::default(),
+                SecurityLevel::Secret,
+                Uuid::new_v4(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .verify_password(&user.username, &password)
+                .await
+                .expect("verify"),
+            "a stored account absent from the in-memory map must still verify its password"
+        );
+        assert!(
+            !service
+                .verify_password(&user.username, &wrong_password)
+                .await
+                .expect("verify"),
+            "a wrong password must still be rejected"
+        );
     }
 
     #[tokio::test]
@@ -2474,6 +3671,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_reclaims_expired_refresh_reservations() {
+        // Regression: a refresh reservation is deliberately left in place after a
+        // successful exchange, so *every* refresh wrote one and nothing ever removed it.
+        // `cleanup_expired_sessions` swept the session and revocation prefixes only, so on
+        // any backend that persists reservations the prefix grew without bound. The
+        // reservation carries the refresh token's own `exp`, which makes it reclaimable
+        // once that passes — the sweep just had to ask for the prefix.
+        use secreton_storage::{EncryptionMetadata, SecretEntry, SecurityLevel};
+        use uuid::Uuid;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        let mut config = AuthConfig::default();
+        config.jwt.secret = Some("test_secret".to_string());
+        config.jwt.issuer = "secreton".to_string();
+        config.jwt.audience = "secreton-api".to_string();
+
+        let auth_service = AuthenticationService::new(storage.clone(), crypto, &config)
+            .await
+            .unwrap();
+
+        let reservation = |suffix: &str, expires: chrono::DateTime<chrono::Utc>| {
+            SecretEntry::new(
+                format!("{}{}", REFRESH_RESERVATION_STORAGE_PREFIX, suffix),
+                vec![],
+                EncryptionMetadata::default(),
+                SecurityLevel::Internal,
+                Uuid::new_v4(),
+            )
+            .with_expiration(expires)
+        };
+
+        let expired = format!("{}{}", REFRESH_RESERVATION_STORAGE_PREFIX, "expired");
+        let live = format!("{}{}", REFRESH_RESERVATION_STORAGE_PREFIX, "live");
+        storage
+            .store(&reservation(
+                "expired",
+                chrono::Utc::now() - chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+        storage
+            .store(&reservation(
+                "live",
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            ))
+            .await
+            .unwrap();
+
+        auth_service
+            .cleanup_expired_sessions()
+            .await
+            .expect("cleanup runs");
+
+        assert!(
+            !storage.exists(&expired).await.unwrap(),
+            "an expired refresh reservation must be reclaimed by session cleanup"
+        );
+        assert!(
+            storage.exists(&live).await.unwrap(),
+            "a reservation whose refresh token is still live must be kept"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_user_count() {
         use secreton_storage::{EncryptionMetadata, SecretEntry, SecurityLevel};
 
@@ -2517,6 +3779,2030 @@ mod tests {
 
         let count = auth_service.get_user_count().await.unwrap();
         assert_eq!(count, 2);
+    }
+
+    /// Build a service graph with the root key installed, so a test can create the
+    /// bootstrap root account and then attempt to log in as it. Returns the root key
+    /// bytes too, so a test can rebuild the service over the same storage (a restart)
+    /// without invalidating the records it wrote.
+    async fn auth_with_open_barrier() -> (
+        Arc<dyn StorageBackend + Send + Sync>,
+        Arc<AuthenticationService>,
+        Vec<u8>,
+    ) {
+        let storage: Arc<dyn StorageBackend + Send + Sync> = Arc::new(MemoryBackend::new());
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        let root_key = secreton_crypto::generate_key(secreton_crypto::AlgorithmId::Aes256Gcm)
+            .expect("root key");
+        crypto
+            .set_root_key(root_key.clone())
+            .await
+            .expect("install root key");
+
+        let mut config = AuthConfig::default();
+        config.jwt.secret = Some("test_secret".to_string());
+        config.jwt.issuer = "secreton".to_string();
+        config.jwt.audience = "secreton-api".to_string();
+
+        let mfa = Arc::new(CombinedMfaService::new(
+            Arc::new(PersistentTotpService::new(
+                storage.clone(),
+                crypto.clone(),
+                "secreton-test".to_string(),
+            )),
+            Arc::new(InMemorySmsService::new(SmsConfig::default())),
+            Arc::new(InMemoryEmailService::new(EmailConfig::default())),
+            Arc::new(InMemoryHardwareService::new()),
+            Arc::new(DefaultPushService::new_mock()),
+            Arc::new(DefaultWebAuthnService::new_default()),
+            Arc::new(DefaultRecoveryCodeService::new()),
+        ));
+
+        let service = Arc::new(
+            AuthenticationService::new(storage.clone(), crypto, &config)
+                .await
+                .unwrap()
+                .with_mfa(mfa),
+        );
+        (storage, service, root_key)
+    }
+
+    /// A backend that fails the *next* `store` of a session record, so a test can prove a
+    /// failure after a refresh token is reserved does not permanently consume it.
+    #[derive(Debug)]
+    struct FailingSessionStore {
+        inner: MemoryBackend,
+        armed: std::sync::atomic::AtomicBool,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingSessionStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+                fired: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailingSessionStore {
+        async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst)
+                && entry.path.starts_with(SESSION_STORAGE_PREFIX)
+            {
+                self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(secreton_storage::StorageError::BackendError {
+                    backend: "fault-injected".to_string(),
+                    message: "injected session store failure".to_string(),
+                });
+            }
+            self.inner.store(entry).await
+        }
+        /// `register_user` now writes the account with `compare_and_set(Absent)`; forward it
+        /// to the inner memory backend so this fault-injection wrapper stays transparent for
+        /// everything it does not deliberately intercept.
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
+        }
+        async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_id(id).await
+        }
+        async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_path(path).await
+        }
+        async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.update(entry).await
+        }
+        async fn upsert(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.upsert(entry).await
+        }
+        async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+            self.inner.delete_by_id(id).await
+        }
+        async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            self.inner.delete_by_path(path).await
+        }
+        async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>> {
+            self.inner.list(params).await
+        }
+        async fn count(&self, params: &QueryParams) -> StorageResult<u64> {
+            self.inner.count(params).await
+        }
+        async fn exists(&self, path: &str) -> StorageResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn begin_transaction(
+            &self,
+        ) -> StorageResult<Box<dyn secreton_storage::StorageTransaction>> {
+            self.inner.begin_transaction().await
+        }
+        async fn health_check(&self) -> StorageResult<secreton_storage::HealthStatus> {
+            self.inner.health_check().await
+        }
+        async fn get_stats(&self) -> StorageResult<secreton_storage::StorageStats> {
+            self.inner.get_stats().await
+        }
+        async fn migrate(&self) -> StorageResult<()> {
+            self.inner.migrate().await
+        }
+        async fn store_oauth_state(
+            &self,
+            state: &secreton_domain::OAuthState,
+        ) -> StorageResult<()> {
+            self.inner.store_oauth_state(state).await
+        }
+        async fn get_oauth_state(
+            &self,
+            state: &str,
+        ) -> StorageResult<Option<secreton_domain::OAuthState>> {
+            self.inner.get_oauth_state(state).await
+        }
+        async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
+            self.inner.delete_expired_oauth_states().await
+        }
+    }
+
+    /// A backend that wraps another and holds the first two `compare_and_set` calls at the
+    /// refresh-reservation path until *both* have arrived.
+    ///
+    /// Without the rendezvous the race in this area is not deterministic: the first
+    /// replica can finish its whole exchange — including the durable revocation — before
+    /// the second even reads the token, so the second is rejected by the revocation rather
+    /// than by the reservation, and the test passes whether or not the reservation is
+    /// authoritative. Parking both attempts at the claim point forces the interleaving the
+    /// property is about: both have passed the fast-path check, and only the shared
+    /// insert-if-absent can decide the winner.
+    #[derive(Debug)]
+    struct ReservationRendezvousBackend {
+        inner: secreton_storage::FileBackend,
+        arrived: tokio::sync::Barrier,
+    }
+
+    impl ReservationRendezvousBackend {
+        fn new(inner: secreton_storage::FileBackend) -> Self {
+            Self {
+                inner,
+                arrived: tokio::sync::Barrier::new(2),
+            }
+        }
+    }
+
+    /// A backend that caps the startup user hydration scan, modelling a deployment with more
+    /// accounts than `USER_LOAD_MAX_ENTRIES`.
+    ///
+    /// It truncates a `USER_STORAGE_PREFIX` list to `cap` rows — what the capped scan does —
+    /// but every other call, including a direct `get_by_path`, is transparent. That is the
+    /// exact shape of the reported defect: at startup the omitted account never enters the
+    /// in-memory password map, while the durable record is still there with the correct
+    /// password.
+    #[derive(Debug)]
+    struct CappedUserLoadBackend {
+        inner: MemoryBackend,
+        cap: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CappedUserLoadBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                cap: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            }
+        }
+
+        /// Make the next startup scan load at most `cap` accounts, as the capped hydration
+        /// does for a deployment past the limit.
+        fn cap_startup_scan_at(&self, cap: usize) {
+            self.cap.store(cap, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for CappedUserLoadBackend {
+        async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.store(entry).await
+        }
+        async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_id(id).await
+        }
+        async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_path(path).await
+        }
+        async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.update(entry).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
+        }
+        async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+            self.inner.delete_by_id(id).await
+        }
+        async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            self.inner.delete_by_path(path).await
+        }
+        async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>> {
+            let mut entries = self.inner.list(params).await?;
+            if params.path_prefix.as_deref() == Some(USER_STORAGE_PREFIX) {
+                let cap = self.cap.load(std::sync::atomic::Ordering::SeqCst);
+                entries.truncate(cap);
+            }
+            Ok(entries)
+        }
+        async fn count(&self, params: &QueryParams) -> StorageResult<u64> {
+            self.inner.count(params).await
+        }
+        async fn exists(&self, path: &str) -> StorageResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn begin_transaction(
+            &self,
+        ) -> StorageResult<Box<dyn secreton_storage::StorageTransaction>> {
+            self.inner.begin_transaction().await
+        }
+        async fn health_check(&self) -> StorageResult<secreton_storage::HealthStatus> {
+            self.inner.health_check().await
+        }
+        async fn get_stats(&self) -> StorageResult<secreton_storage::StorageStats> {
+            self.inner.get_stats().await
+        }
+        async fn migrate(&self) -> StorageResult<()> {
+            self.inner.migrate().await
+        }
+        async fn store_oauth_state(
+            &self,
+            state: &secreton_domain::OAuthState,
+        ) -> StorageResult<()> {
+            self.inner.store_oauth_state(state).await
+        }
+        async fn get_oauth_state(
+            &self,
+            state: &str,
+        ) -> StorageResult<Option<secreton_domain::OAuthState>> {
+            self.inner.get_oauth_state(state).await
+        }
+        async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
+            self.inner.delete_expired_oauth_states().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for ReservationRendezvousBackend {
+        async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.store(entry).await
+        }
+        async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_id(id).await
+        }
+        async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_path(path).await
+        }
+        async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.update(entry).await
+        }
+        async fn upsert(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.upsert(entry).await
+        }
+        async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+            self.inner.delete_by_id(id).await
+        }
+        async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            self.inner.delete_by_path(path).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            if entry.path.starts_with(REFRESH_RESERVATION_STORAGE_PREFIX)
+                && expect == secreton_storage::Expect::Absent
+            {
+                self.arrived.wait().await;
+            }
+            self.inner.compare_and_set(entry, expect).await
+        }
+        async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
+            self.inner.delete_owned(path, token).await
+        }
+        async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>> {
+            self.inner.list(params).await
+        }
+        async fn count(&self, params: &QueryParams) -> StorageResult<u64> {
+            self.inner.count(params).await
+        }
+        async fn exists(&self, path: &str) -> StorageResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn begin_transaction(
+            &self,
+        ) -> StorageResult<Box<dyn secreton_storage::StorageTransaction>> {
+            self.inner.begin_transaction().await
+        }
+        async fn store_oauth_state(
+            &self,
+            state: &secreton_domain::OAuthState,
+        ) -> StorageResult<()> {
+            self.inner.store_oauth_state(state).await
+        }
+        async fn get_oauth_state(
+            &self,
+            state: &str,
+        ) -> StorageResult<Option<secreton_domain::OAuthState>> {
+            self.inner.get_oauth_state(state).await
+        }
+        async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
+            self.inner.delete_expired_oauth_states().await
+        }
+        fn coordination(&self) -> secreton_storage::Coordination {
+            self.inner.coordination()
+        }
+        async fn health_check(&self) -> StorageResult<secreton_storage::HealthStatus> {
+            self.inner.health_check().await
+        }
+        async fn get_stats(&self) -> StorageResult<secreton_storage::StorageStats> {
+            self.inner.get_stats().await
+        }
+        async fn migrate(&self) -> StorageResult<()> {
+            self.inner.migrate().await
+        }
+    }
+
+    /// A cross-process backend that fails the *first* reservation claim once, modelling a
+    /// brief storage outage at the moment a refresh is being exchanged.
+    #[derive(Debug)]
+    struct FailingReservationBackend {
+        inner: secreton_storage::FileBackend,
+        armed: std::sync::atomic::AtomicBool,
+        fired: std::sync::atomic::AtomicBool,
+        /// When set, the next owner-conditional delete reports `Unsupported`, as a backend
+        /// that coordinates across processes but cannot delete conditionally would. Used to
+        /// prove the reservation refund is verified rather than trusted.
+        fail_next_delete_owned: std::sync::atomic::AtomicBool,
+        /// Counts `delete_by_path` calls on a refresh-reservation path. The release must
+        /// never remove a reservation by path — that is the read-then-delete fallback which
+        /// can destroy another attempt's slot — so a non-zero count is the defect.
+        unconditional_reservation_deletes: std::sync::atomic::AtomicU64,
+        /// When planted, the next `get_by_path` for this path returns the planted (stale)
+        /// record instead of the live one. This models the TOCTOU window the rejected
+        /// fallback opened: a release reads the record, sees *its own* owner token, and is
+        /// preempted before the delete — in that window another replica takes the slot, and
+        /// the unconditional delete then destroys the new owner's reservation. The stale
+        /// read is what lets a test reproduce that interleaving deterministically instead of
+        /// hoping for the scheduling.
+        stale_readback: std::sync::Mutex<Option<(String, SecretEntry)>>,
+        /// When set, the next `get_by_path` of a *user* record returns a connection error, so a
+        /// test can model a transient storage fault during login without disabling the later
+        /// lockout read.
+        fail_next_user_read: std::sync::atomic::AtomicBool,
+        /// When set, the next owner-conditional write to a refresh-reservation path reports
+        /// `Ok(false)`, modelling another attempt having taken the slot in the window between
+        /// the session write and the claim extension.
+        fail_next_claim_extension: std::sync::atomic::AtomicBool,
+        /// When set, the next `ExpiredOwner` write at this refresh-reservation path first has
+        /// the *original holder* extend the claim back to life, modelling the extension a
+        /// reclaimer's read-to-write window admits. The `ExpiredOwner` precondition is then
+        /// evaluated against the now-live record, which is exactly the race: a reclaim
+        /// conditioned only on the owner token would replace the freshly extended live claim.
+        extend_before_expired_reclaim: std::sync::Mutex<Option<(String, SecretEntry)>>,
+        /// When set, the next `store` of a revoked-token record fails, modelling the durable
+        /// revocation write dropping while the in-memory one still lands.
+        fail_next_revocation_store: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingReservationBackend {
+        fn new(inner: secreton_storage::FileBackend) -> Self {
+            Self {
+                inner,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                fired: std::sync::atomic::AtomicBool::new(false),
+                fail_next_delete_owned: std::sync::atomic::AtomicBool::new(false),
+                unconditional_reservation_deletes: std::sync::atomic::AtomicU64::new(0),
+                stale_readback: std::sync::Mutex::new(None),
+                fail_next_user_read: std::sync::atomic::AtomicBool::new(false),
+                fail_next_claim_extension: std::sync::atomic::AtomicBool::new(false),
+                extend_before_expired_reclaim: std::sync::Mutex::new(None),
+                fail_next_revocation_store: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// Arm the next `ExpiredOwner` write at `path` to first overwrite the record with
+        /// `live`, modelling the holder's extension landing in the reclaimer's read-to-write
+        /// window.
+        fn extend_claim_before_expired_reclaim(&self, path: &str, live: SecretEntry) {
+            *self
+                .extend_before_expired_reclaim
+                .lock()
+                .expect("extend-before-reclaim lock") = Some((path.to_string(), live));
+        }
+
+        fn unconditional_reservation_deletes(&self) -> u64 {
+            self.unconditional_reservation_deletes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Make the next read of `path` report `entry`, as a replica that read before
+        /// another attempt took the slot would have seen.
+        fn plant_stale_readback(&self, path: &str, entry: SecretEntry) {
+            *self.stale_readback.lock().expect("stale readback lock") =
+                Some((path.to_string(), entry));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailingReservationBackend {
+        async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            if entry.path.starts_with(REVOKED_TOKEN_STORAGE_PREFIX)
+                && self
+                    .fail_next_revocation_store
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(secreton_storage::StorageError::ConnectionFailed {
+                    message: "injected revocation-store failure".to_string(),
+                });
+            }
+            self.inner.store(entry).await
+        }
+        async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_id(id).await
+        }
+        async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            if path.starts_with(USER_STORAGE_PREFIX)
+                && self
+                    .fail_next_user_read
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(secreton_storage::StorageError::ConnectionFailed {
+                    message: "injected user-record read failure".to_string(),
+                });
+            }
+            if let Some((stale_path, entry)) = self
+                .stale_readback
+                .lock()
+                .expect("stale readback lock")
+                .take()
+                && stale_path == path
+            {
+                return Ok(Some(entry));
+            }
+            self.inner.get_by_path(path).await
+        }
+        async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.update(entry).await
+        }
+        async fn upsert(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.upsert(entry).await
+        }
+        async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+            self.inner.delete_by_id(id).await
+        }
+        async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            if path.starts_with(REFRESH_RESERVATION_STORAGE_PREFIX) {
+                self.unconditional_reservation_deletes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.delete_by_path(path).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: secreton_storage::Expect<'_>,
+        ) -> StorageResult<bool> {
+            if entry.path.starts_with(REFRESH_RESERVATION_STORAGE_PREFIX)
+                && expect == secreton_storage::Expect::Absent
+                && self.armed.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(secreton_storage::StorageError::ConnectionFailed {
+                    message: "injected reservation write failure".to_string(),
+                });
+            }
+            // The owner-conditional extension is the only other reservation write; reporting
+            // `Ok(false)` here makes the caller believe another attempt took the slot.
+            if entry.path.starts_with(REFRESH_RESERVATION_STORAGE_PREFIX)
+                && matches!(expect, secreton_storage::Expect::Owner(_))
+                && self
+                    .fail_next_claim_extension
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(false);
+            }
+            // Model the holder's extension landing in the reclaimer's read-to-write window.
+            // Keyed on the path alone, not on the precondition variant, so the same injected
+            // interleaving exercises whichever precondition the reclaim uses — which is what
+            // makes the regression falsifiable: with the old owner-only precondition the
+            // now-live record still matches and is overwritten, and the token is handed out
+            // again.
+            if entry.path.starts_with(REFRESH_RESERVATION_STORAGE_PREFIX) {
+                let extended = {
+                    let mut slot = self
+                        .extend_before_expired_reclaim
+                        .lock()
+                        .expect("extend-before-reclaim lock");
+                    match slot.as_ref() {
+                        Some((path, _)) if path == &entry.path => slot.take().map(|(_, e)| e),
+                        _ => None,
+                    }
+                };
+                if let Some(live) = extended {
+                    self.inner.upsert(&live).await?;
+                }
+            }
+            self.inner.compare_and_set(entry, expect).await
+        }
+        async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
+            if self
+                .fail_next_delete_owned
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(secreton_storage::StorageError::Unsupported {
+                    operation: "delete_owned".to_string(),
+                    backend: "fault-injected".to_string(),
+                });
+            }
+            self.inner.delete_owned(path, token).await
+        }
+        async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>> {
+            self.inner.list(params).await
+        }
+        async fn count(&self, params: &QueryParams) -> StorageResult<u64> {
+            self.inner.count(params).await
+        }
+        async fn exists(&self, path: &str) -> StorageResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn begin_transaction(
+            &self,
+        ) -> StorageResult<Box<dyn secreton_storage::StorageTransaction>> {
+            self.inner.begin_transaction().await
+        }
+        async fn store_oauth_state(
+            &self,
+            state: &secreton_domain::OAuthState,
+        ) -> StorageResult<()> {
+            self.inner.store_oauth_state(state).await
+        }
+        async fn get_oauth_state(
+            &self,
+            state: &str,
+        ) -> StorageResult<Option<secreton_domain::OAuthState>> {
+            self.inner.get_oauth_state(state).await
+        }
+        async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
+            self.inner.delete_expired_oauth_states().await
+        }
+        fn coordination(&self) -> secreton_storage::Coordination {
+            secreton_storage::Coordination::CrossProcess
+        }
+        async fn health_check(&self) -> StorageResult<secreton_storage::HealthStatus> {
+            self.inner.health_check().await
+        }
+        async fn get_stats(&self) -> StorageResult<secreton_storage::StorageStats> {
+            self.inner.get_stats().await
+        }
+        async fn migrate(&self) -> StorageResult<()> {
+            self.inner.migrate().await
+        }
+    }
+
+    /// A service over a caller-supplied backend, with the root key installed so record
+    /// encryption works — the same graph [`auth_with_open_barrier`] builds.
+    async fn auth_with_storage(
+        storage: Arc<dyn StorageBackend + Send + Sync>,
+    ) -> Arc<AuthenticationService> {
+        let root_key = secreton_crypto::generate_key(secreton_crypto::AlgorithmId::Aes256Gcm)
+            .expect("root key");
+        auth_with_storage_and_root_key(storage, root_key).await
+    }
+
+    /// The same graph, with a caller-supplied root key.
+    ///
+    /// Two service instances that share a backend must share the key that encrypts the
+    /// system's own records, or one cannot read what the other wrote. A caller that wants
+    /// two cooperating replicas uses this and passes the one key to both.
+    async fn auth_with_storage_and_root_key(
+        storage: Arc<dyn StorageBackend + Send + Sync>,
+        root_key: Vec<u8>,
+    ) -> Arc<AuthenticationService> {
+        auth_with_storage_root_key_and_refresh_ttl(storage, root_key, 86400 * 7).await
+    }
+
+    /// The same graph, with an explicit refresh-token lifetime so a test can exercise a
+    /// deployment whose `auth.jwt.refresh_expiration` differs from the default.
+    async fn auth_with_storage_root_key_and_refresh_ttl(
+        storage: Arc<dyn StorageBackend + Send + Sync>,
+        root_key: Vec<u8>,
+        refresh_expiration_secs: u64,
+    ) -> Arc<AuthenticationService> {
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        crypto
+            .set_root_key(root_key)
+            .await
+            .expect("install root key");
+
+        let mut config = AuthConfig::default();
+        config.jwt.secret = Some("test_secret".to_string());
+        config.jwt.issuer = "secreton".to_string();
+        config.jwt.audience = "secreton-api".to_string();
+        config.jwt.refresh_expiration = refresh_expiration_secs;
+
+        let mfa = Arc::new(CombinedMfaService::new(
+            Arc::new(PersistentTotpService::new(
+                storage.clone(),
+                crypto.clone(),
+                "secreton-test".to_string(),
+            )),
+            Arc::new(InMemorySmsService::new(SmsConfig::default())),
+            Arc::new(InMemoryEmailService::new(EmailConfig::default())),
+            Arc::new(InMemoryHardwareService::new()),
+            Arc::new(DefaultPushService::new_mock()),
+            Arc::new(DefaultWebAuthnService::new_default()),
+            Arc::new(DefaultRecoveryCodeService::new()),
+        ));
+
+        Arc::new(
+            AuthenticationService::new(storage, crypto, &config)
+                .await
+                .unwrap()
+                .with_mfa(mfa),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_write_does_not_consume_the_refresh_token() {
+        // Regression: `refresh_token` blacklisted the old refresh token *before* doing the
+        // fallible work — loading the user, minting the pair, storing the new session. A
+        // storage fault after that point returned an error while the old token was already
+        // revoked, so the caller held no new token and could never retry with the old one:
+        // a transient fault logged them out permanently.
+        //
+        // The property: after a failed exchange the same refresh token still works once,
+        // and once it has been exchanged successfully, replaying it is still refused.
+        let _env = crate::test_support::without_root_key();
+        let storage = Arc::new(FailingSessionStore::new());
+        let storage_dyn: Arc<dyn StorageBackend + Send + Sync> = storage.clone();
+        let service = auth_with_storage(storage_dyn).await;
+
+        let password = crate::test_support::generated_password();
+        service
+            .register_user(
+                "refresh-user",
+                &password,
+                None,
+                vec!["user".to_string()],
+                vec![],
+            )
+            .await
+            .expect("register user");
+
+        let login = service
+            .login(
+                ApiLoginRequest {
+                    username: "refresh-user".to_string(),
+                    password,
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await
+            .expect("login");
+        let refresh = login.token.refresh_token.clone();
+
+        // Inject a storage fault on the next session write, which is exactly the step after
+        // the old token is reserved.
+        storage
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let failed = service
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await;
+        assert!(
+            failed.is_err(),
+            "the injected storage failure must surface to the caller"
+        );
+        assert!(
+            storage.fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the session-write fault must actually have fired, or this test proves nothing"
+        );
+
+        // The retry with the same refresh token must succeed — the failed attempt released
+        // its reservation rather than consuming the token.
+        let exchanged = service
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await
+            .expect("the retry must succeed with the same refresh token");
+        assert!(!exchanged.access_token.is_empty());
+
+        // And now that the exchange committed, replaying the old token is refused: releasing
+        // the reservation on failure must not weaken reuse detection after success.
+        let replay = service
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await;
+        assert!(
+            replay.is_err(),
+            "a refresh token exchanged successfully must not be replayable"
+        );
+    }
+    #[tokio::test]
+    async fn a_claim_extension_that_reports_the_token_taken_does_not_return_a_session() {
+        // Regression (Auth Bypass, medium): the in-memory extension overwrote the claim
+        // unconditionally and always returned `true`, so on a backend whose durable extension
+        // reported `Ok(false)` — another attempt had taken the slot in the window after the
+        // session was written — the caller still believed it held the claim and returned the
+        // freshly minted pair. The single-use reservation then admitted a second exchange of
+        // the same refresh token alongside the one it had just issued a session for.
+        //
+        // The property: a claim extension that no longer holds must fail the exchange closed
+        // (no token pair), must not return a session, and must leave the losing attempt's
+        // reservation released.
+        let _env = crate::test_support::without_root_key();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+
+        let password = crate::test_support::generated_password();
+        service
+            .register_user(
+                "extend-loses-user",
+                &password,
+                None,
+                vec!["user".to_string()],
+                vec![],
+            )
+            .await
+            .expect("register user");
+        let login = service
+            .login(
+                ApiLoginRequest {
+                    username: "extend-loses-user".to_string(),
+                    password,
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await
+            .expect("login");
+        let refresh = login.token.refresh_token.clone();
+
+        // The login above stored one active session. The aborted exchange must not add a
+        // second one, so it is the *delta* that matters, not the absolute count.
+        let session_count = || async {
+            backend
+                .inner
+                .list(&QueryParams::new().with_path_prefix(SESSION_STORAGE_PREFIX.to_string()))
+                .await
+                .expect("list sessions")
+                .len()
+        };
+        let sessions_after_login = session_count().await;
+        assert!(
+            sessions_after_login >= 1,
+            "the login must have stored a session for the count to be meaningful"
+        );
+
+        // The owner-conditional extension is the next reservation write; report it as taken.
+        backend
+            .fail_next_claim_extension
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result = service
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await;
+        assert!(
+            result.is_err(),
+            "a claim extension that reports the token taken must not return a token pair"
+        );
+
+        // The replacement session was made durable before the extension failed; it must have
+        // been removed so the abandoned attempt does not accumulate an unreachable active
+        // session.
+        assert_eq!(
+            session_count().await,
+            sessions_after_login,
+            "the aborted exchange's session must not survive the failed claim extension"
+        );
+
+        // The failed exchange released its reservation: the same token can be retried.
+        assert!(
+            service
+                .reserve_refresh_token(&refresh, chrono::Utc::now() + chrono::Duration::days(8))
+                .await
+                .expect("retry reserve")
+                .is_some(),
+            "the losing exchange must release its reservation so the token is retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn extending_a_revoked_claim_on_a_single_process_backend_reports_failure() {
+        // Regression (Auth Bypass, medium), the single-process half. `extend_refresh_claim`
+        // short-circuited `return true` for a single-process backend, after an in-memory
+        // commit that overwrote whatever was already there and reported nothing. So once a
+        // concurrent rotation had revoked the token — or a reclaimer had taken the claim —
+        // a slow exchange whose short claim had lapsed still "extended" the claim, overwriting
+        // the revocation with its own live claim, and proceeded to return a session. The
+        // property: the extension must report failure when the claim is no longer this
+        // attempt's to extend.
+        let _env = crate::test_support::without_root_key();
+        let storage: Arc<dyn StorageBackend + Send + Sync> =
+            Arc::new(secreton_storage::backends::MemoryBackend::new());
+        assert_eq!(
+            storage.coordination(),
+            secreton_storage::Coordination::SingleProcess,
+            "this test targets the single-process path"
+        );
+        let service = auth_with_storage(storage).await;
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "single-process-extend-refresh-token";
+        let owner = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // A concurrent rotation revokes the token (owner `None`). The revocation outranks the
+        // claim, so the extension must not overwrite it.
+        service.revoke_token(token.to_string(), expiry).await;
+
+        assert!(
+            !service.extend_refresh_claim(token, &owner, expiry).await,
+            "an extension must not report success once the token has been revoked"
+        );
+        assert!(
+            service.is_token_revoked(token).await,
+            "the revoked claim must remain revoked after the failed extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_omitted_by_the_capped_startup_scan_can_still_sign_in() {
+        // Regression (Broken Access Control, medium): `AuthenticationService::new` hydrates
+        // `UserPassAuthMethod` from a capped storage scan (`USER_LOAD_MAX_ENTRIES`). On a
+        // deployment with more accounts than the cap, the users beyond it are absent from the
+        // map — and `UserPassAuthMethod` is the only thing that verifies a password, so a
+        // stored account omitted at startup could never sign in.
+        //
+        // The property: after a restart whose hydration scan omitted an account, a login for
+        // that account must still succeed. The login path republishes the durable record into
+        // the map before `UserPassAuthMethod` is asked to verify, which is what makes
+        // authentication independent of the cap.
+        let _env = crate::test_support::without_root_key();
+        let backend = Arc::new(CappedUserLoadBackend::new());
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let root_key = secreton_crypto::generate_key(secreton_crypto::AlgorithmId::Aes256Gcm)
+            .expect("root key");
+        let service = auth_with_storage_and_root_key(storage.clone(), root_key.clone()).await;
+
+        let password = crate::test_support::generated_password();
+        service
+            .register_user(
+                "capped-out-user",
+                &password,
+                None,
+                vec!["user".to_string()],
+                vec![],
+            )
+            .await
+            .expect("register user");
+
+        // A fresh service over the same backend is what a restart looks like. Cap the scan at
+        // zero so the account is certainly omitted from the hydrated map; if the login path
+        // did not re-hydrate from the durable record, verification would have no hash to use.
+        backend.cap_startup_scan_at(0);
+        let restarted = auth_with_storage_and_root_key(storage, root_key).await;
+
+        let login = restarted
+            .login(
+                ApiLoginRequest {
+                    username: "capped-out-user".to_string(),
+                    password,
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await
+            .expect("an account omitted by the capped startup scan must still sign in");
+        assert!(!login.token.access_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_instances_sharing_a_backend_admit_exactly_one_refresh_exchange() {
+        // Regression (CWE-362): the single-use refresh reservation lived only in the
+        // in-memory `token_blacklist`. Two replicas sharing PostgreSQL, Redis or a file
+        // directory each have their own map, so both passed the check and both inserted,
+        // and the same refresh token was exchanged twice, issuing two token pairs.
+        //
+        // The property: with the reservation taken in the backend the two replicas share,
+        // exactly one exchange succeeds and the other observes "already used".
+        let _env = crate::test_support::without_root_key();
+
+        // A file backend reports `Coordination::CrossProcess` and really implements
+        // `compare_and_set`, so the reservation is arbitrated between the two service
+        // instances exactly as it would be between two server processes. The wrapper parks
+        // both claim attempts at the reservation point, so the race is forced rather than
+        // hoped for — otherwise the first replica can finish its whole exchange (including
+        // the durable revocation) before the second reads the token, and the test would pass
+        // even without the shared reservation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let storage: Arc<dyn StorageBackend + Send + Sync> =
+            Arc::new(ReservationRendezvousBackend::new(file_storage));
+        assert_eq!(
+            storage.coordination(),
+            secreton_storage::Coordination::CrossProcess,
+            "this test is only meaningful on a backend that arbitrates across instances"
+        );
+
+        // Two independent service graphs — two "replicas" — over the one backend, sharing
+        // the root key that encrypts the system's own records. Sharing the key is what a
+        // real multi-replica deployment does (all replicas unseal with the same vault), and
+        // it is what lets either read the user the other registered.
+        let shared_root_key =
+            secreton_crypto::generate_key(secreton_crypto::AlgorithmId::Aes256Gcm)
+                .expect("root key");
+        let replica_a =
+            auth_with_storage_and_root_key(storage.clone(), shared_root_key.clone()).await;
+        let replica_b = auth_with_storage_and_root_key(storage.clone(), shared_root_key).await;
+
+        let password = crate::test_support::generated_password();
+        replica_a
+            .register_user(
+                "shared-user",
+                &password,
+                None,
+                vec!["user".to_string()],
+                vec![],
+            )
+            .await
+            .expect("register user");
+
+        // Sign in through replica A, which registered the account. The point of this test
+        // is the reservation race, not cross-replica login caching.
+        let login = replica_a
+            .login(
+                ApiLoginRequest {
+                    username: "shared-user".to_string(),
+                    password,
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await
+            .expect("login");
+        let refresh = login.token.refresh_token.clone();
+
+        // Both replicas claim the reservation for the same refresh token at once. The claim
+        // is the single-use gate; asserting on it directly — rather than on the whole
+        // exchange — is what makes this test falsifiable. Reverting the shared reservation
+        // to the per-process map does not make two *exchanges* both succeed here, because a
+        // second defense (the session-binding check that follows the rotation) would still
+        // reject the loser; it makes two *claims* both succeed, which is the race. Both
+        // claims are parked at the rendezvous point above until both have arrived, so the
+        // loser's `None` can only come from the shared insert-if-absent.
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let (claim_a, claim_b) = tokio::join!(
+            replica_a.reserve_refresh_token(&refresh, expiry),
+            replica_b.reserve_refresh_token(&refresh, expiry),
+        );
+        let winners = [claim_a.as_ref(), claim_b.as_ref()]
+            .iter()
+            .filter(|claim| matches!(claim, Ok(Some(_))))
+            .count();
+        assert_eq!(
+            winners, 1,
+            "exactly one replica may hold the single-use reservation; got a={claim_a:?} b={claim_b:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_conditional_release_never_deletes_another_attempts_reservation() {
+        // Regression (Finding 2): `release_refresh_token_reservation` read the record's owner
+        // and then called an *unconditional* `delete_by_path`. A second replica can take the
+        // slot between those two calls, and the unconditional delete then removes *its*
+        // reservation — letting the same refresh token be exchanged twice, which is exactly
+        // what the single-use reservation exists to prevent. The fix removes the
+        // read-then-delete fallback entirely: only `delete_owned` may remove a reservation,
+        // and a failed release leaves the record in place (it lapses on its own via the short
+        // claim TTL; see `a_reservation_whose_release_failed_is_usable_again_after_the_claim_ttl`).
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "release-me-refresh-token";
+        let owner = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // The owner-conditional delete is unavailable on this backend, exactly as it is on a
+        // backend that reports `CrossProcess` without implementing conditional deletion.
+        backend
+            .fail_next_delete_owned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .release_refresh_token_reservation(token, &owner)
+            .await;
+
+        let path = AuthenticationService::refresh_reservation_path(token);
+        assert!(
+            service
+                .storage
+                .get_by_path(&path)
+                .await
+                .expect("read reservation")
+                .is_some(),
+            "a failed conditional release must not fall back to an unconditional delete; the \
+             record is left to lapse rather than risk destroying another attempt's reservation"
+        );
+        assert_eq!(
+            backend.unconditional_reservation_deletes(),
+            0,
+            "the release must never delete a reservation by path: that read-then-delete \
+             fallback can remove a slot another attempt took in between, letting the same \
+             refresh token be exchanged twice"
+        );
+
+        // The token is still blocked while the (now unowned) claim is live, which is the
+        // correct fail-closed behaviour — the slot is not silently freed by an unconditional
+        // delete.
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim while the claim is live")
+                .is_none(),
+            "a live claim must keep the token single-use even after a failed release"
+        );
+    }
+
+    impl AuthenticationService {
+        /// Test-only: force the short refresh-claim window, so a test can drive a claim past
+        /// its deadline without sleeping for the production two minutes.
+        fn force_short_claim_ttl(&self) {
+            self.refresh_claim_ttl_override
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reservation_whose_release_failed_is_usable_again_after_the_claim_ttl() {
+        // Regression (Finding 3): when the durable release failed, the reservation occupied
+        // the slot for the refresh token's whole (potentially multi-day) lifetime, so a retry
+        // after storage recovered was refused by the insert-if-absent until `delete_expired`
+        // swept the record. The claim is now taken with a short TTL
+        // (`REFRESH_CLAIM_TTL_SECS`) and extended to the token's `exp` only once an exchange
+        // succeeds, so an orphaned claim lapses and the token is claimable again.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        // A one-second claim window stands in for the production two minutes.
+        let service = auth_with_storage(storage).await;
+        service.force_short_claim_ttl();
+
+        // The token's own expiry is far in the future, so only the claim TTL can free it.
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "orphaned-claim-refresh-token";
+        let owner = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // The release fails (storage is down / the backend cannot delete conditionally), so
+        // the durable claim is left behind — an orphan occupying the slot.
+        backend
+            .fail_next_delete_owned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .release_refresh_token_reservation(token, &owner)
+            .await;
+
+        // While the orphaned claim is live the token is single-use.
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim while the orphan is live")
+                .is_none(),
+            "an orphaned claim must keep the token single-use while it is within its window"
+        );
+
+        // Past the claim window the orphan lapses, and a retry must succeed rather than being
+        // locked out until the token's own expiry.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim after the orphan lapsed")
+                .is_some(),
+            "a claim whose release failed must not lock the refresh token out past its claim TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_release_never_removes_a_new_owners_reservation() {
+        // Regression (Finding 2/3), the interleaving the fallback opened: owner A claims the
+        // token with a short window, its claim lapses, owner B takes the slot, and only then
+        // does A run a release that fails. A's release must not delete B's reservation — the
+        // record must still exist and still be owned by B — or the same token could be
+        // exchanged twice.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "stale-release-refresh-token";
+        let owner_a = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("A claims the token");
+        let path = AuthenticationService::refresh_reservation_path(token);
+
+        // A's claim lapses; B takes the now-free slot.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let owner_b = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("B re-claims the lapsed slot")
+            .expect("B wins the freed slot");
+        assert_ne!(owner_a, owner_b, "B must hold a fresh owner token");
+
+        // Reproduce the interleaving the fallback opens: A's release reads the record and is
+        // preempted *before* its delete, and in that window B takes the slot. The stale
+        // readback hands A the record as it looked while A still owned it, so the fallback's
+        // ownership check passes and its unconditional delete then removes B's live slot.
+        // Without the stale read, the readback would simply observe B's record and the
+        // fallback would (correctly) decline; the defect only bites in the window.
+        let stale_a_record = SecretEntry::new(
+            path.clone(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by(&owner_a)
+        .with_expiration(chrono::Utc::now() - chrono::Duration::seconds(1));
+        backend.plant_stale_readback(&path, stale_a_record);
+
+        // A's release runs late and its conditional delete fails. It must be a no-op against
+        // B's record.
+        backend
+            .fail_next_delete_owned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .release_refresh_token_reservation(token, &owner_a)
+            .await;
+
+        // Read ground truth through the inner backend: the injected stale readback models the
+        // read the *fallback* performs, and the fixed release performs none, so reading back
+        // through the wrapper would consume the injection and misreport B's live slot.
+        let record = backend
+            .inner
+            .get_by_path(&path)
+            .await
+            .expect("read reservation")
+            .expect("B's reservation must survive A's stale release");
+        assert!(
+            record.has_owner(&owner_b),
+            "the surviving reservation must still belong to B, not A"
+        );
+        assert_eq!(
+            backend.unconditional_reservation_deletes(),
+            0,
+            "a release must never remove a reservation by path — that read-then-delete \
+             fallback is exactly what lets a stale release destroy another attempt's slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reclaimed_reservation_still_honors_a_live_durable_revocation() {
+        // Regression (Auth Bypass): `reserve_refresh_token` reclaimed a lapsed reservation by
+        // deleting the expired record and re-claiming the slot, without ever consulting the
+        // durable *revocation* a completed rotation had written at a different path. A replay
+        // whose early `is_token_revoked` check missed — another replica, or a storage read that
+        // failed open — therefore obtained a second session for an already-exchanged token once
+        // its short claim window elapsed. The property: a lapsed reservation is not reclaimable
+        // while a live revocation for the same token exists.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+        // A one-second claim window stands in for the production two minutes.
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "revoked-but-reclaimable-refresh-token";
+        service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // A completed rotation writes the durable revocation and leaves the reservation, with
+        // its short claim window, to lapse.
+        service.revoke_token(token.to_string(), expiry).await;
+
+        // Clear the in-memory fast path, modelling a different replica (or an instance that
+        // never saw the revocation) whose only record of the revocation is durable storage.
+        {
+            let mut blacklist = service.token_blacklist.write().await;
+            blacklist.remove(token);
+        }
+
+        // Let the claim lapse, then attempt to reclaim it. The durable revocation must win.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim a lapsed but revoked reservation")
+                .is_none(),
+            "a live durable revocation must refuse the reclaimed slot, \
+             or a replay of an exchanged token is issued a second session"
+        );
+
+        // Guard the other direction: a token with no durable revocation is still reclaimable
+        // after its claim lapses, so the check did not simply disable reclaiming altogether.
+        let fresh_token = "unrevoked-reclaimable-refresh-token";
+        let _first = service
+            .reserve_refresh_token(fresh_token, expiry)
+            .await
+            .expect("first reserve")
+            .expect("the first claim wins");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            service
+                .reserve_refresh_token(fresh_token, expiry)
+                .await
+                .expect("re-claim an unrevoked lapsed reservation")
+                .is_some(),
+            "a lapsed reservation with no durable revocation must remain reclaimable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reclaim_cannot_replace_a_claim_extended_back_to_life_in_the_window() {
+        // Regression (Auth Bypass, CWE-367): `reclaim_expired_refresh_claim` read an expired
+        // claim, confirmed its owner, and then replaced it with an owner-conditional
+        // `compare_and_set`. The owner token does not change when a claim is *extended*, so a
+        // holder whose short claim had lapsed but whose exchange then completed could extend
+        // the same record back to life in the reclaimer's read-to-write window. The reclaimer's
+        // write still matched on the token and overwrote the freshly extended live claim with
+        // its own short-deadline reservation; the original holder's slot was gone, and once
+        // the reclaimer's short deadline lapsed the token was claimable and exchangeable again
+        // — the same refresh token exchanged twice.
+        //
+        // The property: a reclaim lands only while the record is *still expired*, so an
+        // extension in the window makes it match nothing and report failure.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "reclaim-race-refresh-token";
+        let owner_a = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // A's exchange outran its short claim: the reservation is now lapsed but still
+        // present, which is what admits a reclaim.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let path = AuthenticationService::refresh_reservation_path(token);
+
+        // Arm the interleaving: A's late extension lands at the reclaim's write, making the
+        // record live again (owner unchanged) before the precondition is evaluated.
+        let live = SecretEntry::new(
+            path.clone(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by(&owner_a)
+        .with_expiration(expiry);
+        backend.extend_claim_before_expired_reclaim(&path, live);
+
+        // B's reclaim must not land: the record it was about to replace is live again.
+        let owner_b = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reclaim a lapsed reservation");
+
+        let stored = backend
+            .inner
+            .get_by_path(&path)
+            .await
+            .expect("read reservation")
+            .expect("the extended live claim must survive");
+        if let Some(owner_b) = owner_b {
+            assert_ne!(
+                stored.owner_token(),
+                Some(owner_b.as_str()),
+                "a reclaim must not replace a claim that was extended back to life in the \
+                 read-to-write window: the token it guards would become exchangeable again"
+            );
+            assert_eq!(
+                stored.owner_token(),
+                Some(owner_a.as_str()),
+                "the extended claim must still belong to the holder that extended it"
+            );
+        } else {
+            // Refusing the reclaim outright is also correct: the slot is occupied by the live
+            // claim. What must not happen is B winning it.
+            assert_eq!(
+                stored.owner_token(),
+                Some(owner_a.as_str()),
+                "the live claim must not be displaced when the reclaim is refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_durable_revocation_still_blocks_replay_via_the_reservation() {
+        // Regression (Finding, Auth Bypass): `commit_refresh_token_rotation` writes the
+        // durable revocation first, but `revoke_token` deliberately tolerates a durable-write
+        // failure — the in-memory revocation still lands, and on its own that is enough for
+        // the local instance but not for a different replica or a restart, which never saw
+        // it. Replay protection then rests entirely on the reservation, so if that carried
+        // only the short claim window it would lapse and a replay would win the slot for a
+        // token that was already exchanged.
+        //
+        // The property: the reservation is extended to the token's own `exp` *before* the
+        // revocation is written, so a revocation that fails to persist still leaves the slot
+        // occupied for the token's whole life.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+        // A one-second claim window stands in for the production two minutes.
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "failed-revocation-refresh-token";
+        let owner = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // The exchange succeeds, so the claim is extended to the token's own expiry before
+        // the rotation commits.
+        assert!(
+            service.extend_refresh_claim(token, &owner, expiry).await,
+            "the completed exchange must hold its extended claim"
+        );
+
+        // The durable revocation then fails, which `revoke_token` tolerates.
+        backend
+            .fail_next_revocation_store
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service.revoke_token(token.to_string(), expiry).await;
+        assert!(
+            backend
+                .inner
+                .get_by_path(&AuthenticationService::revoked_token_path(token))
+                .await
+                .expect("read revocation")
+                .is_none(),
+            "the durable revocation must not have landed, or the test proves nothing"
+        );
+
+        // Model a different replica, or this instance after a restart: no in-memory record of
+        // either the claim or the revocation.
+        service.token_blacklist.write().await.clear();
+
+        // Wait past the short claim window, so a slot that had only the short claim would now
+        // be reclaimable and a replay would win it.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim after the short window")
+                .is_none(),
+            "a failed durable revocation must not free an exchanged token while the extended \
+             reservation still stands, or the token is exchanged a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_release_does_not_clear_a_new_owners_in_memory_claim() {
+        // Regression (Auth Bypass): the in-memory blacklist stored only a deadline, so
+        // `release_refresh_token_reservation` removed whatever entry was present. When A's
+        // exchange failed *late* — after A's short claim had lapsed and B had taken the slot —
+        // A's release cleared B's live claim. On a single-process backend the in-memory claim
+        // is the whole guarantee, so a third request then found no claim and exchanged the same
+        // single-use token a second time.
+        //
+        // The property: a release by an owner that no longer holds the claim does not clear the
+        // current owner's claim.
+        let _env = crate::test_support::without_root_key();
+        let storage: Arc<dyn StorageBackend + Send + Sync> =
+            Arc::new(secreton_storage::backends::MemoryBackend::new());
+        let service = auth_with_storage(storage).await;
+        // A one-second claim window stands in for the production two minutes.
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "single-process-claim-refresh-token";
+
+        // A takes the claim, then its claim lapses before its exchange finishes.
+        let owner_a = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("A must win the only slot");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // B takes the now-free slot.
+        let owner_b = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("B re-claims the lapsed slot")
+            .expect("B wins the freed slot");
+        assert_ne!(owner_a, owner_b);
+
+        // A's release runs late. It must not clear B's in-memory claim.
+        service
+            .release_refresh_token_reservation(token, &owner_a)
+            .await;
+
+        // B's claim must survive: a third request is still refused, and the stored claim still
+        // names B.
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("C's reserve")
+                .is_none(),
+            "the current owner's claim must survive a stale release, or the token is no longer \
+             single-use"
+        );
+        {
+            let blacklist = service.token_blacklist.read().await;
+            let claim = blacklist
+                .get(token)
+                .expect("the current owner's in-memory claim must still be present");
+            assert_eq!(
+                claim.owner.as_deref(),
+                Some(owner_b.as_str()),
+                "the surviving claim must still belong to the current owner"
+            );
+        }
+
+        // Guard the other direction: the current owner can still release its own claim, and the
+        // token then becomes claimable again.
+        service
+            .release_refresh_token_reservation(token, &owner_b)
+            .await;
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("reserve after the owner released")
+                .is_some(),
+            "an owner's own release must free the slot for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_account_lookup_denies_login_rather_than_falling_back_to_cached_identity() {
+        // Regression (Auth Bypass): `login` treated a failed `find_user_by_username` the same as
+        // "no such user" (`if let Ok(Some(user))`). That lookup is what enforces the bootstrap
+        // root refusal; when it errored, the later durable read was only best-effort and the
+        // login fell through to `UserPassAuthMethod`, whose identity is hydrated from the
+        // account's *old* hash. So a transient storage fault could authenticate a bootstrap
+        // root (or an account since disabled) from a stale cached hash.
+        //
+        // The property: a failed account lookup denies the login.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+
+        let password = crate::test_support::generated_password();
+        service
+            .register_user("lookup-user", &password, None, vec![], vec![])
+            .await
+            .expect("register user");
+
+        backend
+            .fail_next_user_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let denied = service
+            .login(
+                ApiLoginRequest {
+                    username: "lookup-user".to_string(),
+                    password: password.clone(),
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await;
+        assert!(
+            denied.is_err(),
+            "a failed account lookup must deny the login, not authenticate from stale state"
+        );
+
+        // Guard the other direction: once storage recovers, the same valid credentials work, so
+        // the denial is a fail-closed response to the fault and not a broken login path.
+        let recovered = service
+            .login(
+                ApiLoginRequest {
+                    username: "lookup-user".to_string(),
+                    password,
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await
+            .expect("login must succeed after storage recovers");
+        assert!(!recovered.token.access_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transient_reservation_failure_does_not_consume_the_refresh_token() {
+        // Regression: when the shared reservation write failed, `reserve_refresh_token`
+        // returned the error but left the in-memory slot it had just inserted. The next
+        // request for the same token hit that slot and returned `InvalidToken` without ever
+        // retrying the backend, so a brief Redis/PostgreSQL blip during a refresh logged the
+        // user out for the whole reservation lifetime even after storage recovered. The
+        // error path must undo the local slot exactly as the `Ok(false)` path does.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+
+        let password = crate::test_support::generated_password();
+        service
+            .register_user("reservation-user", &password, None, vec![], vec![])
+            .await
+            .expect("register user");
+        let login = service
+            .login(
+                ApiLoginRequest {
+                    username: "reservation-user".to_string(),
+                    password,
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await
+            .expect("login");
+        let refresh = login.token.refresh_token.clone();
+
+        // The next reservation claim fails once, standing in for a storage outage.
+        backend
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let failed = service
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await;
+        assert!(
+            failed.is_err(),
+            "the injected storage failure must surface to the caller"
+        );
+        assert!(
+            backend.fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the reservation fault must actually have fired, or this test proves nothing"
+        );
+
+        // Storage has recovered; the same refresh token must still be exchangeable. Before
+        // the fix the local slot was left behind and this returned `InvalidToken`.
+        let exchanged = service
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await
+            .expect("a retry after a transient reservation failure must succeed");
+        assert!(!exchanged.access_token.is_empty());
+
+        // Reuse detection still holds: the exchanged token is now revoked.
+        assert!(
+            service
+                .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+                .await
+                .is_err(),
+            "a successfully exchanged refresh token must not be replayable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_token_outlives_its_reservation_only_until_its_own_expiry() {
+        // Regression (CWE-613): the reservation and the revocation were pinned to a fixed
+        // eight days. When `auth.jwt.refresh_expiration` was configured longer, the token
+        // outlived both guards, and a replay after eight days won the insert-if-absent race
+        // and was issued a fresh session. The guard is now derived from the token's own
+        // `exp`, so it lasts as long as the token remains valid and no longer.
+        //
+        // The deployment here is deliberately one of those: a 30-day refresh lifetime. The
+        // observable is the durable reservation the exchange leaves behind — it must reach
+        // the token's own deadline, not a shorter fixed window.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let storage: Arc<dyn StorageBackend + Send + Sync> = Arc::new(file_storage);
+        let root_key = secreton_crypto::generate_key(secreton_crypto::AlgorithmId::Aes256Gcm)
+            .expect("root key");
+        let service =
+            auth_with_storage_root_key_and_refresh_ttl(storage.clone(), root_key, 86_400 * 30)
+                .await;
+
+        let password = crate::test_support::generated_password();
+        service
+            .register_user("long-lived-user", &password, None, vec![], vec![])
+            .await
+            .expect("register user");
+        let login = service
+            .login(
+                ApiLoginRequest {
+                    username: "long-lived-user".to_string(),
+                    password,
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await
+            .expect("login");
+        let refresh = login.token.refresh_token.clone();
+
+        // The token really does carry the configured 30-day lifetime, so a fixed eight-day
+        // guard would be strictly shorter — this is the defect's precondition, asserted
+        // rather than assumed.
+        let claims = service
+            .token_service
+            .validate_refresh_token(&refresh)
+            .expect("refresh claims");
+        let token_expiry = i64::try_from(claims.exp)
+            .ok()
+            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+            .expect("token expiry as a timestamp");
+        assert!(
+            token_expiry > chrono::Utc::now() + chrono::Duration::days(8),
+            "precondition: the refresh lifetime must exceed the old fixed guard"
+        );
+
+        // Exchange it. A successful rotation leaves the reservation in place for the
+        // token's whole life (that permanence is what closes the cross-replica race).
+        service
+            .refresh_token(&refresh, "192.0.2.1".to_string(), "test".to_string())
+            .await
+            .expect("refresh");
+
+        // Read the durable reservation back. Before the fix its deadline was `now + 8 days`
+        // and the token outlived it; now it is the token's own deadline.
+        let path = AuthenticationService::refresh_reservation_path(&refresh);
+        let stored = storage
+            .get_by_path(&path)
+            .await
+            .expect("read reservation")
+            .expect("a successful exchange must leave its reservation in place");
+        let recorded = stored.expires_at.expect("the reservation must expire");
+        assert!(
+            recorded >= token_expiry - chrono::Duration::seconds(1),
+            "the reservation must last as long as the token, not on a shorter fixed \
+             window: recorded={recorded} token={token_expiry}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_root_created_under_a_custom_name_cannot_password_login() {
+        // CWE-287 regression: the root boundary was the literal username `"root"`. Once
+        // `init` accepted a custom `root_username`, the privileged account it created under
+        // another name kept a generated password hash and could log in with it. The
+        // boundary is now the account's persisted `password_login_disabled` flag.
+        let _env = crate::test_support::without_root_key();
+        let (storage, service, root_key) = auth_with_open_barrier().await;
+
+        const ROOT_USERNAME: &str = "vault-operator";
+        let root = service
+            .register_bootstrap_root(
+                ROOT_USERNAME,
+                Some("root@system.local".to_string()),
+                vec!["root".to_string(), "admin".to_string()],
+                vec!["*".to_string()],
+            )
+            .await
+            .expect("bootstrap root");
+        assert!(root.is_admin());
+        assert!(
+            root.password_hash.is_empty(),
+            "the bootstrap root must store no password hash at all"
+        );
+
+        // Plant a *valid* password hash on the record and in the in-memory userpass cache,
+        // so the account looks exactly like one that held a generated password. An empty
+        // hash alone would make this pass without the flag doing any work; a real hash
+        // proves the flag is the boundary the denial stands on. The password is generated
+        // per test rather than a literal: a fixed one is not a credential, but it reads
+        // like one to a scanner and models production wrongly.
+        let generated: String = crate::test_support::generated_password();
+        // The denial is not "this one known password is refused": it is that no password is
+        // accepted for this account. Probe with a spread of fresh random values plus the
+        // empty string, none of them a literal that reads like a committed credential.
+        let probes: Vec<String> = std::iter::once(String::new())
+            .chain(std::iter::once(generated.clone()))
+            .chain((0..3).map(|_| crate::test_support::generated_password()))
+            .collect();
+        // Control: the same password on an ordinary account really does log in, so a
+        // denial below cannot be explained by a password nobody can use.
+        service
+            .register_user(
+                "password-control",
+                &generated,
+                None,
+                vec!["admin".to_string()],
+                vec![],
+            )
+            .await
+            .expect("control account");
+        assert!(
+            service
+                .login(
+                    ApiLoginRequest {
+                        username: "password-control".to_string(),
+                        password: generated.clone(),
+                        mfa_code: None,
+                    },
+                    "192.0.2.1".to_string(),
+                    "test".to_string(),
+                )
+                .await
+                .is_ok(),
+            "the control account must be able to log in with the generated password"
+        );
+
+        // Now give the bootstrap root that same password: a valid hash both in the record
+        // and in the cache the login path reads.
+        let valid_hash = service
+            .userpass_method
+            .create_user(
+                "hash-probe".to_string(),
+                &generated,
+                "probe-id".to_string(),
+                vec![],
+                vec![],
+                vec![],
+            )
+            .await
+            .expect("hash the probe password");
+        service
+            .userpass_method
+            .add_user(
+                ROOT_USERNAME.to_string(),
+                valid_hash.clone(),
+                root.id.clone(),
+                root.roles.clone(),
+                root.policies.clone(),
+                root.permissions.clone(),
+                true,
+            )
+            .await;
+        let mut stored = root.clone();
+        stored.password_hash = valid_hash;
+        let bytes = serde_json::to_vec(&stored).expect("serialize");
+        let encrypted = service.crypto.encrypt_data(&bytes).await.expect("encrypt");
+        storage
+            .upsert(&secreton_storage::SecretEntry::new(
+                format!("{}{}", USER_STORAGE_PREFIX, ROOT_USERNAME),
+                encrypted,
+                secreton_storage::EncryptionMetadata::default(),
+                secreton_storage::SecurityLevel::Secret,
+                uuid::Uuid::parse_str(&root.id).unwrap_or_default(),
+            ))
+            .await
+            .expect("plant the hash on the record");
+        let _ = root_key;
+
+        // Every password-login entry point refuses it with the generic error.
+        for password in probes.iter().map(String::as_str) {
+            let login = service
+                .login(
+                    ApiLoginRequest {
+                        username: ROOT_USERNAME.to_string(),
+                        password: password.to_string(),
+                        mfa_code: None,
+                    },
+                    "192.0.2.1".to_string(),
+                    "test".to_string(),
+                )
+                .await;
+            let err = login.expect_err("password login must be refused");
+            let text = err.to_string();
+            assert!(
+                text.to_lowercase().contains("invalid credentials")
+                    || text.to_lowercase().contains("authentication failed"),
+                "the denial must stay generic, not name the account: {text}"
+            );
+            assert!(
+                !text.contains(ROOT_USERNAME),
+                "the denial must not echo the privileged username: {text}"
+            );
+
+            let authenticate = service
+                .authenticate(
+                    secreton_auth::LoginRequest {
+                        username: ROOT_USERNAME.to_string(),
+                        password: password.to_string(),
+                        mfa_code: None,
+                        remember_me: None,
+                    },
+                    "192.0.2.1".to_string(),
+                    "test".to_string(),
+                )
+                .await;
+            assert!(
+                authenticate.is_err(),
+                "authenticate() must refuse the bootstrap root too"
+            );
+
+            assert!(
+                !service
+                    .verify_password(ROOT_USERNAME, password)
+                    .await
+                    .expect("verify_password"),
+                "verify_password() must not accept a password for the bootstrap root"
+            );
+        }
+
+        // The account is untouched by those attempts: not locked, not mutated.
+        let reloaded = service
+            .find_user_by_username(ROOT_USERNAME)
+            .await
+            .expect("find")
+            .expect("the root account still exists");
+        assert_eq!(reloaded.failed_login_attempts, 0);
+        assert!(reloaded.locked_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_admin_named_root_can_still_password_login() {
+        // The boundary is the account, not the name. An ordinary admin who happens to be
+        // called "root" is not the bootstrap identity and must not be denied its password.
+        let _env = crate::test_support::without_root_key();
+        let (_storage, service, _root_key) = auth_with_open_barrier().await;
+
+        let ordinary_password = crate::test_support::generated_password();
+        service
+            .register_user(
+                "root",
+                &ordinary_password,
+                Some("ops@example.com".to_string()),
+                vec!["admin".to_string()],
+                vec![],
+            )
+            .await
+            .expect("ordinary admin");
+
+        assert!(
+            service
+                .verify_password("root", &ordinary_password)
+                .await
+                .expect("verify"),
+            "an ordinary admin account named 'root' is password-authenticatable"
+        );
+        let login = service
+            .login(
+                ApiLoginRequest {
+                    username: "root".to_string(),
+                    password: ordinary_password.clone(),
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await;
+        assert!(
+            login.is_ok(),
+            "an ordinary admin named 'root' must be able to log in: {:?}",
+            login.err().map(|e| e.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bootstrap_root_flag_survives_a_restart() {
+        // The denial must not depend on in-memory state: a service rebuilt over the same
+        // storage (a restart) must still refuse the bootstrap root, and the flag must be
+        // what does it. Deserialization of a record written before the field existed
+        // defaults to false, so this also proves the flag is actually persisted.
+        let _env = crate::test_support::without_root_key();
+        let (storage, service, root_key) = auth_with_open_barrier().await;
+
+        const ROOT_USERNAME: &str = "persisted-root";
+        service
+            .register_bootstrap_root(
+                ROOT_USERNAME,
+                None,
+                vec!["root".to_string(), "admin".to_string()],
+                vec!["*".to_string()],
+            )
+            .await
+            .expect("bootstrap root");
+
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        crypto
+            .set_root_key(root_key)
+            .await
+            .expect("reinstall the same root key so the existing records still decrypt");
+
+        let mut config = AuthConfig::default();
+        config.jwt.secret = Some("test_secret".to_string());
+        let restarted = AuthenticationService::new(storage.clone(), crypto, &config)
+            .await
+            .expect("rebuild the service over the same storage");
+
+        // The persisted record carries the flag, and the rebuilt service refuses login.
+        let user = restarted
+            .find_user_by_username(ROOT_USERNAME)
+            .await
+            .expect("find")
+            .expect("user");
+        assert!(
+            user.password_login_disabled,
+            "the non-password-authenticatable flag must be persisted on the record"
+        );
+        assert!(
+            !restarted
+                .verify_password(ROOT_USERNAME, &crate::test_support::generated_password())
+                .await
+                .expect("verify")
+        );
     }
 }
 

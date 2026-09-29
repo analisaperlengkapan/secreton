@@ -1,320 +1,365 @@
 # Model Data
 
-**Versi:** 1.0
-**Tanggal:** December 10, 2025
-**Referensi:** 01-spesifikasi-teknis.md, 02-model-aplikasi.md
+**Versi:** 2.0
+**Terakhir diperbarui:** 2026-09-21
+**Referensi:** [01-spesifikasi-teknis.md](01-spesifikasi-teknis.md), [02-model-aplikasi.md](02-model-aplikasi.md)
+**Status:** sesuai dengan tipe Rust yang benar-benar ada
+
+> Versi 1.0 dokumen ini memuat DDL PostgreSQL lengkap untuk tabel `users`, `secret_entries`,
+> dan `audit_logs`, beserta riwayat enam migrasi. Tidak ada DDL itu di repositori ini, dan
+> tidak ada file migrasi. Dokumen ini menggambarkan entitas seperti yang benar-benar
+> didefinisikan — sebagai struct Rust yang diserialisasi ke backend yang dipilih.
 
 ---
 
-## 1. Overview
+## 1. Cara Data Sebenarnya Disimpan
 
-Dokumen ini menjelaskan struktur yang menggambarkan bentuk dan keterhubungan informasi (dimensi/entitas) data dalam aplikasi.
+Secreton tidak memiliki skema relasional tetap. Yang ada adalah **satu trait storage** dan
+beberapa backend yang mengimplementasikannya:
 
----
-
-## 2. Logical Data Model
-
-### 2.1 Daftar Entitas
-
-| No | Nama Entitas | Deskripsi | Domain |
-|----|--------------|-----------|--------|
-| 1 | User | User accounts dan authentication data | Security |
-| 2 | SecretEntry | Encrypted secrets dengan metadata | Secrets |
-| 3 | Policy | Access control policies | Authorization |
-| 4 | AuditLog | Security event logs | Audit |
-| 5 | Token | Authentication tokens | Security |
-| 6 | Role | User roles untuk RBAC | Authorization |
-| 7 | Permission | Granular permissions | Authorization |
-
-### 2.2 Entity Relationship Diagram
-```
-┌─────────────────┐       ┌─────────────────┐
-│      User       │       │     Policy      │
-│                 │       │                 │
-│ • id (PK)       │1:N────│ • id (PK)       │
-│ • username      │       │ • name          │
-│ • email         │       │ • rules         │
-│ • role_id (FK)  │       │ • created_at    │
-│ • created_at    │       │ • updated_at    │
-│ • updated_at    │       └─────────────────┘
-└─────────┬───────┘               │
-          │                       │
-          │1:N                    │1:N
-          │                       │
-┌─────────▼───────┐       ┌───────▼─────────┐
-│  SecretEntry    │       │   AuditLog      │
-│                 │       │                 │
-│ • id (PK)       │       │ • id (PK)       │
-│ • path          │       │ • user_id (FK)  │
-│ • encrypted_data│       │ • action        │
-│ • owner_id (FK) │       │ • resource      │
-│ • version       │       │ • timestamp     │
-│ • created_at    │       │ • ip_address    │
-│ • updated_at    │       │ • user_agent    │
-│ • expires_at    │       └─────────────────┘
-└─────────────────┘               ▲
-          │                       │
-          │1:N                    │1:N
-          │                       │
-┌─────────▼───────┐       ┌───────▼─────────┐
-│     Token       │       │   Permission    │
-│                 │       │                 │
-│ • id (PK)       │       │ • id (PK)       │
-│ • user_id (FK)  │       │ • role_id (FK)  │
-│ • token_hash    │       │ • resource      │
-│ • expires_at    │       │ • action        │
-│ • created_at    │       │ • created_at    │
-└─────────────────┘       └─────────────────┘
-          ▲
-          │
-          │1:N
-          │
-┌─────────▼───────┐
-│      Role       │
-│                 │
-│ • id (PK)       │
-│ • name          │
-│ • description   │
-│ • created_at    │
-└─────────────────┘
+```rust
+pub trait StorageBackend: std::fmt::Debug + Send + Sync {
+    async fn store(&self, entry: &SecretEntry) -> StorageResult<()>;
+    async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>>;
+    async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>>;
+    async fn update(&self, entry: &SecretEntry) -> StorageResult<()>;
+    async fn delete_by_path(&self, path: &str) -> StorageResult<bool>;
+    async fn list(&self, params: &QueryParams) -> StorageResult<Vec<SecretEntry>>;
+    async fn count(&self, params: &QueryParams) -> StorageResult<u64>;
+    async fn begin_transaction(&self) -> StorageResult<Box<dyn StorageTransaction>>;
+    async fn health_check(&self) -> StorageResult<HealthStatus>;
+    async fn get_stats(&self) -> StorageResult<StorageStats>;
+    async fn migrate(&self) -> StorageResult<()>;
+    // ...
+}
 ```
 
-### 2.3 Detail Entitas
+Konsekuensinya untuk pembaca dokumen ini:
 
-#### 2.3.1 User
-
-**Deskripsi:** Representasi user account dalam sistem dengan informasi authentication.
-
-**Atribut:**
-| No | Nama Atribut | Deskripsi | Mandatory |
-|----|--------------|-----------|-----------|
-| 1 | id | Unique identifier (UUID) | Ya |
-| 2 | username | Login username | Ya |
-| 3 | email | Email address | Ya |
-| 4 | password_hash | Hashed password | Ya |
-| 5 | role_id | Reference to user role | Ya |
-| 6 | mfa_enabled | MFA status flag | Tidak |
-| 7 | last_login | Last login timestamp | Tidak |
-| 8 | created_at | Account creation time | Ya |
-| 9 | updated_at | Last update time | Ya |
-
-**Relasi:**
-| Entitas Terkait | Tipe Relasi | Deskripsi |
-|-----------------|-------------|-----------|
-| Role | N:1 | User belongs to one role |
-| SecretEntry | 1:N | User owns multiple secrets |
-| Token | 1:N | User has multiple tokens |
-| AuditLog | 1:N | User generates audit events |
-
-#### 2.3.2 SecretEntry
-
-**Deskripsi:** Core entity untuk menyimpan encrypted secrets dengan metadata lengkap.
-
-**Atribut:**
-| No | Nama Atribut | Deskripsi | Mandatory |
-|----|--------------|-----------|-----------|
-| 1 | id | Unique identifier (UUID) | Ya |
-| 2 | path | Hierarchical path (e.g., secret/myapp/db) | Ya |
-| 3 | encrypted_data | AES-256-GCM encrypted data | Ya |
-| 4 | encryption_metadata | Key info, IV, auth tag | Ya |
-| 5 | owner_id | Reference to owner user | Ya |
-| 6 | security_level | Security classification | Ya |
-| 7 | version | Version number for updates | Ya |
-| 8 | tags | Searchable tags (JSON array) | Tidak |
-| 9 | created_at | Creation timestamp | Ya |
-| 10 | updated_at | Last update timestamp | Ya |
-| 11 | expires_at | Optional expiration time | Tidak |
-
-**Relasi:**
-| Entitas Terkait | Tipe Relasi | Deskripsi |
-|-----------------|-------------|-----------|
-| User | N:1 | Secret owned by one user |
-| AuditLog | 1:N | Secret operations logged |
-
-### 2.4 Keterhubungan Antar Entitas
-
-| No | Entitas Asal | Entitas Tujuan | Kardinalitas | Deskripsi |
-|----|--------------|----------------|--------------|-----------|
-| 1 | User | Role | N:1 | Multiple users can have same role |
-| 2 | User | SecretEntry | 1:N | One user can own multiple secrets |
-| 3 | User | Token | 1:N | One user can have multiple active tokens |
-| 4 | User | AuditLog | 1:N | One user generates multiple audit events |
-| 5 | Role | Permission | 1:N | One role grants multiple permissions |
-| 6 | Policy | User | N:1 | Policy applies to multiple users |
-| 7 | SecretEntry | AuditLog | 1:N | Secret operations create audit trail |
+- **Tidak ada SQL yang bisa dibaca sebagai "skema".** Backend PostgreSQL menyimpan tipe
+  Rust ini; struct-nya adalah definisi skema.
+- **Tidak ada riwayat migrasi bernomor.** `migrate()` adalah method pada trait, dipanggil
+  oleh `Services::start()`; ia membuat apa yang dibutuhkan backend, bukan menjalankan
+  daftar migrasi berversi.
+- **Tidak ada transaksi yang diam-diam hilang.** Backend in-memory sebelumnya mengembalikan
+  transaksi yang `store`/`update`/`delete`-nya adalah no-op `Ok(())`, sehingga pemanggil
+  yang melakukan commit diberi tahu bahwa operasinya berhasil. Sekarang ada test
+  `rolled_back_transaction_writes_are_discarded`: apa yang ditulis di dalam transaksi yang
+  di-rollback harus tidak terlihat.
 
 ---
 
-## 3. Physical Data Model
+## 2. Entitas
 
-### 3.1 Database Schema
+### 2.1 Ringkasan
 
-**Database:** secreton
-**DBMS:** PostgreSQL 15+
-**Character Set:** UTF-8
+| Entitas | Sumber | Peran |
+|---------|--------|-------|
+| `SecretEntry` | `crates/storage/src/lib.rs` | Unit penyimpanan inti |
+| `User` | `crates/auth/src/model.rs` | Akun dan identitas |
+| `Policy` | `crates/auth/src/policies/model.rs` | Aturan akses sebagai kode |
+| `Token` | `crates/auth/src/token/core.rs` | Token yang diterbitkan |
+| `AuditEvent` | `crates/domain/src/audit.rs` | Jejak peristiwa keamanan |
+| `OAuthState` | `crates/domain/src/models/oauth_state.rs` | State OIDC jangka pendek |
+| `SecurityLevel` | `crates/domain/src/security.rs` | Klasifikasi keamanan |
 
-### 3.2 Tabel/Collection Definitions
+Semua entitas ini adalah nilai Rust biasa dengan `Serialize`/`Deserialize`. Tidak ada tabel
+`roles` atau `permissions` terpisah seperti pada versi 1.0: role dan permission adalah
+`Vec<String>` di dalam `User`.
 
-#### 3.2.1 users
+### 2.2 SecretEntry
 
-**Deskripsi:** User account information dan authentication data.
-**Source:** `crates/auth/src/models.rs`
+`crates/storage/src/lib.rs`
 
-| No | Kolom | Tipe Data | Constraints | Default | Deskripsi |
-|----|-------|-----------|-------------|---------|-----------|
-| 1 | id | UUID | PK, NOT NULL | uuid_generate_v4() | Primary key |
-| 2 | username | VARCHAR(255) | UNIQUE, NOT NULL | - | Login username |
-| 3 | email | VARCHAR(255) | UNIQUE, NOT NULL | - | Email address |
-| 4 | password_hash | TEXT | NOT NULL | - | Argon2 hashed password |
-| 5 | role_id | UUID | FK(users.id), NOT NULL | - | Reference to roles table |
-| 6 | mfa_enabled | BOOLEAN | NOT NULL | false | MFA status |
-| 7 | mfa_secret | TEXT | - | - | TOTP secret (encrypted) |
-| 8 | last_login | TIMESTAMP | - | - | Last successful login |
-| 9 | login_attempts | INTEGER | NOT NULL | 0 | Failed login counter |
-| 10 | locked_until | TIMESTAMP | - | - | Account lock timestamp |
-| 11 | created_at | TIMESTAMP | NOT NULL | CURRENT_TIMESTAMP | Creation time |
-| 12 | updated_at | TIMESTAMP | NOT NULL | CURRENT_TIMESTAMP | Last update |
+| Field | Tipe | Keterangan |
+|-------|------|------------|
+| `id` | `Uuid` | Identifier unik |
+| `path` | `String` | Path hierarkis, mis. `secret/myapp/db` |
+| `encrypted_data` | `Vec<u8>` | Payload terenkripsi (barrier) |
+| `encryption_metadata` | `EncryptionMetadata` | Info kunci, nonce, auth tag |
+| `security_level` | `SecurityLevel` | Klasifikasi |
+| `metadata` | `HashMap<String, String>` | Metadata tambahan |
+| `tags` | `Vec<String>` | Kategorisasi dan pencarian |
+| `version` | `u32` | Nomor versi KV v2 |
+| `owner_id` | `Uuid` | Pemilik |
+| `created_at` | `DateTime<Utc>` | Waktu pembuatan |
+| `updated_at` | `DateTime<Utc>` | Waktu perubahan terakhir |
+| `expires_at` | `Option<DateTime<Utc>>` | Kedaluwarsa opsional |
 
-**Indexes:**
-| Nama Index | Kolom | Tipe | Unique |
-|------------|-------|------|--------|
-| idx_users_username | username | B-Tree | Ya |
-| idx_users_email | email | B-Tree | Ya |
-| idx_users_role_id | role_id | B-Tree | Tidak |
-| idx_users_created_at | created_at | B-Tree | Tidak |
+Catatan penting: `encrypted_data` adalah `Vec<u8>` (blob), bukan teks terenkripsi yang bisa
+dibaca. Konversi ke dan dari plaintext hanya terjadi di dalam barrier kriptografi.
 
-**Foreign Keys:**
-| Kolom | Referensi | On Delete | On Update |
-|-------|-----------|-----------|-----------|
-| role_id | roles(id) | CASCADE | CASCADE |
+### 2.3 User
 
-#### 3.2.2 secret_entries
+`crates/auth/src/model.rs`
 
-**Deskripsi:** Encrypted secrets dengan full metadata.
-**Source:** `crates/storage/src/lib.rs`
+| Field | Tipe | Keterangan |
+|-------|------|------------|
+| `id` | `String` | Identifier (bukan `Uuid` seperti pada entitas lain) |
+| `username` | `String` | Login |
+| `email` | `Option<String>` | Opsional |
+| `display_name` / `full_name` | `Option<String>` | Nama tampilan |
+| `roles` | `Vec<String>` | Role yang dimiliki |
+| `permissions` | `Vec<String>` | Permission eksplisit |
+| `policies` | `Vec<String>` | Policy yang melekat |
+| `metadata` | `HashMap<String, String>` | Metadata |
+| `password_hash` | `String` | Hash Argon2id; kosong untuk bootstrap root |
+| `password_login_disabled` | `bool` | `true` hanya untuk bootstrap root (default `false` untuk record lama) |
+| `mfa_enabled` | `bool` | Status MFA |
+| `mfa_secret` | `Option<String>` | Rahasia TOTP |
+| `disabled`, `enabled`, `is_active` | `bool` | Flag status |
+| `is_superuser` | `bool` | Superuser |
+| `failed_login_attempts` | `u32` | Penghitung percobaan gagal |
+| `locked_until` | `Option<DateTime<Utc>>` | Akun terkunci sampai waktu ini |
+| `created_at`, `updated_at` | `DateTime<Utc>` | Timestamp |
+| `last_login` | `Option<DateTime<Utc>>` | Login terakhir |
 
-| No | Kolom | Tipe Data | Constraints | Default | Deskripsi |
-|----|-------|-----------|-------------|---------|-----------|
-| 1 | id | UUID | PK, NOT NULL | uuid_generate_v4() | Primary key |
-| 2 | path | TEXT | NOT NULL | - | Hierarchical path |
-| 3 | encrypted_data | BYTEA | NOT NULL | - | Encrypted payload |
-| 4 | encryption_metadata | JSONB | NOT NULL | - | Encryption details |
-| 5 | owner_id | UUID | FK(users.id), NOT NULL | - | Owner user ID |
-| 6 | security_level | VARCHAR(50) | NOT NULL | 'standard' | Security classification |
-| 7 | version | INTEGER | NOT NULL | 1 | Version counter |
-| 8 | tags | JSONB | - | - | Search tags |
-| 9 | metadata | JSONB | - | - | Additional metadata |
-| 10 | created_at | TIMESTAMP | NOT NULL | CURRENT_TIMESTAMP | Creation time |
-| 11 | updated_at | TIMESTAMP | NOT NULL | CURRENT_TIMESTAMP | Last update |
-| 12 | expires_at | TIMESTAMP | - | - | Expiration time |
+Root tidak memiliki login password. `init` menerima `root_username` dan membuat akun root
+dengan nama tersebut; identitasnya disimpan agar `unseal` menerbitkan token untuk akun itu,
+bukan untuk nama tetap `"root"`. Token tersebut berlaku satu jam (TTL bootstrap tetap, tidak
+mengikuti session timeout yang dapat dikonfigurasi), dan hanya setelah threshold share
+tercapai. Jika penerbitan token gagal setelah barrier terbuka, ulangi panggilan `unseal`
+selama proses belum restart; vault tetap terbuka di memori. Retry itu tidak menghidupkan
+kembali master key dan tidak butuh threshold share lagi, tetapi tetap menuntut bukti
+kepemilikan salah satu share yang tadi membuka barrier: satu share yang valid sudah cukup.
+Tanpa bukti itu, flag pending saja tidak boleh menerbitkan kredensial — `sys/unseal` adalah
+route publik, dan menerbitkan token paling istimewa di sistem hanya karena sebuah flag akan
+menjadikannya jalur eskalasi tanpa autentikasi.
+Retry ini tidak bertahan melewati restart: root key hanya ada di memori, sehingga setelah
+restart vault harus di-unseal kembali dengan share-nya.
 
-**Indexes:**
-| Nama Index | Kolom | Tipe | Unique |
-|------------|-------|------|--------|
-| idx_secret_entries_path | path | GIN | Tidak |
-| idx_secret_entries_owner_id | owner_id | B-Tree | Tidak |
-| idx_secret_entries_created_at | created_at | B-Tree | Tidak |
-| idx_secret_entries_expires_at | expires_at | B-Tree | Tidak |
-| idx_secret_entries_tags | tags | GIN | Tidak |
+`init` bersifat bertahap (staged). Sebuah marker di `sys/init_staging` ditulis sebelum
+artefak durabel pertama (`sys/init`, `sys/root_key_enc`, `sys/root_identity`, akun root dan
+enrollment TOTP) dan dihapus paling akhir. Selama marker ada, vault dianggap belum
+terinisialisasi: `is_initialized()` mengembalikan false walaupun `sys/init` sudah tertulis.
+Jika salah satu langkah gagal, `init` menghapus state parsial itu dan mengembalikan error
+aslinya, sehingga pemanggilan `init` berikutnya berhasil tanpa restart atau pembersihan
+manual — shares tidak pernah diterima operator pada percobaan yang gagal, jadi state
+setengah jadi tidak boleh terlihat permanen. Marker tidak menyimpan share, token, password,
+JWT secret, atau root key; ia hanya mencatat nama akun root dan id entitas untuk menemukan
+record TOTP yang perlu dibersihkan.
 
-**Foreign Keys:**
-| Kolom | Referensi | On Delete | On Update |
-|-------|-----------|-----------|-----------|
-| owner_id | users(id) | CASCADE | CASCADE |
+Marker dihapus paling akhir dan hanya jika seluruh artefak wajib benar-benar terhapus.
+Selama satu delete gagal, marker tetap ada dan `init` mengembalikan error, sehingga percobaan
+berikutnya mengulang pembersihan yang sama. Path yang tidak ada dihitung sukses (idempoten);
+vault yang sudah committed tidak pernah dihapus artefaknya. Setiap penghapusan diverifikasi
+dengan membaca ulang path tersebut: `delete_by_path` mengembalikan `true` hanya jika record
+benar-benar ada dan dihapus oleh panggilan itu, dan `false` jika tidak ada — nilai itu
+dipakai untuk mencocokkan id record, bukan untuk menyimpulkan path sekarang kosong, karena
+sebuah backend yang gagal menghapus tetap melaporkan `false`. Marker memakai `upsert` pada
+backend satu proses (harus ditulis beberapa kali, dan PostgreSQL menolak insert kedua ke
+`path` yang sama), dan `compare_and_set` dengan precondition pemilik pada backend bersama.
 
-#### 3.2.3 audit_logs
+Inisialisasi diserialkan dalam satu proses oleh sebuah async mutex yang dipegang untuk
+seluruh urutan (recovery, guard `is_initialized`, staging, penulisan, commit, penghapusan
+marker, dan cleanup). Dua pemanggilan `init` yang bersamaan karenanya menghasilkan tepat satu
+pemenang; pemanggilan lainnya ditolak dengan aman.
 
-**Deskripsi:** Comprehensive audit trail untuk semua security events.
-**Source:** `crates/security/src/audit.rs`
+Jaminan lintas proses bergantung pada kemampuan backend, yang dinyatakan oleh
+`StorageBackend::coordination()`. Backend yang memang bisa dipakai bersama
+(`CrossProcess` — PostgreSQL, Redis, file dengan direktori bersama) mengimplementasikan
+`compare_and_set`, `delete_owned`, dan `store_fenced` secara atomik; `init` mengambil lease
+di `sys/init_lease` dengan insert-if-absent (`Expect::Absent`), yang hanya dapat dimenangkan
+satu pemanggil, dan melepasnya di akhir dengan `delete_owned` yang hanya berlaku selama
+lease itu masih miliknya. Lease yang kedaluwarsa boleh diambil alih hanya lewat penulisan
+bersyarat terhadap token pemilik yang benar-benar ada, sehingga replika yang mati di tengah
+inisialisasi tidak memblokir recovery selamanya dan lease yang masih hidup tidak dicuri.
 
-| No | Kolom | Tipe Data | Constraints | Default | Deskripsi |
-|----|-------|-----------|-------------|---------|-----------|
-| 1 | id | UUID | PK, NOT NULL | uuid_generate_v4() | Primary key |
-| 2 | user_id | UUID | FK(users.id) | - | User who performed action |
-| 3 | action | VARCHAR(100) | NOT NULL | - | Action performed |
-| 4 | resource | TEXT | NOT NULL | - | Resource affected |
-| 5 | resource_id | UUID | - | - | Specific resource ID |
-| 6 | ip_address | INET | - | - | Client IP address |
-| 7 | user_agent | TEXT | - | - | Client user agent |
-| 8 | success | BOOLEAN | NOT NULL | true | Action success status |
-| 9 | error_message | TEXT | - | - | Error details if failed |
-| 10 | metadata | JSONB | - | - | Additional context |
-| 11 | timestamp | TIMESTAMP | NOT NULL | CURRENT_TIMESTAMP | Event time |
+Setiap penulisan artefak initialization (`sys/init`, root key terenkripsi, akun bootstrap,
+enrollment TOTP, root identity, staging marker, dan commit) memakai `store_fenced`, bukan
+`store` yang didahului sebuah pemeriksaan. Perbedaannya penting: `check()` hanya membaca
+flag in-memory, jadi sebuah attempt dapat kehilangan lease tepat setelah check-nya lulus dan
+tetap menulis — dan pada Redis penulisan itu menyetel ulang mapping `path`, sehingga shares
+yang dikembalikan pemenang tidak lagi membuka root key yang diselesaikan path tersebut.
+`store_fenced` memindahkan precondition ke dalam penulisan itu sendiri, di backend bersama:
+fence menamai record lease dan token attempt, dan backend mengevaluasi keduanya bersama
+penulisan sebagai satu langkah tak terbagi. Attempt yang sudah kehilangan lease karena itu
+tidak dapat menulis sama sekali; tidak ada API yang dapat dipakai untuk menulis tanpa fence
+aktif. Backend yang tidak mampu menegakkan fence menolak operasi ini dengan
+`StorageError::Unsupported`, dan `init` memperlakukannya sebagai kegagalan keras alih-alih
+kembali ke penulisan tanpa syarat.
 
-**Indexes:**
-| Nama Index | Kolom | Tipe | Unique |
-|------------|-------|------|--------|
-| idx_audit_logs_user_id | user_id | B-Tree | Tidak |
-| idx_audit_logs_action | action | B-Tree | Tidak |
-| idx_audit_logs_timestamp | timestamp | B-Tree | Tidak |
-| idx_audit_logs_resource | resource | GIN | Tidak |
+Rollback, commit, dan penghapusan marker juga bersyarat pada token pemilik, jadi cleanup
+yang basi tidak dapat menghapus artefak percobaan yang lebih baru. Backend yang tidak dapat
+memisahkan proses (`SingleProcess` — memory, Raft single-node) melaporkan demikian, dan
+mutex dalam proses adalah jaminan lengkapnya karena tidak ada replika kedua yang dapat
+berbagi backend itu.
 
-**Foreign Keys:**
-| Kolom | Referensi | On Delete | On Update |
-|-------|-----------|-----------|-----------|
-| user_id | users(id) | SET NULL | CASCADE |
+Semua backend `CrossProcess` memakai compare-and-set yang benar-benar atomik: PostgreSQL
+memakai `ON CONFLICT ... DO UPDATE ... WHERE` dalam satu statement, dan `store_fenced`
+memakai CTE `fence` yang men-`SELECT` record lease dengan `FOR SHARE` sehingga baris lease
+terkunci selama statement berjalan — fence dan penulisan artefak menjadi satu langkah tak
+terbagi, dan takeover yang sedang berjalan (belum commit) memblokir penulisan basi alih-alih
+tak terlihat olehnya. Redis memakai satu skrip Lua untuk operasi maupun fence, dan file
+memakai OS advisory lock serta rename atomik. Tidak ada implementasi
+yang memakai `upsert` read-then-write (yang tidak atomik) sebagai kunci, dan backend yang
+tidak mampu mengembalikan `StorageError::Unsupported` alih-alih kunci palsu — `init`
+memperlakukannya sebagai kegagalan keras.
 
-### 3.3 Enum/Type Definitions
+Vault yang dibuat sebelum `sys/root_identity` ada tetap dapat dipakai. Setelah barrier
+terbuka, jika tidak ada record identitas, `unseal` mencari akun legacy bernama `root`,
+memverifikasi bahwa akun itu benar-benar ada dan privileged, menandainya
+non-password-authenticatable, lalu mem-persist identitas tersebut agar permintaan berikutnya
+tidak bergantung pada fallback. Record identitas yang corrupt atau error storage dilaporkan
+sebagai error dan tidak pernah berubah menjadi fallback ke akun lain.
 
-#### 3.3.1 security_level
+Lockout: setelah 5 percobaan gagal, akun non-privileged dikunci selama 15 menit
+(`crates/engines/src/services/auth.rs`). Akun privileged sengaja tidak dikunci dengan cara
+ini, agar serangan denial-of-service tidak dapat mengunci keluar administrator.
 
-**Source:** `crates/core/src/types.rs`
+### 2.4 Policy
 
-| Value | Deskripsi |
-|-------|-----------|
-| public | Publicly accessible data |
-| internal | Internal system data |
-| confidential | Sensitive business data |
-| restricted | Highly sensitive data |
-| top_secret | Most sensitive data |
+`crates/auth/src/policies/model.rs`
 
-#### 3.3.2 user_role
+| Field | Tipe |
+|-------|------|
+| `id` | `Uuid` |
+| `name` | `String` |
+| `policy_type` | `PolicyType` |
+| `effect` | `PolicyEffect` (allow/deny) |
+| `rules` | `Vec<PolicyRule>` |
+| `metadata` | `HashMap<String, String>` |
+| `created_at`, `updated_at` | `DateTime<Utc>` |
 
-**Source:** `crates/auth/src/lib.rs`
+`PolicyRule` diparse oleh grammar Pest di `policies/policy_grammar.pest` — policy adalah
+bahasa tersendiri, bukan string yang dicocokkan.
 
-| Value | Deskripsi |
-|-------|-----------|
-| admin | Full system access |
-| secret_admin | Secret management access |
-| key_manager | Key management access |
-| crypto_user | Cryptography operations |
-| auditor | Read-only audit access |
-| read_only | Read-only access |
+### 2.5 Token
 
-### 3.4 Migration History
+`crates/auth/src/token/core.rs`
 
-| Version | Tanggal | Deskripsi | Status |
-|---------|---------|-----------|--------|
-| 001 | 2025-01-01 | Initial schema creation | Applied |
-| 002 | 2025-02-15 | Add audit logging table | Applied |
-| 003 | 2025-03-01 | Add MFA support | Applied |
-| 004 | 2025-04-01 | Add secret versioning | Applied |
-| 005 | 2025-05-01 | Add policy engine | Applied |
-| 006 | 2025-06-01 | Add replication support | Pending |
+| Field | Tipe | Keterangan |
+|-------|------|------------|
+| `id` | `Uuid` | Identifier |
+| `accessor` | `String` | Accessor untuk revoke tanpa mengekspos token |
+| `entity_id` | `Option<Uuid>` | Entitas pemilik |
+| `token_type` | `TokenType` | Jenis token |
+| `policies` | `Vec<String>` | Policy yang berlaku |
+| `creation_time`, `expiry_time` | `DateTime<Utc>`, `Option<…>` | Masa berlaku |
+| `last_renewal_time` | `Option<DateTime<Utc>>` | Renewal terakhir |
+| `status` | `TokenStatus` | Status |
+| `renewable` | `bool` | Dapat diperbarui |
+| `explicit_max_ttl` | `Option<Duration>` | Batas atas |
+| `num_uses`, `remaining_uses` | `Option<u32>` | Kuota pemakaian |
+
+Token disimpan berdasarkan accessor, sehingga revocation tidak memerlukan penyimpanan nilai
+token itu sendiri.
+
+Refresh token hanya boleh ditukar sekali, dan jaminan itu berlaku lintas replika: klaim
+single-use ("reservation") diambil di backend bersama sebelum kerja apa pun yang bisa gagal,
+di path yang diturunkan dari hash token — bukan token itu sendiri — dengan insert-if-absent.
+Penukaran yang gagal melepas klaim secara owner-conditional, sehingga klaim percobaan lain
+yang sudah mengambilnya tidak ikut terhapus; kegagalan storage sementara juga melepas slot
+in-memory, sehingga percobaan ulang setelah fault tetap bisa berhasil. Penukaran yang berhasil
+meninggalkan klaim itu sebagai revocation permanen, sehingga token yang sama tidak bisa ditukar
+lagi.
+
+Masa berlaku reservation dan revocation diturunkan dari `exp` token itu sendiri, bukan dari
+offset tetap. Token mengikuti `auth.jwt.refresh_expiration`, jadi konfigurasi lebih dari
+delapan hari tidak lagi membuat guard kedaluwarsa sebelum token. Backend yang tidak dapat
+berkoordinasi lintas proses (`Coordination::SingleProcess`) memakai reservation in-memory
+saja, dan itu adalah jaminan lengkapnya karena tidak ada replika kedua.
+
+### 2.6 AuditEvent
+
+`crates/domain/src/audit.rs`
+
+| Field | Tipe | Keterangan |
+|-------|------|------------|
+| `id` | `Uuid` | Identifier |
+| `timestamp` | `DateTime<Utc>` | Waktu kejadian |
+| `event_type` | `String` | Nama bertitik, mis. `secret.read`, `auth.login` |
+| `actor` | `String` | Pelaku, atau `"anonymous"` untuk percobaan tanpa autentikasi |
+| `resource` | `String` | Sumber daya, mis. path secret |
+| `action` | `String` | Aksi |
+| `outcome` | `AuditOutcome` | Hasil |
+| `client_ip` | `Option<String>` | Alamat klien sesuai konfigurasi trusted proxy |
+| `request_id` | `Option<String>` | Mengaitkan dengan `x-request-id` pada request asal |
+| `metadata` | `HashMap<String, Value>` | Konteks tambahan |
+
+`request_id` adalah yang menghubungkan baris log server dengan entri audit untuk permintaan
+yang sama, dan `actor` bernilai `"anonymous"` pada jalur penolakan — jalur yang justru
+paling penting untuk tercatat.
+
+### 2.7 SecurityLevel
+
+`crates/domain/src/security.rs`
+
+| Nilai | Angka | Arti |
+|-------|------:|------|
+| `Public` | 0 | Tanpa kontrol keamanan |
+| `Internal` | 1 | Kontrol akses dasar (default) |
+| `Confidential` | 2 | Akses terbatas |
+| `Secret` | 3 | Sangat terbatas |
+| `TopSecret` | 4 | Kontrol maksimum |
+
+Angka ini adalah nilai ordinal, sehingga perbandingan tingkat dapat dilakukan langsung.
 
 ---
 
-## 4. Data Validation Rules
+## 3. Keterhubungan Antar Entitas
 
-### 4.1 Business Rules
+```
+        ┌──────────┐
+        │  User    │
+        │          │
+        │ roles[]  │◀──┐ (referensi berdasarkan nama, bukan foreign key)
+        │ perms[]  │   │
+        └────┬─────┘   │
+             │         │
+             │ owner_id │ policies[]
+             ▼         │
+     ┌───────────────┐ │   ┌──────────┐
+     │ SecretEntry   │ │   │  Policy  │
+     │               │ └───│          │
+     │ version       │     │ rules[]  │
+     │ encrypted_data│     └──────────┘
+     └───────┬───────┘
+             │
+             │ (setiap operasi memancarkan)
+             ▼
+     ┌───────────────┐        ┌──────────┐
+     │  AuditEvent   │        │  Token   │
+     │  actor        │        │ accessor │
+     │  request_id   │        │ policies │
+     └───────────────┘        └──────────┘
+```
 
-| No | Rule | Entitas/Kolom | Implementasi |
-|----|------|---------------|--------------|
-| 1 | Username uniqueness | users.username | UNIQUE constraint |
-| 2 | Email format validation | users.email | Application validation |
-| 3 | Path hierarchy | secret_entries.path | Application validation |
-| 4 | Version increment | secret_entries.version | Trigger function |
-| 5 | Token expiration | tokens.expires_at | Background cleanup job |
-| 6 | Audit immutability | audit_logs.* | No UPDATE permission |
+Tidak ada foreign key yang dipaksakan oleh database. Relasi dinyatakan sebagai identifier
+di dalam nilai, dan integritasnya dijaga oleh service di `secreton-engines`. Backend
+in-memory dan file tidak memiliki konsep foreign key sama sekali, jadi mengandalkannya akan
+membuat backend tersebut tidak dapat mengimplementasikan trait yang sama.
 
-### 4.2 Constraint Rules
+---
 
-| No | Constraint | Tabel | Kolom | Deskripsi |
-|----|------------|-------|-------|-----------|
-| 1 | CHECK | users | login_attempts | >= 0 |
-| 2 | CHECK | secret_entries | version | > 0 |
-| 3 | CHECK | secret_entries | expires_at | > created_at |
-| 4 | CHECK | tokens | expires_at | > created_at |
-| 5 | UNIQUE | users | (username) | Unique username |
-| 6 | UNIQUE | users | (email) | Unique email |</content>
-<parameter name="filePath">/home/clouduser/secreton/secreton/docs/architecture/04-model-data.md
+## 4. Aturan Validasi
+
+| Aturan | Di mana |
+|--------|---------|
+| Password mengikuti `PasswordPolicy` | `crates/domain/src/password.rs`, diterapkan saat pembuatan user |
+| Konfigurasi divalidasi saat startup | `ServerConfig::validate()`, sebelum apa pun berjalan |
+| Secret JWT minimum 32 byte | `validate()`; proses berhenti jika lebih pendek |
+| Origin CORS wildcard ditolak | `validate()` |
+| Timeout nol ditolak | `validate()` |
+| Transaksi yang di-rollback dibuang | Test `rolled_back_transaction_writes_are_discarded` |
+| Bytes cache yang rusak ditolak | Round-trip test `postcard`; bytes yang rusak tidak boleh didekode menjadi entri parsial lalu dikembalikan sebagai cache hit |
+| Token hanya HS256 | `Validation::new(Algorithm::HS256)`, dipin oleh `only_hs256_tokens_are_accepted` |
+
+---
+
+## 5. Catatan tentang Versi 1.0 Dokumen Ini
+
+Untuk kejelasan, hal-hal berikut ada di versi 1.0 tetapi **tidak** ada di kode:
+
+- DDL untuk tabel `users`, `secret_entries`, `audit_logs`, `tokens`, `roles`, `permissions`.
+- Index (B-Tree, GIN) dan foreign key dengan `ON DELETE CASCADE`.
+- Riwayat migrasi 001–006 dengan status "Applied"/"Pending".
+- Tabel terpisah untuk `Role` dan `Permission`.
+- Enum `user_role` sebagai tipe tertutup dengan nilai `secret_admin`, `key_manager`,
+  `crypto_user`, `auditor`, `read_only` — role adalah `Vec<String>` bebas, dan helper seperti
+  `is_root()`/`is_admin()` mengenali nama tertentu tapi tidak membatasi daftarnya pada satu
+  enum.
+- Tipe database `INET` dan `JSONB`.
+
+Jika salah satu dari ini diinginkan, ia harus ditambahkan ke kode terlebih dahulu, lalu
+dokumen ini diperbarui.

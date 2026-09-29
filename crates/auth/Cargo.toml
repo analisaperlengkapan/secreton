@@ -17,6 +17,12 @@ workspace = true
 [dependencies]
 secreton-crypto.workspace = true
 secreton-domain.workspace = true
+# Only for [`secreton_storage::StorageFence`] on the ownership-fenced MFA enrollment path.
+# This crate sits above `storage` in the layering, so the dependency direction is allowed,
+# and `secreton-auth` is not part of the `wasm32` build (`crates/ui` reaches it only through
+# `secreton-engines` behind the `ssr` feature), so it cannot leak a server-only type into
+# the UI build.
+secreton-storage.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

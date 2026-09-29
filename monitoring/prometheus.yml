@@ -1,26 +1,21 @@
+# Prometheus scrape configuration for Secreton.
+#
+# The previous version of this file scraped `secreton-backend:9090` — a hostname that
+# appears in no compose file or deployment, on a port the server never bound. It also
+# listed Redis and PostgreSQL as scrape targets, which expose no Prometheus endpoint.
+# Both silently produced `up == 0` forever.
+#
+# Secreton serves its own metrics on the same single port as everything else, so the
+# target is the application service itself. Adjust the hostname to match wherever
+# Prometheus runs: `secreton` if in the compose network, or the pod/service name in
+# Kubernetes.
+
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
-rule_files:
-  # - "first_rules.yml"
-  # - "second_rules.yml"
-
 scrape_configs:
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
-
   - job_name: 'secreton'
-    static_configs:
-      - targets: ['secreton-backend:9090']
     metrics_path: '/metrics'
-    scrape_interval: 5s
-
-  - job_name: 'redis'
     static_configs:
-      - targets: ['redis:6379']
-
-  - job_name: 'postgres'
-    static_configs:
-      - targets: ['postgres:5432']
+      - targets: ['secreton:3000']

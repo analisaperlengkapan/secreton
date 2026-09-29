@@ -1,221 +1,251 @@
 # Model Infrastruktur
 
-**Versi:** 1.0
-**Tanggal:** December 10, 2025
-**Referensi:** 01-spesifikasi-teknis.md, 02-model-aplikasi.md
+**Versi:** 2.0
+**Terakhir diperbarui:** 2026-09-21
+**Referensi:** [01-spesifikasi-teknis.md](01-spesifikasi-teknis.md), [02-model-aplikasi.md](02-model-aplikasi.md)
+**Status:** sesuai dengan kode di `main`
+
+> Versi 1.0 dokumen ini menggambarkan tumpukan Nginx di depan proses, Grafana, delapan port
+> berbeda, dan aturan firewall antara layanan-layanan yang tidak ada. Dokumen ini
+> menggantikannya dengan infrastruktur yang benar-benar dijalankan dan diuji.
 
 ---
 
-## 1. Overview
+## 1. Prinsip
 
-Dokumen ini menjelaskan kerangka kerja yang mencakup semua komponen teknologi dan sumber daya yang diperlukan untuk mendukung pelaksanaan layanan secara digital.
+Tiga hal membentuk seluruh model infrastruktur:
 
----
-
-## 2. Model Infrastruktur Pusat Data/Komputasi Awan/Server
-
-### 2.1 Arsitektur Compute
-
-#### 2.1.1 Containerization
-| Aspek | Detail |
-|-------|--------|
-| Container Runtime | Docker |
-| Base Image | rust:1.90-slim (build), debian:bookworm-slim (runtime) |
-| Registry | Docker Hub (default) |
-| Image Size | ~500MB (runtime), ~2GB (build cache) |
-| Security | Non-root user, minimal attack surface |
-
-#### 2.1.2 Orchestration
-| Aspek | Detail |
-|-------|--------|
-| Platform | Docker Compose |
-| Deployment Strategy | Single-node (development), Rolling update (production) |
-| Scaling | Horizontal pod scaling (planned for K8s) |
-| Service Discovery | Docker internal networking |
-| Configuration | Environment variables, mounted configs |
-
-#### 2.1.3 Server Specifications
-| Komponen | Requirement Minimum | Recommended | Production |
-|----------|---------------------|-------------|------------|
-| CPU | 1 core | 2 cores | 4+ cores |
-| Memory | 512MB | 2GB | 8GB+ |
-| Storage | 1GB | 10GB | 100GB+ SSD |
-| Network | 10Mbps | 100Mbps | 1Gbps |
-
-### 2.2 Diagram Compute Architecture
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Docker Compose Stack                     │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │                    Nginx (Reverse Proxy)             │    │
-│  │  ┌─────────────────────────────────────────────────┐ │    │
-│  │  │                                                 │ │    │
-│  │  │              Secreton API Server                │ │    │
-│  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────┐  │ │    │
-│  │  │  │   Auth      │  │   Crypto    │  │ Storage │  │ │    │
-│  │  │  │  Service    │  │  Service    │  │ Service │  │ │    │
-│  │  │  └─────────────┘  └─────────────┘  └─────────┘  │ │    │
-│  │  └─────────────────────────────────────────────────┘ │    │
-│  └─────────────────────────────────────────────────────┘    │
-│           │                        │                        │
-│           ▼                        ▼                        ▼
-│  ┌─────────────────┐     ┌─────────────────┐     ┌─────────────┐
-│  │   PostgreSQL    │     │      Redis      │     │  Prometheus  │
-│  │   (Database)    │     │     (Cache)     │     │ (Monitoring) │
-│  └─────────────────┘     └─────────────────┘     └─────────────┘
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │                        Grafana                              │ │
-│  │                 (Dashboard & Visualization)                 │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-```
+1. **Satu proses, satu port.** UI, REST API, dan gRPC dilayani oleh satu `axum::Router`
+   pada port 3000. Tidak ada listener kedua, tidak ada reverse proxy bawaan, tidak ada
+   offset port.
+2. **Tanpa build-time network access.** Build script tidak boleh mengunduh apa pun. Ini
+   alasan `utoipa-swagger-ui` tidak menjadi dependensi dan `protoc` di-vendor.
+3. **Konfigurasi divalidasi saat startup.** Setting yang hilang atau salah format
+   menghentikan proses, bukan muncul belakangan di request pertama pengguna.
 
 ---
 
-## 3. Model Infrastruktur Jaringan
+## 2. Compute
 
-### 3.1 Topologi Jaringan
-```
-Internet
-    │
-    ▼
-┌─────────┐     ┌─────────┐     ┌─────────┐
-│ Firewall│────▶│  Nginx  │────▶│Secreton │
-│ Rules   │     │ Reverse │     │  API    │
-│         │     │  Proxy  │     │ Server  │
-└─────────┘     └─────────┘     └─────────┘
-    │               │               │
-    ▼               ▼               ▼
-┌─────────┐     ┌─────────┐     ┌─────────┐
-│PostgreSQL│     │  Redis  │     │Prometheus│
-│ Database │     │  Cache  │     │ Metrics  │
-└─────────┘     └─────────┘     └─────────┘
-```
+### 2.1 Containerization
 
-### 3.2 Port Configuration
-| Service | Port | Protocol | Direction | Description |
-|---------|------|----------|-----------|-------------|
-| Secreton API | 8080 | TCP | Inbound | HTTP API endpoint |
-| Secreton HTTPS | 8443 | TCP | Inbound | HTTPS API endpoint |
-| Secreton Metrics | 9090 | TCP | Internal | Prometheus metrics |
-| PostgreSQL | 5432 | TCP | Internal | Database connection |
-| Redis | 6379 | TCP | Internal | Cache connection |
-| Nginx HTTP | 80 | TCP | Inbound | Web interface |
-| Nginx HTTPS | 443 | TCP | Inbound | Secure web interface |
-| Grafana | 3000 | TCP | Internal | Dashboard access |
-| Prometheus | 9091 | TCP | Internal | Metrics access |
-
-### 3.3 Protocol & API
-| Protocol | Version | Penggunaan |
-|----------|---------|------------|
-| HTTP | 1.1/2 | REST API communication |
-| HTTPS | TLS 1.2/1.3 | Secure API communication |
-| TCP | - | Database dan cache connections |
-| UDP | - | DNS resolution (future) |
-| WebSocket | - | Real-time notifications (planned) |
-
-### 3.4 Load Balancing
 | Aspek | Detail |
 |-------|--------|
-| Type | L7 (Application Layer) |
-| Algorithm | Round Robin |
-| Health Check | HTTP /health endpoint |
-| Session Affinity | None (stateless API) |
-| SSL Termination | Nginx handles TLS |
+| Base build | `rust:1.94.1-slim-bookworm` |
+| Runtime | distroless, non-root (`uid 65532`) |
+| Build | Multi-stage dengan `cargo-chef` + `cargo-leptos` |
+| Alamat bind | `0.0.0.0:3000` (`SECRETON__HTTP__BIND_ADDRESS`) |
+| User | `nonroot:nonroot`, dinyatakan eksplisit |
+| HEALTHCHECK | Tidak ada — distroless tidak punya shell maupun curl; probe langsung ke `/health` |
 
-### 3.5 DNS Configuration
-| Record | Type | Value | Purpose |
-|--------|------|-------|---------|
-| secreton.local | A | 127.0.0.1 | Development access |
-| api.secreton.local | CNAME | secreton.local | API endpoint |
-| db.secreton.local | A | 127.0.0.1 | Database access |
-| monitor.secreton.local | A | 127.0.0.1 | Monitoring access |
+Catatan penting dari Dockerfile: environment `LEPTOS_SITE_ADDR` dibaca oleh template server
+bawaan cargo-leptos, **bukan** oleh binary ini. Dengan hanya variabel itu yang diset,
+proses bind ke `127.0.0.1:8080` — tidak dapat dijangkau dari luar container, pada port yang
+tidak disebut `EXPOSE`. Variabel yang benar-benar dibaca server adalah
+`SECRETON__HTTP__BIND_ADDRESS`.
+
+### 2.2 Spesifikasi Server
+
+| Komponen | Minimum | Direkomendasikan |
+|----------|---------|------------------|
+| CPU | 1 core | 2+ core |
+| Memori | 512 MB | 2 GB |
+| Storage | 1 GB | 10 GB+ (jika memakai PostgreSQL) |
+| Jaringan | 10 Mbps | 100 Mbps+ |
+
+Storage `memory` dan `file` tidak memerlukan layanan eksternal, jadi instance dapat berjalan
+tanpa database sama sekali.
+
+### 2.3 Orkestrasi yang Diuji
+
+```
+compose.yaml
+┌──────────────────────────────────────────────────────┐
+│  network internal compose                            │
+│                                                      │
+│  ┌────────────────────────────┐   ┌───────────────┐  │
+│  │ secreton                   │   │ postgres:17   │  │
+│  │ build: Dockerfile          │   │ -alpine       │  │
+│  │ ports: 3000:3000           │──▶│               │  │
+│  │ read_only: true            │   │ healthcheck   │  │
+│  │ cap_drop: [ALL]            │   │ pg_isready    │  │
+│  │ no-new-privileges:true     │   │               │  │
+│  │ volume: secreton.toml (ro) │   │ volume: data  │  │
+│  └────────────────────────────┘   └───────────────┘  │
+│           ▲                                          │
+└───────────┼──────────────────────────────────────────┘
+            │ hanya port 3000 yang dipublikasikan ke host
+        host 3000
+```
+
+`SECRETON__AUTH__JWT__SECRET` dan `POSTGRES_PASSWORD` bersifat wajib dan diambil dari `.env`
+(`:?` pada compose membuat proses gagal jika tidak diset). `SECRETON__HTTP__TRUSTED_PROXIES`
+diset `"0"` karena compose tidak menempatkan proxy di depan aplikasi.
 
 ---
 
-## 4. Model Infrastruktur Keamanan
+## 3. Jaringan
 
-### 4.1 Network Security
+### 3.1 Topologi
 
-#### 4.1.1 Firewall Rules
-| Rule | Source | Destination | Port | Action | Purpose |
-|------|--------|-------------|------|--------|---------|
-| ALLOW | Internal | PostgreSQL | 5432 | Accept | Database access |
-| ALLOW | Internal | Redis | 6379 | Accept | Cache access |
-| ALLOW | Load Balancer | Secreton API | 8080 | Accept | API traffic |
-| ALLOW | External | Nginx | 80,443 | Accept | Web access |
-| DENY | External | PostgreSQL | 5432 | Drop | Prevent direct DB access |
-| DENY | External | Redis | 6379 | Drop | Prevent direct cache access |
-
-#### 4.1.2 TLS/SSL Configuration
-| Aspek | Detail |
-|-------|--------|
-| TLS Version | 1.2, 1.3 |
-| Certificate Type | Let's Encrypt (production), Self-signed (dev) |
-| Cipher Suites | ECDHE-RSA-AES256-GCM-SHA384, ECDHE-RSA-CHACHA20-POLY1305 |
-| HSTS | max-age=31536000; includeSubDomains |
-| Certificate Pinning | HPKP header (optional) |
-
-### 4.2 Application Security
-
-#### 4.2.1 Authentication Flow
 ```
-Client Request
+Klien (browser / CLI / agent / layanan lain)
+   │
+   │  HTTP/1.1 atau HTTP/2 (h2c untuk gRPC)
+   ▼
+┌──────────────────────────────────────────────┐
+│  Proses Secreton : 3000                     │
+│                                              │
+│  → GET /              UI Leptos (SSR+hydrate)│
+│  → /api/v1/**         REST API               │
+│  → /api-docs/openapi.json                    │
+│  → /health, /health/ready, /metrics          │
+│  → gRPC (h2c, direktori yang sama)           │
+└───────────────┬──────────────────────────────┘
+                │ hanya jika backend eksternal dipilih
+                ▼
+      ┌──────────────────────┐
+      │ PostgreSQL / Redis   │
+      │ (jaringan internal)  │
+      └──────────────────────┘
+```
+
+Tidak ada Nginx, tidak ada TLS termination di dalam proses (konfigurasi `[tls]` ada tetapi
+opsional), tidak ada port 8080, 8443, 5432 (dipublikasikan), 6379 (dipublikasikan), 9090,
+9091, 80, atau 443 dalam konfigurasi bawaan.
+
+### 3.2 Port
+
+| Layanan | Port | Protokol | Arah | Keterangan |
+|---------|------|----------|-------|------------|
+| Secreton (UI + REST + gRPC + metrics) | 3000 | TCP | Inbound | Satu-satunya port yang dipublikasikan |
+| PostgreSQL | 5432 | TCP | Internal (compose) | Hanya jika backend postgres dipilih |
+| Redis | 6379 | TCP | Internal | Hanya jika backend redis dipilih |
+
+### 3.3 Protokol
+
+| Protokol | Versi | Penggunaan |
+|----------|-------|------------|
+| HTTP | 1.1 | REST API dan UI |
+| HTTP/2 (h2c) | 2 | gRPC pada port yang sama |
+| TCP | — | Koneksi PostgreSQL dan Redis |
+
+Tidak ada WebSocket, tidak ada GraphQL, tidak ada UDP.
+
+### 3.4 Alamat Klien dan Rate Limiting
+
+Alamat klien diambil dari entri `X-Forwarded-For` ke-N dihitung dari kanan, di mana N adalah
+`SECRETON__HTTP__TRUSTED_PROXIES`. Nilai nol berarti header diabaikan sepenuhnya dan alamat
+peer socket yang dipakai — benar ketika proses diekspos langsung. Menyetel N lebih tinggi
+daripada jumlah proxy nyata memungkinkan klien memalsukan alamatnya dengan menyisipkan
+entri di depan, yang melemahkan rate limiting per klien.
+
+### 3.5 DNS
+
+Tidak ada catatan DNS yang diasumsikan oleh aplikasi. `secreton.local`,
+`api.secreton.local`, `db.secreton.local`, dan `monitor.secreton.local` dari versi 1.0
+tidak ada dalam kode maupun konfigurasi.
+
+---
+
+## 4. Keamanan Infrastruktur
+
+### 4.1 Isolasi Container
+
+| Kontrol | Nilai |
+|---------|-------|
+| User | `nonroot:nonroot` (uid 65532) |
+| Filesystem | `read_only: true` |
+| Capabilities | `cap_drop: [ALL]` |
+| Privilege escalation | `no-new-privileges:true` |
+| Port dipublikasikan | Hanya 3000 |
+| Network database | Tidak dipublikasikan ke host |
+
+### 4.2 Header Keamanan
+
+Diterapkan oleh middleware `security_headers` pada setiap respons, bukan oleh reverse proxy.
+Karena tidak ada Nginx dalam deployment bawaannya, header ini harus datang dari proses itu
+sendiri. Header yang selalu ada mencakup `X-Frame-Options`, `X-Content-Type-Options`,
+`Content-Security-Policy`, `Referrer-Policy`, dan `Permissions-Policy`; HSTS hanya
+diterbitkan ketika skema efektif permintaan tervalidasi sebagai HTTPS. Skema tidak dibaca
+dari URI permintaan — URI origin-form tidak membawa skema, dan pada HTTP/2 skema adalah
+pseudo-header yang dapat dipalsukan klien. Sumbernya adalah deklarasi operator
+`http.https_only` untuk listener yang men-terminate TLS, atau `X-Forwarded-Proto` yang
+datang dari proxy tepercaya (`http.trusted_proxies`); header itu dari klien langsung
+diabaikan.
+
+### 4.3 Alur Autentikasi
+
+```
+Permintaan klien
       │
       ▼
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Nginx     │────▶│  JWT Auth   │────▶│  RBAC       │
-│ (TLS Term)  │     │ Validation  │     │  Check      │
-└─────────────┘     └─────────────┘     └─────────────┘
-      │                     │                     │
-      ▼                     ▼                     ▼
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Rate Limit  │     │ MFA Check   │     │  Audit Log  │
-│             │     │             │     │             │
-└─────────────┘     └─────────────┘     └─────────────┘
-      │                     │                     │
-      ▼                     ▼                     ▼
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ API Handler │     │  Business  │     │  Response   │
-│             │     │   Logic     │     │             │
-└─────────────┘     └─────────────┘     └─────────────┘
+[request_id]  ──▶ id unik ditempelkan ke setiap respons, termasuk 429
+      │
+      ▼
+[security_headers]
+      │
+      ▼
+[rate_limit]  ──▶ 429 jika kuota terlampaui (600 permintaan / 60 detik secara default)
+      │
+      ▼
+[cors]  ──▶ allowlist; daftar kosong berarti same-origin saja
+      │
+      ▼
+[gerbang seal]  ──▶ 503 jika barrier tertutup, dengan pesan yang bisa ditindaklanjuti
+      │
+      ▼
+[gerbang auth]  ──▶ 401 tanpa kredensial
+      │
+      ▼
+[handler] ──▶ [audit] ──▶ Respons
 ```
 
-#### 4.2.2 Security Headers
-| Header | Value | Purpose |
-|--------|-------|---------|
-| X-Frame-Options | DENY | Prevent clickjacking |
-| X-Content-Type-Options | nosniff | Prevent MIME sniffing |
-| X-XSS-Protection | 1; mode=block | XSS protection |
-| Strict-Transport-Security | max-age=31536000 | Force HTTPS |
-| Content-Security-Policy | default-src 'self' | Prevent XSS |
-| Referrer-Policy | strict-origin-when-cross-origin | Control referrer |
+Urutan ini penting: `request_id` adalah layer terluar sehingga permintaan yang ditolak rate
+limiting tetap punya id yang mengaitkan 429 dengan baris log.
 
-### 4.3 Data Security
+### 4.4 TLS
 
-#### 4.3.1 Encryption at Rest
-| Data Type | Algorithm | Key Management |
-|-----------|-----------|----------------|
-| Secrets | AES-256-GCM | Envelope encryption |
-| User Data | AES-256-GCM | Database-level encryption |
-| Audit Logs | AES-256-GCM | Log encryption |
-| Configuration | AES-256-GCM | Config file encryption |
+Konfigurasi `[tls]` bersifat opsional. Jika tidak diset, proses melayani HTTP polos dan
+terminasi TLS diharapkan dilakukan oleh komponen di depannya. Tidak ada sertifikat yang
+dibuat otomatis.
 
-#### 4.3.2 Encryption in Transit
-| Connection | Protocol | Encryption |
-|------------|----------|------------|
-| API Calls | HTTPS | TLS 1.3 |
-| Database | TLS | PostgreSQL SSL |
-| Cache | TLS | Redis TLS |
-| Monitoring | HTTPS | TLS 1.2+ |
+### 4.5 Enkripsi Data
 
-### 4.4 Security Monitoring
-| Aspect | Tool/Method | Alert |
-|--------|-------------|-------|
-| Network Traffic | Nginx logs | Unusual patterns |
-| Authentication | Audit logs | Failed login attempts |
-| API Usage | Prometheus | Rate limit violations |
-| System Resources | Monitoring | High CPU/memory usage |
-| Security Events | SIEM integration | Suspicious activities |</content>
-<parameter name="filePath">/home/clouduser/secreton/secreton/docs/architecture/03-model-infrastruktur.md
+| Data | Perlakuan |
+|------|-----------|
+| Secrets | Dibungkus barrier AES-256-GCM sebelum mencapai backend |
+| Password | Hash Argon2id |
+| Sesi | JWT HS256, dikirim sebagai cookie `httpOnly` `Secure` `SameSite=Lax` |
+| Kunci | Material kunci di-zeroize saat drop |
+
+### 4.6 Monitoring
+
+Prometheus menarik `/metrics` dari proses yang sama:
+`secreton_sealed`, `secreton_secrets_total`, `secreton_uptime_seconds`. Tidak ada
+`/metrics` pada port terpisah, dan PostgreSQL maupun Redis tidak diekspos sebagai target
+Prometheus — keduanya tidak menyediakan endpoint Prometheus.
+
+---
+
+## 5. CI/CD
+
+Lima workflow di `.github/workflows/`:
+
+| Workflow | Isi |
+|----------|-----|
+| `ci.yml` | Job: fmt, clippy, test (dengan service PostgreSQL), WASM + Leptos build, feature matrix, MSRV, docs, docker build, lalu job `CI` agregat yang gagal jika ada job gagal atau dibatalkan |
+| `security.yml` | Audit dependensi (`cargo-audit`, `cargo-deny`), pemindaian rahasia (gitleaks), dan pemindaian filesystem Trivy |
+| `codeql-analysis.yml` | Analisis CodeQL |
+| `pr-validation.yml` | Validasi pull request |
+| `screenshots.yml` | Satu-satunya pemeriksaan yang mengeksekusi frontend yang dirender: membangun server + wasm, menjalankannya, membuat akun, lalu menjalankan `npm run screenshots` untuk menangkap dan memverifikasi keenam view |
+
+`npm run screenshots:check` bukan pengujian frontend: perintah itu hanya preflight yang
+membuktikan `playwright-core` dapat di-resolve dan Chromium dapat diluncurkan. Gate
+frontend yang sebenarnya adalah langkah `npm run screenshots` di `screenshots.yml`, yang
+berjalan setelah server dibangun dan siap. Job ini tidak pernah meng-commit PNG; ia
+meng-upload `docs/screenshots/` sebagai artefak dan hanya memperingatkan saat gambar
+berubah, karena dashboard memuat jumlah rahasia langsung.
+
+Semua perintah cargo memakai `--locked`, sehingga `Cargo.lock` yang di-commit
+mendeskripsikan artefak yang benar-benar dikirim.

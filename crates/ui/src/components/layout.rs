@@ -25,7 +25,10 @@ pub fn Layout(children: Children) -> impl IntoView {
                             {move || session.user().map(|u| u.display_name.unwrap_or(u.username))}
                         </span>
                         <ActionForm action=logout>
-                            <button type="submit" class="text-sm text-slate-500 hover:text-slate-900">
+                            <button
+                                type="submit"
+                                class="rounded-md px-2 py-1.5 text-sm text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900"
+                            >
                                 "Sign out"
                             </button>
                         </ActionForm>

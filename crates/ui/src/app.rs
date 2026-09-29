@@ -17,6 +17,10 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                // Without a declared icon every page logs a 404 for /favicon.ico, which
+                // looks like a broken asset on every visit.
+                <link rel="icon" href="/favicon.svg" type="image/svg+xml"/>
+                <Csp/>
                 <AutoReload options=options.clone()/>
                 <HydrationScripts options/>
                 <MetaTags/>
@@ -25,6 +29,34 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <App/>
             </body>
         </html>
+    }
+}
+
+/// Names the nonce Leptos stamps onto the inline `<script>` tags it emits here, so the
+/// security-header middleware can build a policy that authorises exactly those scripts.
+///
+/// This has to happen inside the render: the nonce is generated per response by Leptos and
+/// only the renderer knows it. It is echoed under
+/// [`secreton_domain::csp::RENDERED_NONCE_HEADER`], a private header the middleware reads
+/// and removes, so the client never sees it and nothing downstream can choose a policy.
+/// Without a matching nonce the browser refuses every inline script on the page —
+/// including `HydrationScripts`, which boots the WASM bundle — so the page renders but
+/// never becomes interactive.
+///
+/// Only the server has a response to attach a header to, hence the `ssr` gate; in the
+/// browser this component is a no-op.
+#[component]
+fn Csp() -> impl IntoView {
+    #[cfg(feature = "ssr")]
+    {
+        if let Some(nonce) = leptos::nonce::use_nonce()
+            && let Some(options) = use_context::<leptos_axum::ResponseOptions>()
+        {
+            options.insert_header(
+                axum::http::HeaderName::from_static(secreton_domain::csp::RENDERED_NONCE_HEADER),
+                axum::http::HeaderValue::from_str(&nonce).expect("a nonce is a valid header value"),
+            );
+        }
     }
 }
 
@@ -64,6 +96,9 @@ fn Protected() -> impl IntoView {
     let session = use_session();
 
     view! {
+        // The session resource is read inside this boundary; reading it outside one warns
+        // in hydrate mode. The boundary sits here, not around the router, because a
+        // boundary above the router suppresses routing on the server.
         <Suspense fallback=|| view! {
             <div class="flex h-screen items-center justify-center text-slate-500">"Loading…"</div>
         }>

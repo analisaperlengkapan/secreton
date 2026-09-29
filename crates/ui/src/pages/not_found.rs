@@ -13,7 +13,15 @@ pub fn NotFound() -> impl IntoView {
         <main class="flex min-h-screen flex-col items-center justify-center gap-4 p-8">
             <p class="text-6xl font-semibold text-slate-300">"404"</p>
             <h1 class="text-xl font-medium text-slate-800">"Page not found"</h1>
-            <a href="/" class="text-sm text-blue-600 hover:underline">"Back to the dashboard"</a>
+            // A standalone navigation control, not a link inside a sentence: the flex parent
+            // blockifies it, so WCAG 2.5.8's inline exception does not apply and it must meet
+            // the 24px minimum on its own. `py-1.5` on `text-sm` gives a 32px box.
+            <a
+                href="/"
+                class="rounded-md px-3 py-1.5 text-sm text-blue-600 transition-colors hover:bg-blue-50 hover:underline"
+            >
+                "Back to the dashboard"
+            </a>
         </main>
     }
 }

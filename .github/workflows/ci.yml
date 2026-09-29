@@ -62,6 +62,12 @@ jobs:
         options: >-
           --health-cmd "healthcheck.sh --connect --innodb_initialized"
           --health-interval 10s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 10s
+          --health-timeout 5s --health-retries 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -75,6 +81,10 @@ jobs:
           # rather than a fabricated one, so CI must actually run them.
           SECRETON_TEST_POSTGRES_URL: postgres://secreton:secreton@localhost:5432/secreton_test
           SECRETON_TEST_MYSQL_URL: mysql://root:secreton@127.0.0.1:3306/secreton_test
+          # Redis is a shared backend the seal service takes a cross-process lease on.
+          # Its path-keyed delete and its compare-and-set are only meaningful against the
+          # real server, so these run here rather than being asserted against a double.
+          SECRETON_TEST_REDIS_URL: redis://127.0.0.1:6379
       - run: cargo test --doc --workspace --locked
 
   wasm:

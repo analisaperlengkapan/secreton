@@ -236,3 +236,99 @@ async fn no_cross_origin_headers_are_emitted_by_default() {
         "a wildcard CORS response reached an untrusted origin"
     );
 }
+
+/// A trusted-proxy configuration for the scheme tests, since the default server declares
+/// no proxies.
+async fn test_server_with_trusted_proxies(trusted_proxies: usize) -> axum_test::TestServer {
+    let mut config = ServerConfig::default();
+    config.auth.jwt.secret = Some("test-secret-that-is-at-least-32-bytes!".to_string());
+    config.rate_limit.global.requests = 10_000;
+    config.http.trusted_proxies = trusted_proxies;
+    config
+        .validate()
+        .expect("the test configuration must be valid");
+
+    let services = Services::new(&config)
+        .await
+        .expect("services must construct over in-memory storage");
+
+    let state = AppState {
+        rate_limit: RateLimit::new(config.rate_limit.global.requests, trusted_proxies),
+        services,
+        #[cfg(feature = "ui")]
+        leptos_options: leptos::prelude::LeptosOptions::builder()
+            .output_name("secreton-e2e")
+            .site_root("target/site-e2e".to_string())
+            .build(),
+    };
+
+    // `TestServer::new` panics on failure since axum-test 19; `try_new` returns the
+    // error so the test reports which part of the server failed to build.
+    axum_test::TestServer::try_new(build_router(state)).expect("test server")
+}
+
+#[tokio::test]
+async fn a_forwarded_proto_header_from_a_direct_client_does_not_turn_hsts_on() {
+    // Direct listener, no trusted proxy declared. A client sending this over plain HTTP
+    // must not be able to have its request treated as secure.
+    let server = test_server().await;
+    let response = server
+        .get("/health")
+        .add_header("x-forwarded-proto", "https")
+        .await;
+
+    assert!(
+        response.maybe_header("strict-transport-security").is_none(),
+        "a forgeable forwarded header turned HSTS on"
+    );
+}
+
+#[tokio::test]
+async fn a_trusted_proxy_can_report_that_the_client_used_tls() {
+    // With one proxy declared, the forwarded scheme is the answer the middleware acts on.
+    let server = test_server_with_trusted_proxies(1).await;
+    let response = server
+        .get("/health")
+        .add_header("x-forwarded-proto", "https")
+        .await;
+
+    assert!(
+        response.maybe_header("strict-transport-security").is_some(),
+        "the forwarded https scheme should assert HSTS through a trusted proxy"
+    );
+}
+
+#[cfg(feature = "ui")]
+#[tokio::test]
+async fn the_ssr_document_carries_a_csp_naming_the_nonce_its_inline_scripts_use() {
+    // The renderer's nonce and the policy's nonce must be the same value, or hydration
+    // silently fails. Walk the login page and prove both halves agree.
+    let server = test_server().await;
+    let response = server.get("/login").await;
+    let html = response.text();
+
+    let csp = response
+        .maybe_header("content-security-policy")
+        .expect("every response carries a CSP")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Extract the nonce the policy names.
+    let nonce = csp
+        .split("'nonce-")
+        .nth(1)
+        .and_then(|rest| rest.split('\'').next())
+        .expect("an SSR document's policy must name a nonce");
+    assert!(
+        nonce.len() >= 16,
+        "a nonce shorter than 128 bits is guessable: {nonce}"
+    );
+
+    // The inline scripts on the page must carry that same nonce.
+    assert!(
+        html.contains(&format!("nonce=\"{nonce}\"")) || html.contains(&format!("nonce={nonce}")),
+        "the document's inline scripts do not carry the nonce the policy names; \
+         hydration would silently fail"
+    );
+}

@@ -7,7 +7,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Audit configuration
+///
+/// `default` so that a `[audit]` table needs only the keys it wants to change. Without it
+/// serde demands every field, and the committed `secreton.toml` — which sets `enabled`,
+/// `retention_days` and `max_batch_size` — failed to deserialize with "missing field
+/// `level`", stopping the server before it bound a port. Every other config struct here
+/// carries the same attribute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AuditConfig {
     /// Enable audit logging
     pub enabled: bool,

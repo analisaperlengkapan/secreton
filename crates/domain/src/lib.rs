@@ -12,10 +12,12 @@
 
 pub mod api;
 pub mod audit;
+pub mod csp;
 pub mod dto;
 pub mod error;
 pub mod models;
 pub mod password;
+pub mod proxy;
 pub mod security;
 pub mod session;
 

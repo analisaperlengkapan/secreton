@@ -1,0 +1,19 @@
+{
+  "name": "secreton-tooling",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Opt-in Node tooling for the repository. Not part of the Rust build: nothing here is needed to compile, test or run Secreton. It exists so the screenshot capture has a pinned, reproducible dependency instead of a NODE_PATH pointing at an unknown install.",
+  "type": "module",
+  "scripts": {
+    "screenshots": "node scripts/screenshots.mjs",
+    "screenshots:check": "node scripts/check-tooling.mjs",
+    "browser:install": "node scripts/install-browser.mjs",
+    "test:screenshots": "node --test scripts/layout.test.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.55.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
