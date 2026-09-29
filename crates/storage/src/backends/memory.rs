@@ -42,6 +42,27 @@ impl MemoryBackend {
     }
 }
 
+/// Retire the path an id used to resolve to when a write relocates it.
+///
+/// `data` is keyed by path, so writing the same id at a new path otherwise leaves the
+/// record under the old path: `get_by_id` follows the index to the new path, but the old
+/// path still answers `get_by_path` and is enumerated by `list`, and `delete_by_id`
+/// (which removes only the indexed path) then leaves the secret behind. Only a record
+/// that still names `entry.id` is dropped — if another id has since taken the old path,
+/// that replacement must survive. Call before the index is updated to the new path.
+fn retire_moved_record(
+    data: &mut HashMap<String, SecretEntry>,
+    id_index: &HashMap<Uuid, String>,
+    entry: &SecretEntry,
+) {
+    if let Some(previous_path) = id_index.get(&entry.id)
+        && previous_path != &entry.path
+        && data.get(previous_path).map(|record| record.id) == Some(entry.id)
+    {
+        data.remove(previous_path);
+    }
+}
+
 #[async_trait]
 impl StorageBackend for MemoryBackend {
     async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
@@ -58,6 +79,9 @@ impl StorageBackend for MemoryBackend {
         {
             id_index.remove(&old_id);
         }
+        // The same id written at a new path is a relocation: drop the record it used to
+        // occupy, or the old path keeps answering and `delete_by_id` cannot reach it.
+        retire_moved_record(&mut data, &id_index, entry);
         id_index.insert(entry.id, entry.path.clone());
         data.insert(entry.path.clone(), entry.clone());
 
@@ -102,6 +126,10 @@ impl StorageBackend for MemoryBackend {
         if existing != entry.id {
             id_index.remove(&existing);
         }
+        // An update that moves this id to a new path must retire the record under the old
+        // path, exactly as `store` does: the index update alone leaves the stale record
+        // readable by path and out of reach of `delete_by_id`.
+        retire_moved_record(&mut data, &id_index, entry);
         id_index.insert(entry.id, entry.path.clone());
         data.insert(entry.path.clone(), entry.clone());
         Ok(())
@@ -192,6 +220,9 @@ impl StorageBackend for MemoryBackend {
             let old_id = old.id;
             id_index.remove(&old_id);
         }
+        // A conditional write that relocates the id must retire the record under its old
+        // path, exactly as `store` does.
+        retire_moved_record(&mut data, &id_index, &to_write);
         id_index.insert(to_write.id, to_write.path.clone());
         data.insert(to_write.path.clone(), to_write);
         Ok(true)
@@ -238,6 +269,9 @@ impl StorageBackend for MemoryBackend {
         if let Some(old) = data.get(&entry.path) {
             id_index.remove(&old.id);
         }
+        // A fenced write that relocates the id must retire the record under its old path,
+        // exactly as `store` does.
+        retire_moved_record(&mut data, &id_index, &to_write);
         id_index.insert(to_write.id, to_write.path.clone());
         data.insert(to_write.path.clone(), to_write);
         Ok(true)
@@ -457,6 +491,8 @@ impl StorageTransaction for MemoryTransaction {
                     {
                         staged_index.remove(&old_id);
                     }
+                    // A relocation retires the id's former path, exactly as `store` does.
+                    retire_moved_record(&mut staged_data, &staged_index, entry);
                     staged_index.insert(entry.id, entry.path.clone());
                     staged_data.insert(entry.path.clone(), entry.as_ref().clone());
                 }
@@ -470,6 +506,8 @@ impl StorageTransaction for MemoryTransaction {
                     if existing != entry.id {
                         staged_index.remove(&existing);
                     }
+                    // A relocation retires the id's former path, exactly as `update` does.
+                    retire_moved_record(&mut staged_data, &staged_index, entry);
                     staged_index.insert(entry.id, entry.path.clone());
                     staged_data.insert(entry.path.clone(), entry.as_ref().clone());
                 }
@@ -557,6 +595,110 @@ mod tests {
             .unwrap()
             .expect("the replacement must survive");
         assert_eq!(survivor.id, second.id);
+    }
+
+    /// Regression: storing the *same* id at a new path is a relocation. If the record under
+    /// the old path were left behind, `get_by_path(old)` would keep serving it (and `list`
+    /// would enumerate it) while `delete_by_id` removes only the indexed path — so the
+    /// secret survives a delete and appears in two places.
+    #[tokio::test]
+    async fn storing_an_id_at_a_new_path_retires_its_old_path() {
+        let backend = MemoryBackend::new();
+        let mut moved = entry("kv/old");
+        let id = moved.id;
+        backend.store(&moved).await.unwrap();
+
+        moved.path = "kv/new".to_string();
+        backend.store(&moved).await.unwrap();
+
+        assert_eq!(
+            backend
+                .get_by_id(id)
+                .await
+                .unwrap()
+                .expect("the id must still resolve")
+                .path,
+            "kv/new"
+        );
+        assert!(
+            backend.get_by_path("kv/old").await.unwrap().is_none(),
+            "the old path must no longer resolve the moved record"
+        );
+        assert!(
+            backend.delete_by_id(id).await.unwrap(),
+            "delete_by_id must reach the relocated record"
+        );
+        assert!(
+            backend.get_by_path("kv/new").await.unwrap().is_none(),
+            "the relocated record must be gone after delete_by_id"
+        );
+    }
+
+    /// The same relocation guard must hold for an `update`. `update` requires the destination
+    /// path to exist, so a relocation here is an id updated onto a path another id occupies:
+    /// the id's former path must be retired, and the displaced id must no longer resolve.
+    #[tokio::test]
+    async fn updating_an_id_to_a_new_path_retires_its_old_path_and_the_displaced_id() {
+        let backend = MemoryBackend::new();
+        let original = entry("kv/update/old");
+        let id = original.id;
+        backend.store(&original).await.unwrap();
+
+        let displaced = entry("kv/update/new");
+        let displaced_id = displaced.id;
+        backend.store(&displaced).await.unwrap();
+
+        let mut moved = original.clone();
+        moved.path = "kv/update/new".to_string();
+        backend.update(&moved).await.unwrap();
+
+        assert!(
+            backend
+                .get_by_path("kv/update/old")
+                .await
+                .unwrap()
+                .is_none(),
+            "an update that relocates an id must retire the old path"
+        );
+        assert_eq!(
+            backend
+                .get_by_id(id)
+                .await
+                .unwrap()
+                .expect("the id must still resolve")
+                .path,
+            "kv/update/new"
+        );
+        assert!(
+            backend.get_by_id(displaced_id).await.unwrap().is_none(),
+            "the displaced id must not resolve after the update replaced it"
+        );
+    }
+
+    /// A conditional write can relocate an id too; the record under the former path must be
+    /// retired rather than left behind.
+    #[tokio::test]
+    async fn a_conditional_write_that_relocates_an_id_retires_its_old_path() {
+        let backend = MemoryBackend::new();
+        let mut moved = entry("kv/cas/old");
+        let id = moved.id;
+        backend.store(&moved).await.unwrap();
+
+        moved.path = "kv/cas/new".to_string();
+        let wrote = backend
+            .compare_and_set(&moved, crate::Expect::Any)
+            .await
+            .unwrap();
+        assert!(wrote, "the conditional write must succeed");
+
+        assert!(
+            backend.get_by_path("kv/cas/old").await.unwrap().is_none(),
+            "the old path must no longer resolve the moved record"
+        );
+        assert_eq!(
+            backend.get_by_id(id).await.unwrap().unwrap().path,
+            "kv/cas/new"
+        );
     }
 
     #[tokio::test]

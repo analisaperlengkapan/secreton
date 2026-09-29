@@ -184,6 +184,21 @@ pub struct ApiLoginResponse {
     pub token: AuthToken,
 }
 
+/// An in-memory refresh-token reservation: the deadline for the single-use claim and the
+/// owner token of the attempt that holds it.
+///
+/// The owner is what lets an attempt clear only *its own* claim. The value used to be the
+/// deadline alone, so every attempt that touched an entry removed whatever was there — a
+/// losing or releasing attempt could delete a winner's claim (already upgraded to the
+/// token's full lifetime), and a third request would then re-claim and exchange the same
+/// token concurrently. `owner == None` marks a *revocation* (see [`revoke_token`]), which
+/// any attempt may remove; a claim with an owner is removed only by that owner.
+#[derive(Clone, Debug)]
+struct RefreshClaim {
+    expires_at: chrono::DateTime<chrono::Utc>,
+    owner: Option<String>,
+}
+
 /// Cached effective configuration (session timeout + global MFA flag).
 ///
 /// Avoids a storage round-trip on every authentication call by caching
@@ -211,8 +226,9 @@ pub struct AuthenticationService {
     /// Configuration
     config: AuthConfig,
 
-    /// Token blacklist
-    token_blacklist: Arc<tokio::sync::RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
+    /// Token blacklist: revoked tokens (`owner == None`) and live refresh claims
+    /// (`owner == Some`), both keyed by the token string.
+    token_blacklist: Arc<tokio::sync::RwLock<HashMap<String, RefreshClaim>>>,
 
     /// Crypto service
     crypto: Arc<CryptoService>,
@@ -758,25 +774,44 @@ impl AuthenticationService {
         // merely chose the name "root". The check below reads the account's own record, so
         // it covers the identity `init` created under any name and leaves an ordinary
         // account of the same name alone.
-        if let Ok(Some(user)) = self.find_user_by_username(&req.username).await
-            && user.password_login_disabled
-        {
-            if let Some(audit) = &self.audit {
-                let _ = audit
-                    .log_event(
-                        crate::services::audit::SecurityEventType::AuthenticationFailure {
-                            user: req.username.clone(),
-                            method: "userpass".to_string(),
-                            reason: "Account is not password-authenticatable".to_string(),
-                        },
-                    )
-                    .await;
+        //
+        // A lookup that *fails* must deny the login, not be ignored. The check below is what
+        // enforces the bootstrap-root refusal, and the later durable read is only best-effort;
+        // if a transient storage error let this branch fall through, the in-memory
+        // `UserPassAuthMethod` identity — hydrated on an earlier request, before the account
+        // was disabled — could still verify a password. Fail closed, exactly as the lockout
+        // read below already does.
+        match self.find_user_by_username(&req.username).await {
+            Ok(Some(user)) if user.password_login_disabled => {
+                if let Some(audit) = &self.audit {
+                    let _ = audit
+                        .log_event(
+                            crate::services::audit::SecurityEventType::AuthenticationFailure {
+                                user: req.username.clone(),
+                                method: "userpass".to_string(),
+                                reason: "Account is not password-authenticatable".to_string(),
+                            },
+                        )
+                        .await;
+                }
+                // Generic, identical to a wrong password: the refusal must not become a
+                // username oracle that reveals which account is the bootstrap root.
+                return Err(secreton_domain::SecretonError::Authentication {
+                    message: "Invalid credentials".to_string(),
+                });
             }
-            // Generic, identical to a wrong password: the refusal must not become a
-            // username oracle that reveals which account is the bootstrap root.
-            return Err(secreton_domain::SecretonError::Authentication {
-                message: "Invalid credentials".to_string(),
-            });
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load account '{}' while checking password-authenticatability \
+                     during login: {}",
+                    req.username,
+                    e
+                );
+                return Err(secreton_domain::SecretonError::Internal {
+                    message: "An internal error occurred during authentication".to_string(),
+                });
+            }
         }
 
         // Check lockout status before attempting login.
@@ -1231,6 +1266,74 @@ impl AuthenticationService {
         format!("{}{}", REVOKED_TOKEN_STORAGE_PREFIX, hex::encode(digest))
     }
 
+    /// Record the in-memory half of a refresh-token claim under one write guard.
+    ///
+    /// Returns `false` when the token is already spoken for by a live claim or revocation, so
+    /// the caller must not proceed. The claim is inserted with `owner`, so a concurrent
+    /// loser's cleanup cannot remove it.
+    async fn try_claim_refresh_token_in_memory(
+        &self,
+        refresh_token: &str,
+        owner: &str,
+        claim_expiry: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let mut blacklist = self.token_blacklist.write().await;
+        if let Some(existing) = blacklist.get(refresh_token)
+            && existing.expires_at > chrono::Utc::now()
+        {
+            return false;
+        }
+        blacklist.insert(
+            refresh_token.to_string(),
+            RefreshClaim {
+                expires_at: claim_expiry,
+                owner: Some(owner.to_string()),
+            },
+        );
+        true
+    }
+
+    /// Remove an in-memory claim only if it is still the one `owner` took.
+    ///
+    /// A completed exchange upgrades the claim to the token's full lifetime; a losing or
+    /// releasing attempt must not clear that winner's claim, or a third request could
+    /// re-claim and exchange the same token. A *revocation* (`owner == None`) is never
+    /// cleared by this — it is a completed rotation, not a claim.
+    async fn clear_refresh_claim_if_owner(&self, refresh_token: &str, owner: &str) {
+        let mut blacklist = self.token_blacklist.write().await;
+        if blacklist
+            .get(refresh_token)
+            .and_then(|claim| claim.owner.as_deref())
+            == Some(owner)
+        {
+            blacklist.remove(refresh_token);
+        }
+    }
+
+    /// Mark a refresh token's in-memory claim as committed, extending it to the token's own
+    /// expiry so it cannot lapse before the token does.
+    async fn commit_refresh_claim_in_memory(
+        &self,
+        refresh_token: &str,
+        owner: &str,
+        expiry: chrono::DateTime<chrono::Utc>,
+    ) {
+        let mut blacklist = self.token_blacklist.write().await;
+        // Never downgrade a revocation (or another owner's committed claim) to a claim.
+        if let Some(existing) = blacklist.get(refresh_token)
+            && existing.owner.is_none()
+        {
+            return;
+        }
+        blacklist.insert(
+            refresh_token.to_string(),
+            RefreshClaim {
+                expires_at: expiry,
+                owner: Some(owner.to_string()),
+            },
+        );
+    }
+
     /// Revoke a token.
     ///
     /// Writes the revocation to both the in-memory blacklist (fast path for
@@ -1240,12 +1343,20 @@ impl AuthenticationService {
     /// this instance, and the session-binding check in `validate_token`
     /// provides additional defense when sessions are deleted.
     pub async fn revoke_token(&self, token: String, expires_at: chrono::DateTime<chrono::Utc>) {
-        // In-memory update (fast path).
+        // In-memory update (fast path). A revocation has no owner, so it outranks any live
+        // claim for the same token: `is_token_revoked` sees the deadline, and a later
+        // release sees `owner == None` and leaves it in place.
         {
             let mut blacklist = self.token_blacklist.write().await;
             // Clean up expired entries while we're at it
-            blacklist.retain(|_, &mut exp| exp > chrono::Utc::now());
-            blacklist.insert(token.clone(), expires_at);
+            blacklist.retain(|_, claim| claim.expires_at > chrono::Utc::now());
+            blacklist.insert(
+                token.clone(),
+                RefreshClaim {
+                    expires_at,
+                    owner: None,
+                },
+            );
         }
 
         // Persist the revocation so other instances see it.  We store an
@@ -1281,11 +1392,14 @@ impl AuthenticationService {
     /// every user — the session-binding check in `validate_token` remains
     /// the authoritative defense.
     pub async fn is_token_revoked(&self, token: &str) -> bool {
-        // In-memory fast path.
+        // In-memory fast path. A live entry — a claim or a revocation — means the token is
+        // spoken for. A claim carries an owner; `is_token_revoked` is used by
+        // `refresh_token`'s early reject, where "another attempt is mid-exchange" must
+        // refuse this one just as a completed revocation would.
         {
             let blacklist = self.token_blacklist.read().await;
-            if let Some(expires_at) = blacklist.get(token)
-                && *expires_at > chrono::Utc::now()
+            if let Some(claim) = blacklist.get(token)
+                && claim.expires_at > chrono::Utc::now()
             {
                 return true;
             }
@@ -1306,7 +1420,15 @@ impl AuthenticationService {
                 if still_valid {
                     if let Some(exp) = entry.expires_at {
                         let mut blacklist = self.token_blacklist.write().await;
-                        blacklist.insert(token.to_string(), exp);
+                        // A persisted revocation has no owner: it must never be cleared as a
+                        // claim by a later release.
+                        blacklist.insert(
+                            token.to_string(),
+                            RefreshClaim {
+                                expires_at: exp,
+                                owner: None,
+                            },
+                        );
                     }
                     return true;
                 }
@@ -1779,19 +1901,18 @@ impl AuthenticationService {
         let claim_ttl = self.refresh_claim_ttl();
         let claim_expiry =
             (chrono::Utc::now() + chrono::Duration::seconds(claim_ttl)).min(refresh_expiry);
-        {
-            let mut blacklist = self.token_blacklist.write().await;
-            if let Some(expires_at) = blacklist.get(refresh_token)
-                && *expires_at > chrono::Utc::now()
-            {
-                return Ok(None);
-            }
-            blacklist.insert(refresh_token.to_string(), claim_expiry);
-        }
 
         // The owner token is unique to this claim, so a release can never remove a
-        // reservation another attempt re-took after this one's record expired.
+        // reservation another attempt re-took after this one's record expired. Generate it
+        // before the in-memory claim so the claim records who owns it.
         let owner = Uuid::new_v4().to_string();
+
+        if !self
+            .try_claim_refresh_token_in_memory(refresh_token, &owner, claim_expiry)
+            .await
+        {
+            return Ok(None);
+        }
 
         if self.storage.coordination() == secreton_storage::Coordination::SingleProcess {
             // A process-local backend is a separate map per process, so no second replica
@@ -1832,11 +1953,12 @@ impl AuthenticationService {
                     .map(|exp| exp > chrono::Utc::now())
                     .unwrap_or(true);
                 if live {
-                    // Undo the in-memory slot this call just inserted, exactly as the
+                    // Undo the in-memory claim this call just took, exactly as the
                     // `Ok(false)` arm below does, so this process does not carry a reservation
-                    // for a token it must refuse.
-                    let mut blacklist = self.token_blacklist.write().await;
-                    blacklist.remove(refresh_token);
+                    // for a token it must refuse. Owner-scoped: a revocation with no owner is
+                    // never cleared this way.
+                    self.clear_refresh_claim_if_owner(refresh_token, &owner)
+                        .await;
                     return Ok(None);
                 }
             }
@@ -1847,8 +1969,8 @@ impl AuthenticationService {
                      token; refusing the exchange rather than risk replaying an already-rotated \
                      token: {e}"
                 );
-                let mut blacklist = self.token_blacklist.write().await;
-                blacklist.remove(refresh_token);
+                self.clear_refresh_claim_if_owner(refresh_token, &owner)
+                    .await;
                 return Err(AuthError::Storage(e));
             }
         }
@@ -1879,10 +2001,11 @@ impl AuthenticationService {
         {
             Ok(true) => Ok(Some(owner)),
             Ok(false) => {
-                // Another replica already holds it. Drop the in-memory slot this call just
-                // inserted so this process does not carry a reservation it did not win.
-                let mut blacklist = self.token_blacklist.write().await;
-                blacklist.remove(refresh_token);
+                // Another replica already holds it. Drop the in-memory claim this call just
+                // took — owner-scoped, so it cannot clear a claim the winner has since
+                // upgraded — so this process does not carry a reservation it did not win.
+                self.clear_refresh_claim_if_owner(refresh_token, &owner)
+                    .await;
                 Ok(None)
             }
             Err(e) => {
@@ -1892,8 +2015,8 @@ impl AuthenticationService {
                 // a brief Redis or PostgreSQL disconnect — consume the refresh token on this
                 // instance for the reservation's whole lifetime, so every retry returned
                 // `InvalidToken` without ever consulting the recovered backend.
-                let mut blacklist = self.token_blacklist.write().await;
-                blacklist.remove(refresh_token);
+                self.clear_refresh_claim_if_owner(refresh_token, &owner)
+                    .await;
                 Err(AuthError::Storage(e))
             }
         }
@@ -1917,10 +2040,12 @@ impl AuthenticationService {
     /// short [`REFRESH_CLAIM_TTL_SECS`] deadline, so it lapses on its own and the token
     /// becomes claimable again. Logs never include token material.
     async fn release_refresh_token_reservation(&self, refresh_token: &str, owner: &str) {
-        {
-            let mut blacklist = self.token_blacklist.write().await;
-            blacklist.remove(refresh_token);
-        }
+        // Owner-scoped: clear the in-memory claim only if it is still this attempt's. Doing
+        // it unconditionally let a loser's release delete the winner's claim, and a third
+        // request then re-claimed and exchanged the same token. A revocation has no owner and
+        // is left in place — it marks a completed rotation, not a claim.
+        self.clear_refresh_claim_if_owner(refresh_token, owner)
+            .await;
         let path = Self::refresh_reservation_path(refresh_token);
 
         match self.storage.delete_owned(&path, owner).await {
@@ -1974,10 +2099,10 @@ impl AuthenticationService {
     ) -> bool {
         // In-memory slot: the whole guarantee on a single-process backend, and the fast
         // path on a shared one. Upgrade it to the token's expiry so it cannot lapse early.
-        {
-            let mut blacklist = self.token_blacklist.write().await;
-            blacklist.insert(refresh_token.to_string(), refresh_expiry);
-        }
+        // The committed claim keeps `owner`, so a losing or releasing attempt cannot clear
+        // it; only this owner can.
+        self.commit_refresh_claim_in_memory(refresh_token, owner, refresh_expiry)
+            .await;
 
         if self.storage.coordination() == secreton_storage::Coordination::SingleProcess {
             return true;
@@ -3825,6 +3950,10 @@ mod tests {
         /// read is what lets a test reproduce that interleaving deterministically instead of
         /// hoping for the scheduling.
         stale_readback: std::sync::Mutex<Option<(String, SecretEntry)>>,
+        /// When set, the next `get_by_path` of a *user* record returns a connection error, so a
+        /// test can model a transient storage fault during login without disabling the later
+        /// lockout read.
+        fail_next_user_read: std::sync::atomic::AtomicBool,
     }
 
     impl FailingReservationBackend {
@@ -3836,6 +3965,7 @@ mod tests {
                 fail_next_delete_owned: std::sync::atomic::AtomicBool::new(false),
                 unconditional_reservation_deletes: std::sync::atomic::AtomicU64::new(0),
                 stale_readback: std::sync::Mutex::new(None),
+                fail_next_user_read: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -3861,6 +3991,15 @@ mod tests {
             self.inner.get_by_id(id).await
         }
         async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            if path.starts_with(USER_STORAGE_PREFIX)
+                && self
+                    .fail_next_user_read
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(secreton_storage::StorageError::ConnectionFailed {
+                    message: "injected user-record read failure".to_string(),
+                });
+            }
             if let Some((stale_path, entry)) = self
                 .stale_readback
                 .lock()
@@ -4483,6 +4622,148 @@ mod tests {
                 .is_some(),
             "a lapsed reservation with no durable revocation must remain reclaimable"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_release_does_not_clear_a_new_owners_in_memory_claim() {
+        // Regression (Auth Bypass): the in-memory blacklist stored only a deadline, so
+        // `release_refresh_token_reservation` removed whatever entry was present. When A's
+        // exchange failed *late* — after A's short claim had lapsed and B had taken the slot —
+        // A's release cleared B's live claim. On a single-process backend the in-memory claim
+        // is the whole guarantee, so a third request then found no claim and exchanged the same
+        // single-use token a second time.
+        //
+        // The property: a release by an owner that no longer holds the claim does not clear the
+        // current owner's claim.
+        let _env = crate::test_support::without_root_key();
+        let storage: Arc<dyn StorageBackend + Send + Sync> =
+            Arc::new(secreton_storage::backends::MemoryBackend::new());
+        let service = auth_with_storage(storage).await;
+        // A one-second claim window stands in for the production two minutes.
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "single-process-claim-refresh-token";
+
+        // A takes the claim, then its claim lapses before its exchange finishes.
+        let owner_a = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("A must win the only slot");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // B takes the now-free slot.
+        let owner_b = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("B re-claims the lapsed slot")
+            .expect("B wins the freed slot");
+        assert_ne!(owner_a, owner_b);
+
+        // A's release runs late. It must not clear B's in-memory claim.
+        service
+            .release_refresh_token_reservation(token, &owner_a)
+            .await;
+
+        // B's claim must survive: a third request is still refused, and the stored claim still
+        // names B.
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("C's reserve")
+                .is_none(),
+            "the current owner's claim must survive a stale release, or the token is no longer \
+             single-use"
+        );
+        {
+            let blacklist = service.token_blacklist.read().await;
+            let claim = blacklist
+                .get(token)
+                .expect("the current owner's in-memory claim must still be present");
+            assert_eq!(
+                claim.owner.as_deref(),
+                Some(owner_b.as_str()),
+                "the surviving claim must still belong to the current owner"
+            );
+        }
+
+        // Guard the other direction: the current owner can still release its own claim, and the
+        // token then becomes claimable again.
+        service
+            .release_refresh_token_reservation(token, &owner_b)
+            .await;
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("reserve after the owner released")
+                .is_some(),
+            "an owner's own release must free the slot for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_account_lookup_denies_login_rather_than_falling_back_to_cached_identity() {
+        // Regression (Auth Bypass): `login` treated a failed `find_user_by_username` the same as
+        // "no such user" (`if let Ok(Some(user))`). That lookup is what enforces the bootstrap
+        // root refusal; when it errored, the later durable read was only best-effort and the
+        // login fell through to `UserPassAuthMethod`, whose identity is hydrated from the
+        // account's *old* hash. So a transient storage fault could authenticate a bootstrap
+        // root (or an account since disabled) from a stale cached hash.
+        //
+        // The property: a failed account lookup denies the login.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+
+        let password = crate::test_support::generated_password();
+        service
+            .register_user("lookup-user", &password, None, vec![], vec![])
+            .await
+            .expect("register user");
+
+        backend
+            .fail_next_user_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let denied = service
+            .login(
+                ApiLoginRequest {
+                    username: "lookup-user".to_string(),
+                    password: password.clone(),
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await;
+        assert!(
+            denied.is_err(),
+            "a failed account lookup must deny the login, not authenticate from stale state"
+        );
+
+        // Guard the other direction: once storage recovers, the same valid credentials work, so
+        // the denial is a fail-closed response to the fault and not a broken login path.
+        let recovered = service
+            .login(
+                ApiLoginRequest {
+                    username: "lookup-user".to_string(),
+                    password,
+                    mfa_code: None,
+                },
+                "192.0.2.1".to_string(),
+                "test".to_string(),
+            )
+            .await
+            .expect("login must succeed after storage recovers");
+        assert!(!recovered.token.access_token.is_empty());
     }
 
     #[tokio::test]

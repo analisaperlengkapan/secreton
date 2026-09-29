@@ -625,6 +625,14 @@ where
     }
 
     async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+        // Read both identities the update can retire, before the write: the record this id
+        // currently resolves to (an update may move it to a new path), and the record the
+        // destination path currently names (an update may replace it with a different id).
+        // Without this, a warmed id key survives `get_by_id` after the backend has retired
+        // the id, and `get_by_id` keeps serving the retired secret until its TTL expires.
+        let previous_by_id = self.storage.get_by_id(entry.id).await.ok().flatten();
+        let previous_at_path = self.storage.get_by_path(&entry.path).await.ok().flatten();
+
         let result = self.storage.update(entry).await;
 
         if result.is_ok() {
@@ -645,6 +653,25 @@ where
                         serialized,
                         Some(self.default_ttl),
                     )
+                    .await;
+            }
+            if let Some(previous) = &previous_by_id
+                && previous.path != entry.path
+            {
+                // The id moved: the path it used to occupy must not keep resolving it.
+                let _ = self
+                    .cache
+                    .delete(&Self::cache_key_for_path(&previous.path))
+                    .await;
+            }
+            if let Some(previous) = &previous_at_path
+                && previous.id != entry.id
+            {
+                // The destination path now names a different id: retire the superseded id
+                // so a cached `get_by_id` cannot return the record the backend dropped.
+                let _ = self
+                    .cache
+                    .delete(&Self::cache_key_for_id(previous.id))
                     .await;
             }
         }
@@ -1765,6 +1792,104 @@ mod round_trip_tests {
                 .expect("backend read")
                 .is_none(),
             "the backend must no longer hold the displaced record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_update_retires_the_id_at_the_destination_path() {
+        // Regression: `CachedStorage::update` refreshed the id and path keys of the record it
+        // wrote but never retired the id the destination path used to name. An `update` that
+        // replaces a path's record under a *new* id left the old id's cache key holding the
+        // superseded record, and `get_by_id(old_id)` kept serving a secret the backend no
+        // longer had until its TTL expired — a deleted secret still readable through the
+        // wrapper. `store` already reconciled this; `update` did not.
+        let backend = crate::backends::MemoryBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let path = "kv/update/retire";
+
+        let old = sample_entry_with_path(path, b"v1");
+        let old_id = old.id;
+        crate::StorageBackend::store(&cached, &old)
+            .await
+            .expect("seed");
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, old_id)
+                .await
+                .expect("warm id")
+                .is_some()
+        );
+
+        let mut replacement = sample_entry_with_path(path, b"v2");
+        replacement.id = Uuid::new_v4();
+        assert_ne!(replacement.id, old_id);
+        crate::StorageBackend::update(&cached, &replacement)
+            .await
+            .expect("update");
+
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, old_id)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "the superseded id must not be served from cache after an update"
+        );
+        assert!(
+            crate::StorageBackend::get_by_id(&backend, old_id)
+                .await
+                .expect("backend read")
+                .is_none(),
+            "the backend must no longer hold the superseded record"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_that_relocates_an_id_clears_the_old_path_cache() {
+        // The sibling of the transaction relocation test, for a direct `update`: moving an id
+        // to a new path must clear the cached entry at the path it left, or that path keeps
+        // answering with the relocated secret.
+        let backend = RelocatingBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let old_path = "kv/update/relocate-old";
+        let new_path = "kv/update/relocate-new";
+
+        let entry = sample_entry_with_path(old_path, b"payload");
+        crate::StorageBackend::store(&cached, &entry)
+            .await
+            .expect("seed");
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, old_path)
+                .await
+                .expect("warm old path")
+                .is_some()
+        );
+
+        let mut relocated = entry.clone();
+        relocated.path = new_path.to_string();
+        crate::StorageBackend::update(&cached, &relocated)
+            .await
+            .expect("update");
+
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, new_path)
+                .await
+                .expect("cached read")
+                .is_some(),
+            "the relocated record must resolve at its new path"
+        );
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, old_path)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "the former path must not keep serving the relocated record from cache"
         );
     }
 
