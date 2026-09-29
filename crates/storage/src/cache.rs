@@ -533,11 +533,14 @@ where
     C: CacheBackend,
 {
     async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
-        // Read what the path named before the write, so a `store` that replaces the record
-        // under a different id can retire the superseded id from the cache. Without this the
-        // `entry:id:<old>` key survives the write, and `get_by_id(old_id)` keeps answering
-        // from cache with a record the backend no longer has.
-        let previous = self.storage.get_by_path(&entry.path).await.ok().flatten();
+        // Read both identities a `store` can retire, before the write: the record the
+        // destination path currently names (a `store` that replaces it under a different id
+        // must retire the superseded id, or `get_by_id(old_id)` keeps answering from cache
+        // with a record the backend no longer has), and the record this id currently
+        // resolves to (a `store` that moves the id to a new path must clear the former
+        // path's key, or `get_by_path(old_path)` keeps serving the relocated record).
+        let previous_at_path = self.storage.get_by_path(&entry.path).await.ok().flatten();
+        let previous_by_id = self.storage.get_by_id(entry.id).await.ok().flatten();
         let result = self.storage.store(entry).await;
 
         if result.is_ok() {
@@ -559,12 +562,21 @@ where
                     Some(self.default_ttl),
                 )
                 .await;
-            if let Some(previous) = previous
+            if let Some(previous) = previous_at_path
                 && previous.id != entry.id
             {
                 let _ = self
                     .cache
                     .delete(&Self::cache_key_for_id(previous.id))
+                    .await;
+            }
+            if let Some(previous) = previous_by_id
+                && previous.path != entry.path
+            {
+                // The id moved: the path it used to occupy must not keep resolving it.
+                let _ = self
+                    .cache
+                    .delete(&Self::cache_key_for_path(&previous.path))
                     .await;
             }
         }
@@ -1890,6 +1902,60 @@ mod round_trip_tests {
                 .expect("cached read")
                 .is_none(),
             "the former path must not keep serving the relocated record from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_relocates_an_id_clears_the_old_path_cache() {
+        // Regression: `CachedStorage::store` read only the record the *destination path*
+        // named, so a `store` that moved an existing id to a new path left the former path
+        // key cached. `get_by_path(old_path)` then kept resolving the relocated record from
+        // the cache until its TTL expired — a moved secret readable at the path its id no
+        // longer occupies. `update` already reconciled this; `store` did not.
+        let backend = crate::backends::MemoryBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let old_path = "kv/store/relocate-old";
+        let new_path = "kv/store/relocate-new";
+
+        let entry = sample_entry_with_path(old_path, b"payload");
+        crate::StorageBackend::store(&cached, &entry)
+            .await
+            .expect("seed");
+        // Warm the old path key, so a stale hit is what the test observes.
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, old_path)
+                .await
+                .expect("warm old path")
+                .is_some()
+        );
+
+        // The same id is stored at a new path. `store` is a relocation here: the backend
+        // retires the former path's record.
+        let relocated = SecretEntry {
+            path: new_path.to_string(),
+            ..entry.clone()
+        };
+        crate::StorageBackend::store(&cached, &relocated)
+            .await
+            .expect("relocate");
+
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, old_path)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "the former path must not keep serving a relocated id from cache"
+        );
+        assert!(
+            crate::StorageBackend::get_by_path(&backend, old_path)
+                .await
+                .expect("backend read")
+                .is_none(),
+            "the backend must no longer hold the record at the former path"
         );
     }
 
