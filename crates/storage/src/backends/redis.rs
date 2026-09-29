@@ -960,32 +960,35 @@ impl StorageBackend for RedisBackend {
             local expected = ARGV[4]
             local expires = ARGV[5]
 
-            local function write(key, value)
-                if expires ~= '' then
-                    local ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
-                    if ttl <= 0 then
-                        redis.call('DEL', key)
-                        return 0
-                    end
-                    redis.call('SET', key, value)
-                    redis.call('PEXPIRE', key, ttl * 1000)
-                    return 1
+            -- Decide the deadline once, before any mutation. A conditional write whose own
+            -- deadline has already elapsed must leave the destination exactly as it found
+            -- it. The write helper used to compute the TTL and `DEL` the target key when it
+            -- was already expired, and it was reachable from the `absent` and
+            -- missing-mapping branches as well as the replacement branch: a rejected write
+            -- at an occupied path deleted the live record and left the path mapping
+            -- dangling, so `get_by_path` returned nothing even though the write failed.
+            -- Folding the check in here makes every branch non-mutating on the expiry path.
+            local ttl = nil
+            if expires ~= '' then
+                ttl = tonumber(expires) - tonumber(redis.call('TIME')[1])
+                if ttl <= 0 then
+                    return 3
                 end
+            end
+
+            local function write(key, value)
                 redis.call('SET', key, value)
-                return 1
+                if ttl then
+                    redis.call('PEXPIRE', key, ttl * 1000)
+                end
             end
 
             if mode == 'absent' then
                 if mapping then
                     return 0
                 end
-                if write('secreton:entry:' .. expected, ARGV[1]) == 0 then
-                    return 3
-                end
-                if write(KEYS[1], expected) == 0 then
-                    redis.call('DEL', 'secreton:entry:' .. expected)
-                    return 3
-                end
+                write('secreton:entry:' .. expected, ARGV[1])
+                write(KEYS[1], expected)
                 return 1
             end
 
@@ -993,13 +996,8 @@ impl StorageBackend for RedisBackend {
                 if mode == 'owner' or mode == 'unexpired_owner' or mode == 'expired_owner' then
                     return 0
                 end
-                if write('secreton:entry:' .. expected, ARGV[1]) == 0 then
-                    return 3
-                end
-                if write(KEYS[1], expected) == 0 then
-                    redis.call('DEL', 'secreton:entry:' .. expected)
-                    return 3
-                end
+                write('secreton:entry:' .. expected, ARGV[1])
+                write(KEYS[1], expected)
                 return 1
             end
 
@@ -1044,13 +1042,8 @@ impl StorageBackend for RedisBackend {
                 end
             end
 
-            if write('secreton:entry:' .. expected, ARGV[1]) == 0 then
-                return 3
-            end
-            if write(KEYS[1], expected) == 0 then
-                redis.call('DEL', 'secreton:entry:' .. expected)
-                return 3
-            end
+            write('secreton:entry:' .. expected, ARGV[1])
+            write(KEYS[1], expected)
             -- A replacement whose identity moved off the old id leaves that id's record
             -- behind; drop it so a superseded record cannot outlive the path that named it.
             if mapping ~= expected then
@@ -2464,6 +2457,52 @@ mod tests {
                 .owner_token(),
             Some("attempt-a"),
             "the live claim must be left in place"
+        );
+    }
+
+    /// Regression (severe): a conditional write whose own deadline has already elapsed
+    /// returned `Ok(false)` but still deleted the destination. The script's `write` helper
+    /// dropped an already-expired target key, and the `absent`, missing-mapping and
+    /// replacement branches all called it. A rejected replacement at an occupied path
+    /// therefore removed the live record and left the path mapping dangling, so
+    /// `get_by_path` returned nothing even though the write had failed. The deadline must be
+    /// decided before any mutation, and the expiry path must touch nothing.
+    #[tokio::test]
+    async fn an_expired_conditional_write_does_not_delete_the_live_record() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/contract/expired-replacement");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        let live = entry_at(&path, b"live");
+        let live_id = live.id;
+        backend.store(&live).await.expect("store the live record");
+
+        // The proposed replacement is already expired when the script runs.
+        let expired =
+            entry_at(&path, b"expired").with_expiration(Utc::now() - chrono::Duration::seconds(30));
+        assert!(
+            !backend
+                .compare_and_set(&expired, Expect::Any)
+                .await
+                .expect("conditional replacement"),
+            "a write whose own deadline has elapsed must be reported as not landing"
+        );
+
+        let surviving = backend
+            .get_by_path(&path)
+            .await
+            .expect("read")
+            .expect("the rejected write must leave the live record in place");
+        assert_eq!(
+            surviving.id, live_id,
+            "the rejected write must not have removed the live record"
+        );
+        assert_eq!(
+            surviving.encrypted_data, b"live",
+            "the rejected write must not have changed the payload"
         );
     }
 }

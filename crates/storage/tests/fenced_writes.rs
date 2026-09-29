@@ -655,3 +655,80 @@ async fn raft_compare_and_set_arbitrates_within_the_process() {
         "a fenced compare-and-set must be refused on a backend with no shared lease"
     );
 }
+
+/// An id that already lives at one path must not survive at that path when the same id is
+/// conditionally inserted at another. A Raft state machine keeps records by path plus a
+/// separate id index; moving the index without removing the old record makes both paths
+/// answer the same secret, so enumeration reports a duplicate and `delete_by_id` can only
+/// reach one of them. The memory backend retires the abandoned path for exactly this write.
+#[cfg(feature = "raft")]
+#[tokio::test]
+async fn raft_relocation_does_not_leave_the_old_path_answering() {
+    use secreton_storage::QueryParams;
+    use secreton_storage::backends::{RaftConfig, RaftStorageBackend};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backend = RaftStorageBackend::new(RaftConfig {
+        data_dir: dir.path().to_path_buf(),
+        ..RaftConfig::default()
+    })
+    .await
+    .expect("raft backend");
+    backend
+        .initialize_cluster()
+        .await
+        .expect("elect the single node as leader so `store` is admitted");
+
+    let id = uuid::Uuid::new_v4();
+    let mut original = entry("relocation/old", "owner", b"payload");
+    original.id = id;
+    backend
+        .store(&original)
+        .await
+        .expect("store at the old path");
+
+    let mut moved = entry("relocation/new", "owner", b"payload");
+    moved.id = id;
+    assert!(
+        backend
+            .compare_and_set(&moved, Expect::Absent)
+            .await
+            .expect("relocate with an insert-if-absent"),
+        "the destination path is absent, so the insert must win"
+    );
+
+    assert!(
+        backend
+            .get_by_path("relocation/old")
+            .await
+            .expect("read old path")
+            .is_none(),
+        "the abandoned path must stop answering once its id lives elsewhere"
+    );
+    let at_new = backend
+        .get_by_path("relocation/new")
+        .await
+        .expect("read new path")
+        .expect("the destination must hold the record");
+    assert_eq!(at_new.id, id);
+    assert_eq!(
+        backend
+            .get_by_id(id)
+            .await
+            .expect("read by id")
+            .expect("the id must resolve")
+            .path,
+        "relocation/new",
+        "the id index must name the destination, not the abandoned path"
+    );
+
+    let listed = backend
+        .list(&QueryParams::new().with_path_prefix("relocation/".to_string()))
+        .await
+        .expect("list");
+    assert_eq!(
+        listed.len(),
+        1,
+        "a relocation must not leave the secret enumerated twice"
+    );
+}

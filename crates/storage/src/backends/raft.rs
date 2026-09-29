@@ -139,6 +139,7 @@ impl RaftStateMachine {
                 let path = entry.path.clone();
                 let id = entry.id;
 
+                self.retire_relocated_record(&entry);
                 self.data.insert(path.clone(), entry);
                 self.id_index.insert(id, path);
                 self.update_stats();
@@ -195,6 +196,24 @@ impl RaftStateMachine {
                     }
                 }
             }
+        }
+    }
+
+    /// Remove the record an id currently occupies when it is being written at a different
+    /// path, so a relocation cannot leave the id reachable through both paths.
+    ///
+    /// `id_index` is the only place that remembers where an id lives. A `store` of an
+    /// existing id at a new path, or a conditional replacement that carries an id already
+    /// present under another path, must drop the old record in the same state-machine step;
+    /// otherwise `get_by_path` keeps answering the abandoned path and enumeration reports
+    /// the same secret twice. Guarded by the record's own `id` so a map that has since been
+    /// repointed at a different record is not disturbed.
+    fn retire_relocated_record(&mut self, entry: &SecretEntry) {
+        if let Some(previous_path) = self.id_index.get(&entry.id)
+            && previous_path != &entry.path
+            && self.data.get(previous_path).map(|record| record.id) == Some(entry.id)
+        {
+            self.data.remove(previous_path);
         }
     }
 
@@ -278,6 +297,11 @@ impl RaftStateMachine {
             entry.id = previous.id;
             entry.created_at = previous.created_at;
         }
+        // An insert-if-absent at a *new* path can carry an id that already lives at another
+        // path. Leaving the old record in place would make both paths answer that id and
+        // enumeration report the secret twice; the memory backend retires the old path for
+        // exactly this case. Do it in the same state-machine step as the insert.
+        self.retire_relocated_record(&entry);
         self.id_index.insert(entry.id, path.clone());
         self.data.insert(path, entry);
         self.update_stats();
