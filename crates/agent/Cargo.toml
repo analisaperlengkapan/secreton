@@ -39,7 +39,7 @@ rand = { workspace = true }
 
 # System monitoring dependencies
 sysinfo = "0.37"
-nix = { version = "0.29", features = ["user"] }
+nix = { version = "0.31", features = ["user"] }
 
 # HTTP server for metrics
 axum = { workspace = true }
