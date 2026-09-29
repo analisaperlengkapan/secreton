@@ -517,7 +517,9 @@ impl StorageBackend for PostgresBackend {
         let security_level = entry.security_level as i32;
         let version = entry.version as i32;
         let token = match expect {
-            crate::Expect::Owner(token) | crate::Expect::UnexpiredOwner(token) => token.to_string(),
+            crate::Expect::Owner(token)
+            | crate::Expect::UnexpiredOwner(token)
+            | crate::Expect::ExpiredOwner(token) => token.to_string(),
             _ => String::new(),
         };
 
@@ -557,14 +559,19 @@ impl StorageBackend for PostgresBackend {
                         &entry.expires_at,
                     ],
                 ),
-                crate::Expect::Owner(_) | crate::Expect::UnexpiredOwner(_) => (
+                crate::Expect::Owner(_)
+                | crate::Expect::UnexpiredOwner(_)
+                | crate::Expect::ExpiredOwner(_) => (
                     // The owner key is a compile-time constant, not interpolated input.
                     // `UnexpiredOwner` folds the lease deadline into the same `WHERE`, so the
                     // renewal is a single statement whose precondition and write cannot
                     // interleave: a lease that lapsed before the statement executes matches no
-                    // row and is never revived. The deadline is read from metadata against the
-                    // database clock, and the regex guard keeps the `::bigint` cast from
-                    // erroring on a malformed value rather than rejecting it.
+                    // row and is never revived. `ExpiredOwner` is the converse: the reclaim
+                    // lands only while the record's own `expires_at` has already passed, so a
+                    // claim another reader extended in the read-to-write window is left alone.
+                    // Both deadlines are read from the row against the database clock, and the
+                    // regex guard keeps the `::bigint` cast from erroring on a malformed value
+                    // rather than rejecting it.
                     format!(
                         "UPDATE secreton_entries SET{owner_update_set} \
                          WHERE path = $1 AND metadata->>'{owner}' = $11{deadline}",
@@ -577,6 +584,14 @@ impl StorageBackend for PostgresBackend {
                                      > EXTRACT(EPOCH FROM NOW())::bigint",
                                 expires = crate::LEASE_EXPIRES_AT_KEY
                             ),
+                            // `expires_at` is the record's own expiration, not the lease
+                            // metadata: a record with no expiration must fail closed, which is
+                            // why the NULL case rejects rather than admits.
+                            crate::Expect::ExpiredOwner(_) => {
+                                " AND expires_at IS NOT NULL \
+                                 AND expires_at < NOW()"
+                                    .to_string()
+                            }
                             _ => String::new(),
                         }
                     ),
@@ -1004,7 +1019,7 @@ impl StorageBackend for PostgresBackend {
     }
 
     async fn migrate(&self) -> StorageResult<()> {
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
@@ -1040,11 +1055,37 @@ impl StorageBackend for PostgresBackend {
             CREATE INDEX IF NOT EXISTS idx_oauth_state_expires_at ON oauth_state(expires_at);
         "#;
 
-        client
-            .batch_execute(create_table_query)
+        // `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` are not atomic against
+        // a concurrent run of the same DDL: two sessions both find the object absent and both
+        // try to create it, and one loses with a duplicate-catalog error. Several test binaries
+        // migrate the same database in parallel, which is exactly that race, and it surfaced as
+        // an intermittent `db error` from `batch_execute`. A session-scoped advisory lock taken
+        // inside a transaction makes migration a critical section: the transaction, and the
+        // lock with it, end before the connection returns to the pool, so an unrelated later
+        // statement never inherits it.
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| StorageError::MigrationError {
+                message: format!("Failed to begin migration transaction: {}", e),
+            })?;
+        // The key is an arbitrary constant ("secreton" as ASCII, decimal), shared by every
+        // migrator so they serialise against each other. A decimal literal, not `0x…`: hex
+        // integer literals need PostgreSQL 16, and this must parse on older servers too.
+        tx.batch_execute("SELECT pg_advisory_xact_lock(8305295778244808558)")
+            .await
+            .map_err(|e| StorageError::MigrationError {
+                message: format!("Failed to take the migration lock: {}", e),
+            })?;
+        tx.batch_execute(create_table_query)
             .await
             .map_err(|e| StorageError::MigrationError {
                 message: format!("Failed to run migrations: {}", e),
+            })?;
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::MigrationError {
+                message: format!("Failed to commit migrations: {}", e),
             })?;
 
         Ok(())

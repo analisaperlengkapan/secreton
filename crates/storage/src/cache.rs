@@ -249,6 +249,44 @@ where
             .await;
     }
 
+    /// The records the cache currently attributes to `path`, if any.
+    ///
+    /// The backend pre-read a conditional write performs can miss the record a previous
+    /// write left cached at this path: a replacement this wrapper did not observe, or one
+    /// whose readback failed, is present in the cache but may not yet be at the path in the
+    /// backend when this call reads it. Capturing the cached record too means the id it
+    /// names is retired even when the backend read comes back with nothing (or with the
+    /// *replacing* record, whose id is not the displaced one), so `get_by_id` cannot keep
+    /// serving a superseded record from an id key the path no longer names.
+    async fn cached_record_at_path(&self, path: &str) -> Option<SecretEntry> {
+        let bytes = self
+            .cache
+            .get(&Self::cache_key_for_path(path))
+            .await
+            .ok()
+            .flatten()?;
+        postcard::from_bytes::<SecretEntry>(&bytes).ok()
+    }
+
+    /// Every distinct record the path named before a conditional write, from the backend and
+    /// from the cache. The two can disagree — the cache may hold a replacement the backend
+    /// pre-read did not see, or vice versa — so both ids are retired, not just the backend's.
+    fn previous_records(
+        backend: Option<SecretEntry>,
+        cached: Option<SecretEntry>,
+    ) -> Vec<SecretEntry> {
+        let mut records = Vec::new();
+        if let Some(backend) = backend {
+            records.push(backend);
+        }
+        if let Some(cached) = cached
+            && records.iter().all(|entry| entry.id != cached.id)
+        {
+            records.push(cached);
+        }
+        records
+    }
+
     /// Align the cache with the record a conditional write left at `path`.
     ///
     /// The cache keys a record under both its id and its path. A conditional write is a
@@ -256,28 +294,30 @@ where
     /// wrapper must not rely on that: if the write ends up under a different id than the
     /// path previously named, the old `entry:id:<old>` key still holds the superseded
     /// record, and `get_by_id(old_id)` would serve it from cache rather than report the
-    /// record gone. Cache the canonical record and retire any id the path no longer names.
+    /// record gone. Cache the canonical record and retire every id the path no longer names
+    /// — both the one the backend named before the write and the one the cache held, which
+    /// can differ when another writer replaced the record between the two reads.
     async fn cache_after_conditional_write(
         &self,
         path: &str,
-        previous: Option<&SecretEntry>,
+        previous: &[SecretEntry],
         canonical: Option<SecretEntry>,
     ) {
         match canonical {
             Some(canonical) => {
                 self.cache_entry(&canonical).await;
-                if let Some(previous) = previous
-                    && previous.id != canonical.id
-                {
-                    let _ = self
-                        .cache
-                        .delete(&Self::cache_key_for_id(previous.id))
-                        .await;
+                for previous in previous {
+                    if previous.id != canonical.id {
+                        let _ = self
+                            .cache
+                            .delete(&Self::cache_key_for_id(previous.id))
+                            .await;
+                    }
                 }
             }
             None => {
                 let _ = self.cache.delete(&Self::cache_key_for_path(path)).await;
-                if let Some(previous) = previous {
+                for previous in previous {
                     let _ = self
                         .cache
                         .delete(&Self::cache_key_for_id(previous.id))
@@ -295,9 +335,9 @@ where
     /// it until the TTL expires, reporting a value the backend no longer holds. Invalidating
     /// both keys here converts that silent staleness into a cache miss that the next read
     /// repairs from the backend.
-    async fn invalidate_after_failed_readback(&self, path: &str, previous: Option<&SecretEntry>) {
+    async fn invalidate_after_failed_readback(&self, path: &str, previous: &[SecretEntry]) {
         let _ = self.cache.delete(&Self::cache_key_for_path(path)).await;
-        if let Some(previous) = previous {
+        for previous in previous {
             let _ = self
                 .cache
                 .delete(&Self::cache_key_for_id(previous.id))
@@ -755,8 +795,12 @@ where
     ) -> StorageResult<bool> {
         // Read the record the path names *before* the write so its id can be retired from
         // the cache if the write lands under a different one. Best-effort: a failed read
-        // just means the stale-id cleanup below has nothing to work from.
-        let previous = self.storage.get_by_path(&entry.path).await.ok().flatten();
+        // just means the stale-id cleanup below has nothing to work from — but the record the
+        // *cache* attributes to the path is captured too, since a replacement this wrapper did
+        // not observe can leave a superseded id key that the backend read no longer reveals.
+        let backend_previous = self.storage.get_by_path(&entry.path).await.ok().flatten();
+        let cached_previous = self.cached_record_at_path(&entry.path).await;
+        let previous = Self::previous_records(backend_previous, cached_previous);
         let written = self.storage.compare_and_set(entry, expect).await?;
         if written {
             // Read back the canonical record. If the read fails or the record is
@@ -764,7 +808,7 @@ where
             // is worse than a cache miss, which the next read repairs.
             match self.storage.get_by_path(&entry.path).await {
                 Ok(canonical) => {
-                    self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
+                    self.cache_after_conditional_write(&entry.path, &previous, canonical)
                         .await;
                 }
                 Err(_) => {
@@ -774,7 +818,7 @@ where
                     // an error here would tell the caller a durable write failed. Registration
                     // would refuse an account that exists, and initialization would leave its
                     // lease held until expiry, both over a read that the next request repeats.
-                    self.invalidate_after_failed_readback(&entry.path, previous.as_ref())
+                    self.invalidate_after_failed_readback(&entry.path, &previous)
                         .await;
                 }
             }
@@ -784,12 +828,12 @@ where
             // the id key matters too: when several wrappers share storage, a replacement
             // this call *lost* to can have displaced the record the path named, so
             // `get_by_id` would otherwise keep serving the superseded entry until its TTL
-            // expires. Retire both the path and the id it previously resolved to.
+            // expires. Retire both the path and every id it previously resolved to.
             let _ = self
                 .cache
                 .delete(&Self::cache_key_for_path(&entry.path))
                 .await;
-            if let Some(previous) = previous.as_ref() {
+            for previous in &previous {
                 let _ = self
                     .cache
                     .delete(&Self::cache_key_for_id(previous.id))
@@ -825,12 +869,14 @@ where
         entry: &SecretEntry,
         fence: crate::StorageFence<'_>,
     ) -> StorageResult<bool> {
-        let previous = self.storage.get_by_path(&entry.path).await.ok().flatten();
+        let backend_previous = self.storage.get_by_path(&entry.path).await.ok().flatten();
+        let cached_previous = self.cached_record_at_path(&entry.path).await;
+        let previous = Self::previous_records(backend_previous, cached_previous);
         let written = self.storage.store_fenced(entry, fence).await?;
         if written {
             match self.storage.get_by_path(&entry.path).await {
                 Ok(canonical) => {
-                    self.cache_after_conditional_write(&entry.path, previous.as_ref(), canonical)
+                    self.cache_after_conditional_write(&entry.path, &previous, canonical)
                         .await;
                 }
                 Err(_) => {
@@ -838,21 +884,23 @@ where
                     // readback failed. Retire the cached keys so no later read reports the
                     // superseded record, but keep the success result — the write is durable,
                     // and turning the readback failure into an error would report it as lost.
-                    self.invalidate_after_failed_readback(&entry.path, previous.as_ref())
+                    self.invalidate_after_failed_readback(&entry.path, &previous)
                         .await;
                 }
             }
         } else {
-            // The fence did not hold, so nothing was written. Clear both the path key and the
+            // The fence did not hold, so nothing was written. Clear both the path key and every
             // id the path previously resolved to: another writer that took the fence can have
             // replaced the record under a new id, and the old id key would otherwise keep
             // serving the displaced record through `get_by_id` until its TTL expires. This is
-            // the same two-key retirement `compare_and_set` does on a lost race.
+            // the same two-key retirement `compare_and_set` does on a lost race, and it draws
+            // on the cached record too, because the displaced id can have been cached by a
+            // write this call's backend pre-read could not see.
             let _ = self
                 .cache
                 .delete(&Self::cache_key_for_path(&entry.path))
                 .await;
-            if let Some(previous) = previous.as_ref() {
+            for previous in &previous {
                 let _ = self
                     .cache
                     .delete(&Self::cache_key_for_id(previous.id))
@@ -1230,6 +1278,11 @@ mod round_trip_tests {
                             && crate::lease_has_not_expired(&e, chrono::Utc::now().timestamp())
                     })
                 }
+                crate::Expect::ExpiredOwner(token) => self
+                    .inner
+                    .get_by_path(&entry.path)
+                    .await?
+                    .is_some_and(|e| e.has_owner(token) && e.is_expired()),
                 crate::Expect::Any => true,
             };
             if !held {
@@ -1256,6 +1309,109 @@ mod round_trip_tests {
             self.inner.delete_by_path(&entry.path).await?;
             self.inner.store(entry).await?;
             Ok(true)
+        }
+        async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
+            self.inner.delete_owned(path, token).await
+        }
+        async fn list(&self, params: &crate::QueryParams) -> StorageResult<Vec<SecretEntry>> {
+            self.inner.list(params).await
+        }
+        async fn count(&self, params: &crate::QueryParams) -> StorageResult<u64> {
+            self.inner.count(params).await
+        }
+        async fn exists(&self, path: &str) -> StorageResult<bool> {
+            self.inner.exists(path).await
+        }
+        async fn begin_transaction(&self) -> StorageResult<Box<dyn crate::StorageTransaction>> {
+            self.inner.begin_transaction().await
+        }
+        async fn health_check(&self) -> StorageResult<crate::HealthStatus> {
+            self.inner.health_check().await
+        }
+        async fn get_stats(&self) -> StorageResult<crate::StorageStats> {
+            self.inner.get_stats().await
+        }
+        async fn migrate(&self) -> StorageResult<()> {
+            self.inner.migrate().await
+        }
+        async fn delete_expired(&self, path_prefix: Option<String>) -> StorageResult<u64> {
+            self.inner.delete_expired(path_prefix).await
+        }
+        async fn store_oauth_state(
+            &self,
+            state: &secreton_domain::OAuthState,
+        ) -> StorageResult<()> {
+            self.inner.store_oauth_state(state).await
+        }
+        async fn get_oauth_state(
+            &self,
+            state: &str,
+        ) -> StorageResult<Option<secreton_domain::OAuthState>> {
+            self.inner.get_oauth_state(state).await
+        }
+        async fn delete_expired_oauth_states(&self) -> StorageResult<u64> {
+            self.inner.delete_expired_oauth_states().await
+        }
+    }
+
+    /// A backend that, just before serving the cache wrapper's pre-write read of a path,
+    /// installs a replacement record with a *different* id — modelling another writer whose
+    /// replacement landed after this wrapper had cached the original record but before the
+    /// pre-read. The pre-read then returns the replacement's id, so the displaced id would
+    /// go unretired unless the cache's own copy of the path is consulted too. Its fenced
+    /// writes report `Ok(false)`, modelling the fence having been taken by that other writer.
+    #[derive(Debug)]
+    struct ReplacesBeforePreReadBackend {
+        inner: crate::backends::MemoryBackend,
+        replace: std::sync::Arc<std::sync::Mutex<Option<(String, SecretEntry)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::StorageBackend for ReplacesBeforePreReadBackend {
+        async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.store(entry).await
+        }
+        async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
+            self.inner.get_by_id(id).await
+        }
+        async fn get_by_path(&self, path: &str) -> StorageResult<Option<SecretEntry>> {
+            let swap = {
+                let mut slot = self.replace.lock().expect("replace lock");
+                match slot.as_ref() {
+                    Some((target, _)) if target == path => slot.take().map(|(_, entry)| entry),
+                    _ => None,
+                }
+            };
+            if let Some(replacement) = swap {
+                self.inner.store(&replacement).await?;
+            }
+            self.inner.get_by_path(path).await
+        }
+        async fn update(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.update(entry).await
+        }
+        async fn upsert(&self, entry: &SecretEntry) -> StorageResult<()> {
+            self.inner.upsert(entry).await
+        }
+        async fn delete_by_id(&self, id: Uuid) -> StorageResult<bool> {
+            self.inner.delete_by_id(id).await
+        }
+        async fn delete_by_path(&self, path: &str) -> StorageResult<bool> {
+            self.inner.delete_by_path(path).await
+        }
+        async fn compare_and_set(
+            &self,
+            entry: &SecretEntry,
+            expect: crate::Expect<'_>,
+        ) -> StorageResult<bool> {
+            self.inner.compare_and_set(entry, expect).await
+        }
+        async fn store_fenced(
+            &self,
+            _entry: &SecretEntry,
+            _fence: crate::StorageFence<'_>,
+        ) -> StorageResult<bool> {
+            Ok(false)
         }
         async fn delete_owned(&self, path: &str, token: &str) -> StorageResult<bool> {
             self.inner.delete_owned(path, token).await
@@ -1592,6 +1748,78 @@ mod round_trip_tests {
                 .expect("cached read")
                 .is_some(),
             "the new id must be readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_fenced_write_retires_an_id_only_the_cache_still_knows() {
+        // Regression: the id a lost `store_fenced`/`compare_and_set` retires came solely from
+        // the backend pre-read. When another writer replaced the record between the moment
+        // this wrapper cached the original record and that pre-read, the pre-read returned the
+        // *replacement's* id — not the displaced one — so the displaced id's cached key
+        // survived and `get_by_id` kept serving a record the path no longer names until its TTL
+        // expired. The wrapper must also retire the id the cache itself attributes to the path.
+        //
+        // The property: after a fenced write loses to a replacement that landed before the
+        // pre-read, a cached `get_by_id(displaced)` returns None.
+        let backend = ReplacesBeforePreReadBackend {
+            inner: crate::backends::MemoryBackend::new(),
+            replace: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
+        let replace_handle = std::sync::Arc::clone(&backend.replace);
+        let cached = CachedStorage::new(backend, InMemoryCache::new(), Duration::from_secs(300));
+
+        let path = "kv/racy/target";
+        let displaced = sample_entry_with_path(path, b"v1");
+        let displaced_id = displaced.id;
+        crate::StorageBackend::store(&cached, &displaced)
+            .await
+            .expect("seed");
+        // Warm both keys: the path key is what the wrapper consults, the id key is what must
+        // be retired.
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, path)
+                .await
+                .expect("warm path")
+                .is_some()
+        );
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, displaced_id)
+                .await
+                .expect("warm id")
+                .is_some()
+        );
+
+        // Arm the replacement: the replaying wrapper's pre-read of `path` will find a record
+        // with a new id, so the displaced id is invisible to it.
+        let replacement = sample_entry_with_path(path, b"v2");
+        *replace_handle.lock().expect("replace lock") = Some((path.to_string(), replacement));
+
+        // The fenced write loses, as it does when another writer has taken the lease.
+        let lease = "lease/init";
+        let owner = "owner-token";
+        crate::StorageBackend::store(
+            &cached,
+            &sample_entry_with_path(lease, b"lease").owned_by(owner),
+        )
+        .await
+        .expect("lease");
+        let lost = crate::StorageBackend::store_fenced(
+            &cached,
+            &sample_entry_with_path(path, b"v3"),
+            crate::StorageFence::new(lease, owner),
+        )
+        .await
+        .expect("fenced write");
+        assert!(!lost, "the fence must have been taken, so the write loses");
+
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, displaced_id)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "the displaced id must be retired from the cache even though the backend pre-read \
+             saw only the replacement, or `get_by_id` serves a record the path no longer names"
         );
     }
 

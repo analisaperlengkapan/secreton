@@ -428,6 +428,102 @@ async fn memory_backend_honours_owner_conditional_replacement() {
     assert_owner_compare_and_set_contract(&MemoryBackend::new()).await;
 }
 
+/// The `Expect::ExpiredOwner` contract every coordinating backend must honour.
+///
+/// The auth service reclaims a lapsed refresh-token reservation with
+/// `compare_and_set(.., Expect::ExpiredOwner(owner))`. `Expect::Owner` alone was not enough:
+/// the owner token is unchanged when a claim is *extended*, so a reclaim could overwrite a
+/// claim its holder had just extended back to life in the read-to-write window. This pins the
+/// two behaviours the reclaim depends on: a still-expired owned record is replaceable, and a
+/// revived (unexpired) owned record is not.
+async fn assert_expired_owner_contract(backend: &(dyn StorageBackend + Send + Sync)) {
+    let path = "contract/expired-owner-cas";
+    let owned_expiring_at = |owner: &str, expires_at: chrono::DateTime<chrono::Utc>| {
+        SecretEntry::new(
+            path.to_string(),
+            b"claim".to_vec(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            uuid::Uuid::nil(),
+        )
+        .owned_by(owner)
+        .with_expiration(expires_at)
+    };
+
+    // A claim that is owned and expired is reclaimable.
+    backend
+        .store(&owned_expiring_at(
+            "a",
+            chrono::Utc::now() - chrono::Duration::seconds(1),
+        ))
+        .await
+        .expect("store lapsed claim");
+    assert!(
+        backend
+            .compare_and_set(
+                &owned_expiring_at("b", chrono::Utc::now() + chrono::Duration::seconds(120)),
+                Expect::ExpiredOwner("a")
+            )
+            .await
+            .expect("reclaim a lapsed claim"),
+        "a still-expired owned record must be reclaimable"
+    );
+
+    // The holder extends it back to life; the owner token is unchanged. A reclaim must now
+    // fail and leave the revived claim in place.
+    backend
+        .store(&owned_expiring_at(
+            "b",
+            chrono::Utc::now() + chrono::Duration::days(8),
+        ))
+        .await
+        .expect("extend the claim");
+    assert!(
+        !backend
+            .compare_and_set(
+                &owned_expiring_at("c", chrono::Utc::now() + chrono::Duration::seconds(120)),
+                Expect::ExpiredOwner("b")
+            )
+            .await
+            .expect("reclaim a revived claim"),
+        "a reclaim must not replace a claim that is no longer expired"
+    );
+    assert_eq!(
+        backend
+            .get_by_path(path)
+            .await
+            .expect("read")
+            .expect("the revived claim must survive")
+            .owner_token(),
+        Some("b"),
+        "the revived claim must be left in place"
+    );
+}
+
+#[tokio::test]
+async fn memory_backend_honours_expired_owner_precondition() {
+    assert_expired_owner_contract(&MemoryBackend::new()).await;
+}
+
+#[tokio::test]
+async fn file_backend_honours_expired_owner_precondition() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let backend = FileBackend::new(dir.path().to_str().expect("utf8 path")).expect("file backend");
+    assert_expired_owner_contract(&backend).await;
+}
+
+#[tokio::test]
+async fn cache_wrapper_preserves_expired_owner_precondition() {
+    use secreton_storage::cache::InMemoryCache;
+
+    let storage: Arc<dyn StorageBackend + Send + Sync> = Arc::new(CachedStorage::new(
+        MemoryBackend::new(),
+        InMemoryCache::new(),
+        Duration::from_secs(60),
+    ));
+    assert_expired_owner_contract(storage.as_ref()).await;
+}
+
 #[tokio::test]
 async fn file_backend_honours_owner_conditional_replacement() {
     let dir = tempfile::tempdir().expect("temp dir");

@@ -202,6 +202,13 @@ impl StorageBackend for MemoryBackend {
             crate::Expect::UnexpiredOwner(token) => existing.is_some_and(|e| {
                 e.has_owner(token) && crate::lease_has_not_expired(e, Utc::now().timestamp())
             }),
+            // Owner *and* already expired, under the same write guard: reclaiming a lapsed
+            // reservation must not overwrite one that another reader extended back to life
+            // in the read-to-write window. A record without an expiration fails closed —
+            // "missing" is not proof of expiry.
+            crate::Expect::ExpiredOwner(token) => {
+                existing.is_some_and(|e| e.has_owner(token) && e.is_expired())
+            }
             crate::Expect::Any => true,
         };
         if !holds {
@@ -1062,6 +1069,90 @@ mod tests {
                 .await
                 .unwrap(),
             "a live owned lease must be renewable"
+        );
+    }
+
+    /// Regression: reclaiming a lapsed reservation with `Expect::Owner` could overwrite a
+    /// claim that the record's own holder extended back to life between the reclaimer's read
+    /// and its write — the owner token does not change when a claim is extended, so an
+    /// owner-only precondition still matched. `ExpiredOwner` folds "still expired" into the
+    /// same atomic step, so a record that became live is left untouched. Falsified by treating
+    /// the new variant like `Owner`.
+    #[tokio::test]
+    async fn an_expired_owner_write_refuses_to_overwrite_a_revived_claim() {
+        let backend = MemoryBackend::new();
+        let path = "sys/auth/refresh-reservations/claim";
+        let owner = "attempt-a";
+
+        // The positive control: a claim that is owned and still expired is replaceable, so
+        // the variant is not simply refusing every write.
+        let lapsed = SecretEntry::new(
+            path.to_string(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by(owner)
+        .with_expiration(Utc::now() - chrono::Duration::seconds(1));
+        backend.store(&lapsed).await.unwrap();
+
+        let reclaim = SecretEntry::new(
+            path.to_string(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by("attempt-b")
+        .with_expiration(Utc::now() + chrono::Duration::seconds(120));
+        assert!(
+            backend
+                .compare_and_set(&reclaim, crate::Expect::ExpiredOwner(owner))
+                .await
+                .unwrap(),
+            "a still-expired claim must be reclaimable"
+        );
+
+        // The holder extends the same record back to life (owner unchanged), as it does when a
+        // short claim lapses just as its exchange completes.
+        let revived = SecretEntry::new(
+            path.to_string(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by("attempt-b")
+        .with_expiration(Utc::now() + chrono::Duration::days(8));
+        backend.store(&revived).await.unwrap();
+
+        let overwrite = SecretEntry::new(
+            path.to_string(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by("attempt-c")
+        .with_expiration(Utc::now() + chrono::Duration::seconds(120));
+        assert!(
+            !backend
+                .compare_and_set(&overwrite, crate::Expect::ExpiredOwner("attempt-b"))
+                .await
+                .unwrap(),
+            "a reclaim must not overwrite a claim that is no longer expired, even though its \
+             owner token is unchanged"
+        );
+        assert_eq!(
+            backend
+                .get_by_path(path)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_token(),
+            Some("attempt-b"),
+            "the revived claim must be left in place"
         );
     }
 }

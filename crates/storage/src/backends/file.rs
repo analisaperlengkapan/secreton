@@ -493,6 +493,12 @@ impl StorageBackend for FileBackend {
             crate::Expect::UnexpiredOwner(token) => existing.as_ref().is_some_and(|e| {
                 e.has_owner(token) && crate::lease_has_not_expired(e, Utc::now().timestamp())
             }),
+            // Owner *and* already expired, under the same advisory lock as the replacement:
+            // a reclaim must not overwrite a claim another reader extended back to life in
+            // the read-to-write window. A record without an expiration fails closed.
+            crate::Expect::ExpiredOwner(token) => existing
+                .as_ref()
+                .is_some_and(|e| e.has_owner(token) && e.is_expired()),
             crate::Expect::Any => true,
         };
         if !holds {
@@ -1046,6 +1052,68 @@ mod tests {
                 .await
                 .expect("conditional renewal"),
             "a live owned lease must be renewable"
+        );
+    }
+
+    /// Regression: reclaiming a lapsed reservation with `Expect::Owner` could overwrite a
+    /// claim the holder extended back to life in the read-to-write window — the owner token is
+    /// unchanged by an extension, so an owner-only precondition still matched. `ExpiredOwner`
+    /// folds "still expired" into the same advisory-locked step. Falsified by treating the new
+    /// variant like `Owner`.
+    #[tokio::test]
+    async fn an_expired_owner_write_refuses_a_revived_claim() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let backend = FileBackend::new(dir.path().to_str().expect("utf8 path")).expect("backend");
+        let path = "sys/auth/refresh-reservations/claim";
+        let claim = |owner: &str, expires_at: chrono::DateTime<Utc>| {
+            entry_at(Uuid::new_v4(), path, b"claim")
+                .owned_by(owner)
+                .with_expiration(expires_at)
+        };
+
+        // Positive control: a still-expired claim is reclaimable.
+        backend
+            .store(&claim(
+                "attempt-a",
+                Utc::now() - chrono::Duration::seconds(1),
+            ))
+            .await
+            .expect("store lapsed claim");
+        assert!(
+            backend
+                .compare_and_set(
+                    &claim("attempt-b", Utc::now() + chrono::Duration::seconds(120)),
+                    crate::Expect::ExpiredOwner("attempt-a")
+                )
+                .await
+                .expect("conditional reclaim"),
+            "a still-expired claim must be reclaimable"
+        );
+
+        // The holder extends the record back to life; the owner token is unchanged.
+        backend
+            .store(&claim("attempt-b", Utc::now() + chrono::Duration::days(8)))
+            .await
+            .expect("extend the claim");
+        assert!(
+            !backend
+                .compare_and_set(
+                    &claim("attempt-c", Utc::now() + chrono::Duration::seconds(120)),
+                    crate::Expect::ExpiredOwner("attempt-b")
+                )
+                .await
+                .expect("conditional reclaim"),
+            "a reclaim must not overwrite a claim that is no longer expired"
+        );
+        assert_eq!(
+            backend
+                .get_by_path(path)
+                .await
+                .expect("read")
+                .expect("the revived claim must survive")
+                .owner_token(),
+            Some("attempt-b"),
+            "the revived claim must be left in place"
         );
     }
 }

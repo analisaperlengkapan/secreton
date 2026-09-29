@@ -930,13 +930,13 @@ impl StorageBackend for RedisBackend {
         let path_key = format!("secreton:path:{}", entry.path);
 
         let expected_owner = match expect {
-            crate::Expect::Owner(token) | crate::Expect::UnexpiredOwner(token) => {
-                Some(token.to_string())
-            }
+            crate::Expect::Owner(token)
+            | crate::Expect::UnexpiredOwner(token)
+            | crate::Expect::ExpiredOwner(token) => Some(token.to_string()),
             _ => None,
         };
 
-        // KEYS[1]=path key; ARGV[1]=value, ARGV[2]=mode ("absent" | "any" | "owner" | "unexpired_owner"),
+        // KEYS[1]=path key; ARGV[1]=value, ARGV[2]=mode ("absent" | "any" | "owner" | "unexpired_owner" | "expired_owner"),
         // ARGV[3]=owner token (owner mode only), ARGV[4]=the id the payload was built with,
         // ARGV[5]=the os.time() at which the record expires, or '' for no expiry.
         //
@@ -990,7 +990,7 @@ impl StorageBackend for RedisBackend {
             end
 
             if not mapping then
-                if mode == 'owner' or mode == 'unexpired_owner' then
+                if mode == 'owner' or mode == 'unexpired_owner' or mode == 'expired_owner' then
                     return 0
                 end
                 if write('secreton:entry:' .. expected, ARGV[1]) == 0 then
@@ -1013,7 +1013,7 @@ impl StorageBackend for RedisBackend {
                 end
             end
 
-            if mode == 'owner' or mode == 'unexpired_owner' then
+            if mode == 'owner' or mode == 'unexpired_owner' or mode == 'expired_owner' then
                 local current = redis.call('GET', 'secreton:entry:' .. mapping)
                 if not current then
                     return 0
@@ -1032,6 +1032,15 @@ impl StorageBackend for RedisBackend {
                     if not lease_expires or lease_expires <= tonumber(redis.call('TIME')[1]) then
                         return 0
                     end
+                end
+                -- The converse precondition, for reclaiming a lapsed reservation. Redis
+                -- enforces a record's deadline by expiring its keys, so a reservation that
+                -- has lapsed is simply absent here (the read above found no mapping) and a
+                -- record that *is* present is by definition not expired. There is therefore
+                -- nothing to reclaim in place: fail the precondition and let the caller's
+                -- insert-if-absent decide, which it does correctly because the slot is free.
+                if mode == 'expired_owner' then
+                    return 0
                 end
             end
 
@@ -1056,6 +1065,7 @@ impl StorageBackend for RedisBackend {
             crate::Expect::Any => "any",
             crate::Expect::Owner(_) => "owner",
             crate::Expect::UnexpiredOwner(_) => "unexpired_owner",
+            crate::Expect::ExpiredOwner(_) => "expired_owner",
             // Dispatched above; restated so the match stays exhaustive.
             crate::Expect::AbsentFenced(_) => {
                 return Err(StorageError::Unsupported {
@@ -2411,6 +2421,49 @@ mod tests {
                 .await
                 .expect("conditional renewal"),
             "a live owned lease must be renewable"
+        );
+    }
+
+    /// Regression: reclaiming a lapsed reservation with `Expect::Owner` could overwrite a
+    /// claim the holder had extended back to life, because the owner token does not change on
+    /// extension. On Redis the reservation's deadline is enforced by key expiry, so a claim
+    /// that is present is never expired and the reclaim must always fail, leaving the caller
+    /// to the insert-if-absent (correct here because a lapsed claim's keys are gone). The
+    /// property: an `ExpiredOwner` write against a present, live record reports `Ok(false)`.
+    #[tokio::test]
+    async fn an_expired_owner_write_refuses_a_live_record() {
+        let Some(url) = redis_url() else {
+            return;
+        };
+        let namespace = format!("it/{}", Uuid::new_v4());
+        let path = format!("{namespace}/claim/expired-owner");
+        let backend = RedisBackend::new(&url).await.expect("connect");
+
+        // A live owned claim: its keys are present, so its deadline has not passed.
+        let live = entry_at(&path, b"live")
+            .owned_by("attempt-a")
+            .with_expiration(Utc::now() + chrono::Duration::days(8));
+        backend.store(&live).await.expect("store live claim");
+
+        let overwrite = entry_at(&path, b"overwrite")
+            .owned_by("attempt-b")
+            .with_expiration(Utc::now() + chrono::Duration::seconds(120));
+        assert!(
+            !backend
+                .compare_and_set(&overwrite, Expect::ExpiredOwner("attempt-a"))
+                .await
+                .expect("conditional reclaim"),
+            "a reclaim must not overwrite a live claim, whose owner token still matches"
+        );
+        assert_eq!(
+            backend
+                .get_by_path(&path)
+                .await
+                .expect("read")
+                .expect("the live claim must survive")
+                .owner_token(),
+            Some("attempt-a"),
+            "the live claim must be left in place"
         );
     }
 }

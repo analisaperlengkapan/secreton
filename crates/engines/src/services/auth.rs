@@ -1356,11 +1356,20 @@ impl AuthenticationService {
     /// *its* reservation, letting a second exchange of the same token run concurrently with
     /// the first. That is the overlap this closes.
     ///
-    /// The takeover instead replaces the expired record with this attempt's own reservation
-    /// using an owner-conditional `compare_and_set` against the *expired owner's* token: a
-    /// concurrent reclaimer that got there first has changed the owner (or removed the
-    /// record), so this write's precondition fails and it reports `false` rather than
-    /// overwriting a live claim. A record that is not expired is left untouched.
+    /// The takeover replaces the expired record with this attempt's own reservation using an
+    /// [`Expect::ExpiredOwner`] `compare_and_set` against the *expired owner's* token. That
+    /// precondition is a conjunction of three facts evaluated in the same indivisible step
+    /// as the write — the record still exists, still carries that owner, and is *still
+    /// expired*. The read above confirmed all three, but an arbitrary window separates it
+    /// from this write, and the owner alone is not enough: the original holder's extension
+    /// ([`Self::extend_refresh_claim`]) is itself an owner-conditional replacement that does
+    /// not change the token, so a reclaimer conditioned only on the token would replace a
+    /// claim that had just been extended back to life. The extended claim is then gone, and
+    /// the token it guarded — now the reclaimer's reservation, written with the short claim
+    /// deadline — becomes claimable and exchangeable again: the same refresh token exchanged
+    /// twice. Folding "still expired" into the precondition means an extension in that window
+    /// makes this write match no record, so it reports `false` and the caller falls through
+    /// to insert-if-absent, which correctly finds the slot occupied.
     async fn reclaim_expired_refresh_claim(&self, path: &str, entry: &SecretEntry) -> bool {
         let Ok(Some(existing)) = self.storage.get_by_path(path).await else {
             // Absent or unreadable: fall through to the insert-if-absent, which is the
@@ -1375,7 +1384,10 @@ impl AuthenticationService {
         };
         matches!(
             self.storage
-                .compare_and_set(entry, secreton_storage::Expect::Owner(&existing_owner))
+                .compare_and_set(
+                    entry,
+                    secreton_storage::Expect::ExpiredOwner(&existing_owner)
+                )
                 .await,
             Ok(true)
         )
@@ -4155,6 +4167,15 @@ mod tests {
         /// `Ok(false)`, modelling another attempt having taken the slot in the window between
         /// the session write and the claim extension.
         fail_next_claim_extension: std::sync::atomic::AtomicBool,
+        /// When set, the next `ExpiredOwner` write at this refresh-reservation path first has
+        /// the *original holder* extend the claim back to life, modelling the extension a
+        /// reclaimer's read-to-write window admits. The `ExpiredOwner` precondition is then
+        /// evaluated against the now-live record, which is exactly the race: a reclaim
+        /// conditioned only on the owner token would replace the freshly extended live claim.
+        extend_before_expired_reclaim: std::sync::Mutex<Option<(String, SecretEntry)>>,
+        /// When set, the next `store` of a revoked-token record fails, modelling the durable
+        /// revocation write dropping while the in-memory one still lands.
+        fail_next_revocation_store: std::sync::atomic::AtomicBool,
     }
 
     impl FailingReservationBackend {
@@ -4168,7 +4189,19 @@ mod tests {
                 stale_readback: std::sync::Mutex::new(None),
                 fail_next_user_read: std::sync::atomic::AtomicBool::new(false),
                 fail_next_claim_extension: std::sync::atomic::AtomicBool::new(false),
+                extend_before_expired_reclaim: std::sync::Mutex::new(None),
+                fail_next_revocation_store: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        /// Arm the next `ExpiredOwner` write at `path` to first overwrite the record with
+        /// `live`, modelling the holder's extension landing in the reclaimer's read-to-write
+        /// window.
+        fn extend_claim_before_expired_reclaim(&self, path: &str, live: SecretEntry) {
+            *self
+                .extend_before_expired_reclaim
+                .lock()
+                .expect("extend-before-reclaim lock") = Some((path.to_string(), live));
         }
 
         fn unconditional_reservation_deletes(&self) -> u64 {
@@ -4187,6 +4220,15 @@ mod tests {
     #[async_trait::async_trait]
     impl StorageBackend for FailingReservationBackend {
         async fn store(&self, entry: &SecretEntry) -> StorageResult<()> {
+            if entry.path.starts_with(REVOKED_TOKEN_STORAGE_PREFIX)
+                && self
+                    .fail_next_revocation_store
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(secreton_storage::StorageError::ConnectionFailed {
+                    message: "injected revocation-store failure".to_string(),
+                });
+            }
             self.inner.store(entry).await
         }
         async fn get_by_id(&self, id: Uuid) -> StorageResult<Option<SecretEntry>> {
@@ -4253,6 +4295,27 @@ mod tests {
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 return Ok(false);
+            }
+            // Model the holder's extension landing in the reclaimer's read-to-write window.
+            // Keyed on the path alone, not on the precondition variant, so the same injected
+            // interleaving exercises whichever precondition the reclaim uses — which is what
+            // makes the regression falsifiable: with the old owner-only precondition the
+            // now-live record still matches and is overwritten, and the token is handed out
+            // again.
+            if entry.path.starts_with(REFRESH_RESERVATION_STORAGE_PREFIX) {
+                let extended = {
+                    let mut slot = self
+                        .extend_before_expired_reclaim
+                        .lock()
+                        .expect("extend-before-reclaim lock");
+                    match slot.as_ref() {
+                        Some((path, _)) if path == &entry.path => slot.take().map(|(_, e)| e),
+                        _ => None,
+                    }
+                };
+                if let Some(live) = extended {
+                    self.inner.upsert(&live).await?;
+                }
             }
             self.inner.compare_and_set(entry, expect).await
         }
@@ -5021,6 +5084,165 @@ mod tests {
                 .expect("re-claim an unrevoked lapsed reservation")
                 .is_some(),
             "a lapsed reservation with no durable revocation must remain reclaimable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reclaim_cannot_replace_a_claim_extended_back_to_life_in_the_window() {
+        // Regression (Auth Bypass, CWE-367): `reclaim_expired_refresh_claim` read an expired
+        // claim, confirmed its owner, and then replaced it with an owner-conditional
+        // `compare_and_set`. The owner token does not change when a claim is *extended*, so a
+        // holder whose short claim had lapsed but whose exchange then completed could extend
+        // the same record back to life in the reclaimer's read-to-write window. The reclaimer's
+        // write still matched on the token and overwrote the freshly extended live claim with
+        // its own short-deadline reservation; the original holder's slot was gone, and once
+        // the reclaimer's short deadline lapsed the token was claimable and exchangeable again
+        // — the same refresh token exchanged twice.
+        //
+        // The property: a reclaim lands only while the record is *still expired*, so an
+        // extension in the window makes it match nothing and report failure.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "reclaim-race-refresh-token";
+        let owner_a = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // A's exchange outran its short claim: the reservation is now lapsed but still
+        // present, which is what admits a reclaim.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let path = AuthenticationService::refresh_reservation_path(token);
+
+        // Arm the interleaving: A's late extension lands at the reclaim's write, making the
+        // record live again (owner unchanged) before the precondition is evaluated.
+        let live = SecretEntry::new(
+            path.clone(),
+            Vec::new(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Internal,
+            Uuid::nil(),
+        )
+        .owned_by(&owner_a)
+        .with_expiration(expiry);
+        backend.extend_claim_before_expired_reclaim(&path, live);
+
+        // B's reclaim must not land: the record it was about to replace is live again.
+        let owner_b = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reclaim a lapsed reservation");
+
+        let stored = backend
+            .inner
+            .get_by_path(&path)
+            .await
+            .expect("read reservation")
+            .expect("the extended live claim must survive");
+        if let Some(owner_b) = owner_b {
+            assert_ne!(
+                stored.owner_token(),
+                Some(owner_b.as_str()),
+                "a reclaim must not replace a claim that was extended back to life in the \
+                 read-to-write window: the token it guards would become exchangeable again"
+            );
+            assert_eq!(
+                stored.owner_token(),
+                Some(owner_a.as_str()),
+                "the extended claim must still belong to the holder that extended it"
+            );
+        } else {
+            // Refusing the reclaim outright is also correct: the slot is occupied by the live
+            // claim. What must not happen is B winning it.
+            assert_eq!(
+                stored.owner_token(),
+                Some(owner_a.as_str()),
+                "the live claim must not be displaced when the reclaim is refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_durable_revocation_still_blocks_replay_via_the_reservation() {
+        // Regression (Finding, Auth Bypass): `commit_refresh_token_rotation` writes the
+        // durable revocation first, but `revoke_token` deliberately tolerates a durable-write
+        // failure — the in-memory revocation still lands, and on its own that is enough for
+        // the local instance but not for a different replica or a restart, which never saw
+        // it. Replay protection then rests entirely on the reservation, so if that carried
+        // only the short claim window it would lapse and a replay would win the slot for a
+        // token that was already exchanged.
+        //
+        // The property: the reservation is extended to the token's own `exp` *before* the
+        // revocation is written, so a revocation that fails to persist still leaves the slot
+        // occupied for the token's whole life.
+        let _env = crate::test_support::without_root_key();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_storage =
+            secreton_storage::FileBackend::new(dir.path().to_str().expect("utf-8 path"))
+                .expect("file backend");
+        let backend = Arc::new(FailingReservationBackend::new(file_storage));
+        let storage: Arc<dyn StorageBackend + Send + Sync> = backend.clone();
+        let service = auth_with_storage(storage).await;
+        // A one-second claim window stands in for the production two minutes.
+        service.force_short_claim_ttl();
+
+        let expiry = chrono::Utc::now() + chrono::Duration::days(8);
+        let token = "failed-revocation-refresh-token";
+        let owner = service
+            .reserve_refresh_token(token, expiry)
+            .await
+            .expect("reserve")
+            .expect("the first claim wins");
+
+        // The exchange succeeds, so the claim is extended to the token's own expiry before
+        // the rotation commits.
+        assert!(
+            service.extend_refresh_claim(token, &owner, expiry).await,
+            "the completed exchange must hold its extended claim"
+        );
+
+        // The durable revocation then fails, which `revoke_token` tolerates.
+        backend
+            .fail_next_revocation_store
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service.revoke_token(token.to_string(), expiry).await;
+        assert!(
+            backend
+                .inner
+                .get_by_path(&AuthenticationService::revoked_token_path(token))
+                .await
+                .expect("read revocation")
+                .is_none(),
+            "the durable revocation must not have landed, or the test proves nothing"
+        );
+
+        // Model a different replica, or this instance after a restart: no in-memory record of
+        // either the claim or the revocation.
+        service.token_blacklist.write().await.clear();
+
+        // Wait past the short claim window, so a slot that had only the short claim would now
+        // be reclaimable and a replay would win it.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            service
+                .reserve_refresh_token(token, expiry)
+                .await
+                .expect("re-claim after the short window")
+                .is_none(),
+            "a failed durable revocation must not free an exchanged token while the extended \
+             reservation still stands, or the token is exchanged a second time"
         );
     }
 

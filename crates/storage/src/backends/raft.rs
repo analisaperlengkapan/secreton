@@ -257,6 +257,12 @@ impl RaftStateMachine {
                 e.has_owner(token)
                     && crate::lease_has_not_expired(e, chrono::Utc::now().timestamp())
             }),
+            // Owner *and* already expired, in the same state-machine step as the replacement:
+            // a reclaim must not overwrite a claim another reader extended back to life in
+            // the read-to-write window. A record without an expiration fails closed.
+            crate::Expect::ExpiredOwner(token) => existing
+                .as_ref()
+                .is_some_and(|e| e.has_owner(token) && e.is_expired()),
             crate::Expect::Any => true,
             crate::Expect::AbsentFenced(_) => false,
         };

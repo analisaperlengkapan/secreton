@@ -246,6 +246,26 @@ pub enum Expect<'a> {
     /// still live at the instant it is replaced, and a lapsed lease is never revived. Fails
     /// closed on a missing or unparseable deadline, exactly as [`LEASE_EXPIRES_AT_KEY`] does.
     UnexpiredOwner(&'a str),
+    /// The record at the path must carry this exact owner token **and** its own recorded
+    /// expiration (`expires_at`) must already have passed — checked against the backend's
+    /// own clock, in the same indivisible step as the write.
+    ///
+    /// This is [`Self::Owner`] with the opposite deadline condition, and it exists because a
+    /// read-then-replace is not enough to reclaim a lapsed reservation. A caller that reads
+    /// an expired claim, confirms its owner, and then replaces it with an owner-conditional
+    /// write can be overtaken between the read and the write: another reader also sees the
+    /// record expired, the original owner extends it back to life (the extension is an
+    /// owner-conditional *replacement* that does not change the owner token), and the
+    /// reclaimer's write — conditioned only on the token, which the extended record still
+    /// carries — then replaces a live claim. The record that had just been extended is gone,
+    /// and the token it guarded can be exchanged a second time.
+    ///
+    /// Folding "still expired" into the precondition closes that window: the takeover lands
+    /// only while the record is both owned and unexpired-free at the instant it is replaced,
+    /// so a claim that became live in between is left alone and the reclaimer reports
+    /// `Ok(false)`. Fails closed on a record with no `expires_at`, exactly as it treats a
+    /// live record: "missing" is not proof of expiry.
+    ExpiredOwner(&'a str),
     /// No precondition. The write is still a single atomic replacement, which is what
     /// distinguishes it from a read followed by a separate `store`.
     Any,
