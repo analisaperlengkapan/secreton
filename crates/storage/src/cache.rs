@@ -335,6 +335,11 @@ where
     /// Paths the transaction wrote or deleted from, plus the ids it wrote or removed.
     touched_paths: Vec<String>,
     touched_ids: Vec<Uuid>,
+    /// The latest path each id was given by a staged write in this transaction. A delete
+    /// resolves the id's path from here first: the committed record may still name the id's
+    /// *previous* path, and reconciling only that path would leave the path the staged write
+    /// installed cached after the delete.
+    staged_paths: std::collections::HashMap<Uuid, String>,
 }
 
 impl<S, C> CachedTransaction<S, C>
@@ -369,6 +374,7 @@ where
     async fn store(&mut self, entry: &SecretEntry) -> StorageResult<()> {
         self.record_displaced_id(entry).await;
         self.inner.store(entry).await?;
+        self.staged_paths.insert(entry.id, entry.path.clone());
         self.touched_paths.push(entry.path.clone());
         self.touched_ids.push(entry.id);
         Ok(())
@@ -377,27 +383,50 @@ where
     async fn update(&mut self, entry: &SecretEntry) -> StorageResult<()> {
         self.record_displaced_id(entry).await;
         self.inner.update(entry).await?;
+        self.staged_paths.insert(entry.id, entry.path.clone());
         self.touched_paths.push(entry.path.clone());
         self.touched_ids.push(entry.id);
         Ok(())
     }
 
     async fn delete(&mut self, id: Uuid) -> StorageResult<bool> {
-        // Resolve the path *before* the delete. The record is what populated the path key,
-        // and after the commit it may already be gone, so it cannot be recovered then.
-        let previous = match self
-            .cache
-            .get(&CachedStorage::<S, C>::cache_key_for_id(id))
+        // Resolve every path this id can currently be reached through, *before* the delete:
+        // after the commit the record is gone and the path cannot be recovered.
+        //
+        // The backend is the authority, not the cache's id key. That key can name a path an
+        // earlier relocation moved the id away from — a write this wrapper did not observe,
+        // or one whose readback failed — and reconciling only that path would leave the path
+        // the record actually occupies cached after the delete, so `get_by_path` kept serving
+        // the removed secret until its TTL expired. A write staged in this same transaction
+        // is newer still: the backend has not seen it, so it names the id's previous path.
+        let mut paths: Vec<String> = Vec::new();
+        if let Some(staged) = self.staged_paths.get(&id) {
+            paths.push(staged.clone());
+        }
+        if let Some(backend_path) = self
+            .storage
+            .get_by_id(id)
             .await
+            .ok()
+            .flatten()
+            .map(|entry| entry.path)
+            && !paths.contains(&backend_path)
         {
-            Ok(Some(bytes)) => postcard::from_bytes::<SecretEntry>(&bytes).ok(),
-            _ => None,
+            paths.push(backend_path);
         }
-        .or(self.storage.get_by_id(id).await.unwrap_or_default());
+        if paths.is_empty()
+            && let Ok(Some(bytes)) = self
+                .cache
+                .get(&CachedStorage::<S, C>::cache_key_for_id(id))
+                .await
+            && let Ok(entry) = postcard::from_bytes::<SecretEntry>(&bytes)
+            && !entry.path.is_empty()
+        {
+            paths.push(entry.path);
+        }
+
         let removed = self.inner.delete(id).await?;
-        if let Some(entry) = previous {
-            self.touched_paths.push(entry.path);
-        }
+        self.touched_paths.extend(paths);
         self.touched_ids.push(id);
         Ok(removed)
     }
@@ -409,6 +438,7 @@ where
             default_ttl,
             touched_paths,
             touched_ids,
+            staged_paths: _,
             inner,
         } = *self;
 
@@ -790,6 +820,7 @@ where
             inner,
             touched_paths: Vec::new(),
             touched_ids: Vec::new(),
+            staged_paths: std::collections::HashMap::new(),
         }))
     }
 
@@ -1695,6 +1726,76 @@ mod round_trip_tests {
                 .expect("backend read")
                 .is_none(),
             "the backend must no longer hold the displaced record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_delete_reconciles_the_backend_path_not_a_stale_cached_one() {
+        // Regression: `CachedTransaction::delete` resolved the id's path from the cache's id
+        // key, which can name a path the record no longer occupies — a relocation this
+        // wrapper did not observe (another replica sharing the backend), or a cache entry
+        // that outlived the record it described. It then reconciled only that path, leaving
+        // the path the record actually occupies cached, so `get_by_path` kept serving the
+        // deleted secret until its TTL expired. The property: the commit reconciles the path
+        // the backend names, not a stale cached one.
+        let backend = crate::backends::MemoryBackend::new();
+        let cached = CachedStorage::new(
+            backend.clone(),
+            InMemoryCache::new(),
+            Duration::from_secs(300),
+        );
+        let old_path = "kv/tx/delete-stale-old";
+        let new_path = "kv/tx/delete-stale-new";
+
+        // Seed through the wrapper so the id key caches `old_path`.
+        let entry = sample_entry_with_path(old_path, b"payload");
+        let id = entry.id;
+        crate::StorageBackend::store(&cached, &entry)
+            .await
+            .expect("seed");
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, id)
+                .await
+                .expect("warm id")
+                .is_some()
+        );
+
+        // Relocate the id in the backend without going through the wrapper, so the wrapper's
+        // id key still names `old_path` while the record now names `new_path`.
+        let relocated = SecretEntry {
+            path: new_path.to_string(),
+            ..entry.clone()
+        };
+        crate::StorageBackend::store(&backend, &relocated)
+            .await
+            .expect("relocate");
+        // Warm the new path key, so a stale hit is what the test observes.
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, new_path)
+                .await
+                .expect("warm")
+                .is_some()
+        );
+
+        let mut tx = crate::StorageBackend::begin_transaction(&cached)
+            .await
+            .expect("begin");
+        tx.delete(id).await.expect("stage delete");
+        tx.commit().await.expect("commit");
+
+        assert!(
+            crate::StorageBackend::get_by_path(&cached, new_path)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "the path the backend names must be reconciled even when the cached id key is stale"
+        );
+        assert!(
+            crate::StorageBackend::get_by_id(&cached, id)
+                .await
+                .expect("cached read")
+                .is_none(),
+            "the deleted id must not be readable"
         );
     }
 }

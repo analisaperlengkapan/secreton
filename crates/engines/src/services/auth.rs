@@ -3264,6 +3264,7 @@ mod tests {
         let (storage, service, _root_key) = auth_with_open_barrier().await;
 
         let password = crate::test_support::generated_password();
+        let wrong_password = crate::test_support::generated_password();
         let password_hash = service
             .userpass_method
             .hash_password(&password)
@@ -3318,7 +3319,7 @@ mod tests {
         );
         assert!(
             !service
-                .verify_password(&user.username, "not-the-password")
+                .verify_password(&user.username, &wrong_password)
                 .await
                 .expect("verify"),
             "a wrong password must still be rejected"

@@ -388,6 +388,21 @@ impl SecretService {
                                 .record_access(path, AccessType::Read, start_time.elapsed(), true)
                                 .await;
 
+                            // Audit the read here too. The cache-hit branch returns early,
+                            // so without this a read served from cache left no `SecretAccess`
+                            // event — the read path an operator can repeat to keep a secret
+                            // out of the audit trail entirely. The event is identical to the
+                            // cache-miss one below; the cache only shortens the fetch, it
+                            // does not change what was accessed.
+                            let _ = self
+                                .audit
+                                .log_event(SecurityEventType::SecretAccess {
+                                    secret_path: path.to_string(),
+                                    user: user.id.to_string(),
+                                    action: "read".to_string(),
+                                })
+                                .await;
+
                             let metadata = SecretMetadata {
                                 description: encrypted_entry.metadata.get("description").cloned(),
                                 tags: encrypted_entry.tags.clone(),
@@ -2931,6 +2946,75 @@ mod tests {
         let secret = service.get_secret("app/config", &user, None).await.unwrap();
         assert_eq!(secret.path, "app/config");
         assert!(secret.data.contains_key("key1"));
+    }
+
+    /// Regression: a read served from the plaintext cache returned before logging a
+    /// `SecretAccess` event, so a caller could read a secret repeatedly without leaving an
+    /// audit trail — the cache-hit path evaded auditing entirely. The property: the second,
+    /// cache-served read is audited exactly like the first.
+    #[tokio::test]
+    async fn a_cache_hit_read_is_audited() {
+        let _env = crate::test_support::with_root_key();
+        let storage = Arc::new(MemoryBackend::new());
+        let crypto = Arc::new(CryptoService::new(storage.clone()).await.unwrap());
+        let audit = Arc::new(
+            AuditLogger::new(storage.clone(), 2555, 1, true)
+                .await
+                .unwrap(),
+        );
+        let identity = Arc::new(secreton_auth::InMemoryIdentityService::new());
+        let policy_service = Arc::new(secreton_auth::PolicyService::new());
+        let performance = Arc::new(SecretPerformanceOptimizer::default());
+        seed_admin_policy(&policy_service).await;
+
+        let user = mock_user();
+        let user_uuid = Uuid::parse_str(&user.id).unwrap();
+        let mut data = HashMap::new();
+        data.insert("key1".to_string(), "value1".to_string());
+        let secret_entry = SecretEntry::new(
+            "app/cache-audit".to_string(),
+            crypto
+                .encrypt_data(&serde_json::to_vec(&data).unwrap())
+                .await
+                .unwrap(),
+            EncryptionMetadata::default(),
+            SecurityLevel::Secret,
+            user_uuid,
+        );
+        storage.store(&secret_entry).await.expect("seed");
+
+        let service = SecretService::new(
+            storage.clone(),
+            crypto,
+            audit,
+            identity,
+            policy_service,
+            performance,
+        )
+        .await
+        .unwrap();
+
+        // First read decrypts and populates the plaintext cache.
+        service
+            .get_secret("app/cache-audit", &user, None)
+            .await
+            .expect("first read");
+        // The second read is served from that cache.
+        service
+            .get_secret("app/cache-audit", &user, None)
+            .await
+            .expect("cache-served read");
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let logs = audit_entries(&storage).await;
+        let reads = logs
+            .iter()
+            .filter(|l| l.contains("app/cache-audit") && l.contains("\"operation\":\"read\""))
+            .count();
+        assert_eq!(
+            reads, 2,
+            "a read served from the cache must be audited like any other read, got {logs:?}"
+        );
     }
 
     #[tokio::test]
