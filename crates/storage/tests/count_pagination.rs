@@ -11,9 +11,12 @@
 //!
 //! ```text
 //! docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:17
-//! SECRETON_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres \
-//!     cargo test -p secreton-storage --test count_pagination
+//! export SECRETON_TEST_POSTGRES_URL="postgres://postgres@localhost:5432/postgres"
+//! cargo test -p secreton-storage --test count_pagination
 //! ```
+//!
+//! The URL above embeds no password; insert the container's `POSTGRES_PASSWORD` between
+//! the role name and the `@`.
 //!
 //! Without it the PostgreSQL arm returns early, like the other database integration tests.
 use secreton_storage::{

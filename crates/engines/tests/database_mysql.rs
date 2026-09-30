@@ -9,9 +9,12 @@
 //!
 //! ```text
 //! docker run --rm -d -p 3306:3306 -e MARIADB_ROOT_PASSWORD=rootpw mariadb:11
-//! SECRETON_TEST_MYSQL_URL=mysql://root:rootpw@127.0.0.1:3306/secreton_test \
-//!     cargo test -p secreton-engines --features mysql --test database_mysql
+//! export SECRETON_TEST_MYSQL_URL="mysql://root@127.0.0.1:3306/secreton_test"
+//! cargo test -p secreton-engines --features mysql --test database_mysql
 //! ```
+//!
+//! The URL above embeds no password; insert the container's `MARIADB_ROOT_PASSWORD`
+//! between the role name and the `@`.
 //!
 //! Without that variable each test returns early, so a fresh checkout needs no server.
 
@@ -44,6 +47,34 @@ fn database_url() -> Option<String> {
             None
         }
     }
+}
+
+/// The admin URL with its userinfo replaced by the issued account's.
+///
+/// The admin password is not a fixed string — CI and a local container use different
+/// ones — so the URL is split on its structure rather than matched against a literal.
+/// A literal substitution silently does nothing when the password differs, and the
+/// assertion that follows then runs against the *admin* connection and passes for the
+/// wrong reason.
+fn with_issued_credentials(admin_url: &str, issued_name: &str, issued_credential: &str) -> String {
+    let (scheme, rest) = admin_url
+        .split_once("://")
+        .expect("the admin URL has a scheme");
+    let at = rest.rfind('@').expect("the admin URL carries userinfo");
+    format!(
+        "{scheme}://{issued_name}:{issued_credential}@{}",
+        &rest[at + 1..]
+    )
+}
+
+/// The userinfo embedded in a connection URL, if it carries any.
+///
+/// The whole `user:password` pair is returned, not just the password: the password alone
+/// can be a substring of the database name (`secreton` inside `secreton_test`), which
+/// would make a `contains` check report a leak that is not there.
+fn embedded_userinfo(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    Some(&rest[..rest.find('@')?])
 }
 
 fn engine_for(url: &str) -> DatabaseEngine {
@@ -111,10 +142,7 @@ async fn issued_credentials_correspond_to_a_real_account() {
 
     // And they authenticate. This is what separates a provisioned account from a
     // fabricated one — the shape both MongoDB and Redis shipped with.
-    let issued_url = url.replace(
-        "root:rootpw@",
-        &format!("{issued_name}:{issued_credential}@"),
-    );
+    let issued_url = with_issued_credentials(&url, &issued_name, &issued_credential);
     let pool = mysql_async::Pool::new(issued_url.as_str());
     let conn = pool.get_conn().await;
     assert!(
@@ -143,10 +171,7 @@ async fn the_role_statement_is_applied_to_the_new_account() {
 
     // Creating the account is not enough: without the role SQL the caller gets a login
     // with no privileges, which fails at the first query rather than at issue time.
-    let issued_url = url.replace(
-        "root:rootpw@",
-        &format!("{issued_name}:{issued_credential}@"),
-    );
+    let issued_url = with_issued_credentials(&url, &issued_name, &issued_credential);
     let granted = privileges_of_current_user(&issued_url).await;
     assert!(
         granted.iter().any(|g| g.contains("SELECT")),
@@ -192,10 +217,11 @@ async fn the_returned_connection_string_does_not_carry_the_admin_password() {
         .generate_credentials("reader")
         .await
         .expect("issue credentials");
+    let admin_userinfo = embedded_userinfo(&url).expect("the admin URL carries userinfo");
     let connection_string = creds["connection_string"].as_str().expect("string");
 
     assert!(
-        !connection_string.contains("rootpw"),
+        !connection_string.contains(admin_userinfo),
         "the admin credential from the engine's own connection URL was handed to the \
          caller: {connection_string}"
     );

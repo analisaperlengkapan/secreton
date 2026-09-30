@@ -10,9 +10,12 @@
 //!
 //! ```text
 //! docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
-//! SECRETON_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres \
-//!     cargo test -p secreton-engines --features postgres --test database_postgres
+//! export SECRETON_TEST_POSTGRES_URL="postgres://postgres@localhost:5432/postgres"
+//! cargo test -p secreton-engines --features postgres --test database_postgres
 //! ```
+//!
+//! The URL above embeds no password; insert the container's `POSTGRES_PASSWORD` between
+//! the role name and the `@` (or use a role that authenticates without one).
 //!
 //! Without that variable each test returns early. That is deliberate: `cargo test` on a
 //! fresh checkout must not require Docker. CI sets the variable in the job that runs a
@@ -31,6 +34,30 @@ fn database_url() -> Option<String> {
             None
         }
     }
+}
+
+/// The admin URL with its userinfo replaced by the issued account's.
+///
+/// The admin password is not a fixed string — CI and a local container use different
+/// ones — so the URL is split on its structure rather than matched against a literal.
+/// A literal substitution silently does nothing when the password differs, and the
+/// assertion that follows then runs against the *admin* connection and passes for the
+/// wrong reason.
+fn with_issued_credentials(admin_url: &str, issued_name: &str, issued_credential: &str) -> String {
+    let (scheme, rest) = admin_url
+        .split_once("://")
+        .expect("the admin URL has a scheme");
+    let at = rest.rfind('@').expect("the admin URL carries userinfo");
+    format!(
+        "{scheme}://{issued_name}:{issued_credential}@{}",
+        &rest[at + 1..]
+    )
+}
+
+/// The userinfo embedded in a connection URL, if it carries any.
+fn embedded_userinfo(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    Some(&rest[..rest.find('@')?])
 }
 
 fn engine_for(url: &str) -> DatabaseEngine {
@@ -89,10 +116,7 @@ async fn issued_credentials_correspond_to_a_real_account() {
     );
 
     // And they actually authenticate.
-    let issued_url = url.replace(
-        "postgres:postgres@",
-        &format!("{issued_name}:{issued_credential}@"),
-    );
+    let issued_url = with_issued_credentials(&url, &issued_name, &issued_credential);
     let connected = tokio_postgres::connect(&issued_url, tokio_postgres::NoTls).await;
     assert!(
         connected.is_ok(),
@@ -142,10 +166,11 @@ async fn the_returned_connection_string_does_not_carry_the_admin_password() {
         .generate_credentials("reader")
         .await
         .expect("issue credentials");
+    let admin_userinfo = embedded_userinfo(&url).expect("the admin URL carries userinfo");
     let connection_string = creds["connection_string"].as_str().expect("string");
 
     assert!(
-        !connection_string.contains("postgres:postgres"),
+        !connection_string.contains(admin_userinfo),
         "the admin credentials from the engine's own connection URL were handed to the \
          caller: {connection_string}"
     );

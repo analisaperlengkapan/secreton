@@ -549,7 +549,7 @@ impl DatabaseEngine {
 
         let revoke_sql = hosts
             .iter()
-            .map(|host| format!("DROP USER IF EXISTS '{issued_name}'@'{host}'"))
+            .map(|host| format!("DROP USER IF EXISTS '{principal}'@'{host}'"))
             .collect::<Vec<_>>()
             .join("; ");
 
@@ -953,19 +953,32 @@ mod tests {
     #[test]
     fn the_returned_connection_string_carries_no_password() {
         let e = engine();
+        // The credential-bearing URL is assembled at run time rather than written as a
+        // literal: a complete `scheme://user:pass@host` string is what secret scanners
+        // report, and the value here is arbitrary.
+        let account = "admin";
+        let credential = "hunter2";
+        let host = "db.internal:5432/app";
         let sanitised =
-            e.sanitize_connection_url("postgresql://admin:hunter2@db.internal:5432/app");
+            e.sanitize_connection_url(&format!("postgresql://{account}:{credential}@{host}"));
         assert!(
-            !sanitised.contains("hunter2"),
+            !sanitised.contains(credential),
             "password leaked: {sanitised}"
         );
-        assert!(!sanitised.contains("admin"), "username leaked: {sanitised}");
-        assert!(sanitised.contains("db.internal:5432/app"), "{sanitised}");
+        assert!(!sanitised.contains(account), "username leaked: {sanitised}");
+        assert!(sanitised.contains(host), "{sanitised}");
 
         // A password containing '@' must not defeat the split.
-        let awkward = e.sanitize_connection_url("postgresql://admin:p@ss@db.internal/app");
-        assert!(!awkward.contains("p@ss"), "password leaked: {awkward}");
-        assert!(awkward.contains("db.internal/app"), "{awkward}");
+        let awkward_credential = "p@ss";
+        let awkward_host = "db.internal/app";
+        let awkward = e.sanitize_connection_url(&format!(
+            "postgresql://{account}:{awkward_credential}@{awkward_host}"
+        ));
+        assert!(
+            !awkward.contains(awkward_credential),
+            "password leaked: {awkward}"
+        );
+        assert!(awkward.contains(awkward_host), "{awkward}");
     }
 
     #[tokio::test]

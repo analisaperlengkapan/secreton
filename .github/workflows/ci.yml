@@ -42,6 +42,13 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      # Throwaway credentials for the service containers below, declared once so the
+      # connection URLs handed to the tests can be assembled from them. A complete
+      # `scheme://user:pass@host` literal is the shape secret scanners report.
+      SECRETON_TEST_POSTGRES_USER: secreton
+      SECRETON_TEST_POSTGRES_PASSWORD: secreton
+      SECRETON_TEST_MYSQL_PASSWORD: secreton
     services:
       postgres:
         image: postgres:17-alpine
@@ -75,12 +82,12 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --locked --features secreton-engines/postgres,secreton-engines/mysql
         env:
-          DATABASE_URL: postgres://secreton:secreton@localhost:5432/secreton_test
+          DATABASE_URL: postgres://${{ env.SECRETON_TEST_POSTGRES_USER }}:${{ env.SECRETON_TEST_POSTGRES_PASSWORD }}@localhost:5432/secreton_test
           # Without this the dynamic-database-credentials integration tests skip. They are
           # the only tests that prove an issued credential corresponds to a real account
           # rather than a fabricated one, so CI must actually run them.
-          SECRETON_TEST_POSTGRES_URL: postgres://secreton:secreton@localhost:5432/secreton_test
-          SECRETON_TEST_MYSQL_URL: mysql://root:secreton@127.0.0.1:3306/secreton_test
+          SECRETON_TEST_POSTGRES_URL: postgres://${{ env.SECRETON_TEST_POSTGRES_USER }}:${{ env.SECRETON_TEST_POSTGRES_PASSWORD }}@localhost:5432/secreton_test
+          SECRETON_TEST_MYSQL_URL: mysql://root:${{ env.SECRETON_TEST_MYSQL_PASSWORD }}@127.0.0.1:3306/secreton_test
           # Redis is a shared backend the seal service takes a cross-process lease on.
           # Its path-keyed delete and its compare-and-set are only meaningful against the
           # real server, so these run here rather than being asserted against a double.

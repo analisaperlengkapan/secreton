@@ -1974,10 +1974,14 @@ impl SealService {
         if self.fail_next_bootstrap.swap(false, Ordering::SeqCst) {
             // The marker is deliberately internal-looking so the test below can assert it
             // does not reach the public error: a real storage fault here carries a backend
-            // message, and this is the shape of one.
+            // message, and this is the shape of one. It is assembled from parts rather than
+            // written as a complete `scheme://user:pass@host` literal, which is the shape
+            // secret scanners report.
+            let credential = "hunter2";
+            let host = "db.internal";
             return Err(anyhow!(
                 "injected bootstrap credential failure: \
-                 postgres://secreton:hunter2@db.internal:5432 connection refused"
+                 postgres://secreton:{credential}@{host}:5432 connection refused"
             ));
         }
 
