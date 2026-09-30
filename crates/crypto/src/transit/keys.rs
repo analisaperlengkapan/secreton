@@ -543,24 +543,27 @@ impl TransitKey {
             KeyMaterial::X25519(private_key_bytes) => {
                 // Two layouts are accepted:
                 //
-                //   v<version>:x25519:v1:<ephemeral>:<nonce>:<ciphertext>   (salted)
-                //   v<version>:<ephemeral>:<nonce>:<ciphertext>             (legacy, unsalted)
+                //   v<version>:x25519:v1:<ephemeral>:<nonce>:<ciphertext>   (marked)
+                //   v<version>:<ephemeral>:<nonce>:<ciphertext>             (unmarked)
                 //
                 // The `x25519` marker's presence is what separates them. It is never a
-                // valid base64 ephemeral key (base64 never emits ':'), so a legacy record
-                // can never be misread as a marked one. When the marker is absent the
-                // derivation must be the legacy unsalted one, or ciphertext issued before
-                // the salt was introduced stops authenticating.
-                let (salted, parts) = if parts.get(1) == Some(&"x25519") {
+                // valid base64 ephemeral key (base64 never emits ':'), so an unmarked
+                // record can never be misread as a marked one. A marked record commits to
+                // the derivation named after the marker; an unmarked one does not, so it
+                // is authenticated under every derivation this build knows. Releases
+                // before the marker emitted the salted derivation without it, so picking
+                // a single derivation for unmarked records would strand those ciphertexts.
+                let marked = parts.get(1) == Some(&"x25519");
+                let parts = if marked {
                     let derivation = parts.get(2).copied().unwrap_or("");
                     if derivation != "v1" {
                         return Err(CryptoError::InvalidCiphertext(format!(
                             "Unknown X25519 derivation version '{derivation}'"
                         )));
                     }
-                    (true, &parts[3..])
+                    &parts[3..]
                 } else {
-                    (false, &parts[1..])
+                    &parts[1..]
                 };
 
                 if parts.len() != 3 {
@@ -601,26 +604,42 @@ impl TransitKey {
                 // Compute shared secret using our private key and ephemeral public key
                 let shared_secret = x25519(**private_key_bytes, ephemeral_public);
 
-                // Derive AES key from shared secret. A marked record was salted with the
-                // ephemeral public key by the encryptor; a legacy record used no salt.
-                let mut aes_key = Key::<Aes256Gcm>::default();
-                let salt: Option<&[u8]> = if salted {
-                    Some(ephemeral_public.as_slice())
+                // Derive AES key from shared secret. A marked record commits to the
+                // salted derivation; an unmarked one may have been written by either —
+                // the unsalted releases, or the salted releases that predate the marker —
+                // so both are tried and the AES-GCM tag decides which is correct.
+                let mut derivations: Vec<Option<&[u8]>> = Vec::new();
+                if marked {
+                    derivations.push(Some(ephemeral_public.as_slice()));
                 } else {
-                    None
-                };
-                hkdf::Hkdf::<sha2::Sha256>::new(salt, &shared_secret)
-                    .expand(b"secreton-x25519-aes", aes_key.as_mut())
-                    .map_err(|_| {
-                        CryptoError::KeyDerivationFailed("HKDF expansion failed".to_string())
-                    })?;
+                    derivations.push(Some(ephemeral_public.as_slice()));
+                    derivations.push(None);
+                }
 
-                // Decrypt with AES-GCM
-                let cipher = Aes256Gcm::new(&aes_key);
+                let mut plaintext = None;
+                for salt in derivations {
+                    let mut aes_key = Key::<Aes256Gcm>::default();
+                    hkdf::Hkdf::<sha2::Sha256>::new(salt, &shared_secret)
+                        .expand(b"secreton-x25519-aes", aes_key.as_mut())
+                        .map_err(|_| {
+                            CryptoError::KeyDerivationFailed("HKDF expansion failed".to_string())
+                        })?;
 
-                let mut decrypted = cipher
-                    .decrypt(&nonce, encrypted_bytes.as_slice())
-                    .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
+                    // A wrong derivation yields a key that fails the tag check, which is
+                    // exactly the signal to move on to the next candidate.
+                    if let Ok(opened) =
+                        Aes256Gcm::new(&aes_key).decrypt(&nonce, encrypted_bytes.as_slice())
+                    {
+                        plaintext = Some(opened);
+                        break;
+                    }
+                }
+
+                let mut decrypted = plaintext.ok_or_else(|| {
+                    CryptoError::DecryptionFailed(
+                        "X25519 ciphertext failed authentication".to_string(),
+                    )
+                })?;
 
                 // Remove context if present
                 if let Some(ctx) = context
@@ -974,6 +993,40 @@ mod x25519_ciphertext_tests {
         )
     }
 
+    /// Encrypt the way the markerless salted releases did: the salted HKDF derivation
+    /// under the same unmarked `v<version>:<ephemeral>:<nonce>:<ciphertext>` layout. A
+    /// record persisted by such a build carries no marker, so nothing in it names the
+    /// derivation — only the AES-GCM tag can.
+    fn unmarked_salted_ciphertext(
+        private_key: &[u8; 32],
+        plaintext: &[u8],
+        version: u32,
+    ) -> String {
+        let mut ephemeral_scalar = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut ephemeral_scalar);
+        let ephemeral_public = x25519(ephemeral_scalar, X25519_BASEPOINT_BYTES);
+        let shared_secret = x25519(*private_key, ephemeral_public);
+
+        let mut aes_key = Key::<Aes256Gcm>::default();
+        hkdf::Hkdf::<Sha256>::new(Some(&ephemeral_public), &shared_secret)
+            .expand(b"secreton-x25519-aes", aes_key.as_mut())
+            .expect("salted HKDF expansion");
+        let cipher = Aes256Gcm::new(&aes_key);
+
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = ChaChaNonce::from(nonce_bytes);
+        let encrypted = cipher.encrypt(&nonce, plaintext).expect("salted encrypt");
+
+        format!(
+            "v{}:{}:{}:{}",
+            version,
+            BASE64.encode(ephemeral_public),
+            BASE64.encode(nonce_bytes),
+            BASE64.encode(&encrypted)
+        )
+    }
+
     fn x25519_key() -> TransitKey {
         TransitKey::new("x".to_string(), KeyType::X25519, KeyOptions::default()).expect("new key")
     }
@@ -994,6 +1047,20 @@ mod x25519_ciphertext_tests {
         let recovered = key
             .decrypt(&legacy, None)
             .expect("legacy ciphertext must still authenticate");
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn unmarked_ciphertext_from_the_salted_releases_still_decrypts() {
+        let key = x25519_key();
+        let plaintext = b"persisted by a salted build without the marker";
+        let salted = unmarked_salted_ciphertext(private_bytes(&key), plaintext, 1);
+
+        // The markerless layout is shared with the unsalted releases, so the unmarked
+        // branch cannot name the derivation — it has to accept whichever one verifies.
+        let recovered = key
+            .decrypt(&salted, None)
+            .expect("unmarked salted ciphertext must still authenticate");
         assert_eq!(recovered, plaintext);
     }
 

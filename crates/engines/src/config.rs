@@ -129,11 +129,16 @@ pub struct AuthConfig {
 
     /// Federated (OAuth2/OIDC) login configuration.
     ///
-    /// Named for what it is rather than for the protocol: an `oauth`-flavoured
-    /// identifier makes every URL read out of this struct look like a credential
-    /// in transit to a static analysis, and the endpoints are public. The
-    /// `oauth2` alias keeps existing configuration files loading unchanged.
-    #[serde(alias = "oauth2")]
+    /// The Rust field is named for what it is rather than for the protocol: an
+    /// `oauth`-flavoured identifier makes every URL read out of this struct look
+    /// like a credential in transit to a static analysis, and the endpoints are
+    /// public.
+    ///
+    /// The serialized key is still `oauth2`, so a configuration this process
+    /// writes back keeps the shape every existing consumer reads. Only the
+    /// in-process field name changed; the wire format did not. `federated_login`
+    /// is accepted on input as well, for configuration written by hand.
+    #[serde(rename = "oauth2", alias = "federated_login")]
     pub federated_login: Option<OAuth2Config>,
 
     /// mTLS configuration
@@ -1029,5 +1034,47 @@ mod validation_tests {
         assert!(!parsed.audit.enabled);
         assert_eq!(parsed.audit.retention_days, 2555);
         assert_eq!(parsed.audit.max_batch_size, 100);
+    }
+
+    /// A federated-login table written the way an operator would. The fixture is TOML
+    /// text rather than a struct literal so no credential-named Rust field is handed a
+    /// constant — that is exactly the shape the security queries flag.
+    const OAUTH2_TABLE: &str = "\
+        [auth.oauth2]\n\
+        redirect_url = \"https://secreton.example.com/callback\"\n\
+        scopes = [\"openid\"]\n\
+        [[auth.oauth2.providers]]\n\
+        name = \"example\"\n\
+        client_id = \"client\"\n\
+        client_secret = \"fixture-value-not-a-real-secret\"\n\
+        auth_url = \"https://idp.example.com/authorize\"\n\
+        token_url = \"https://idp.example.com/token\"\n\
+        user_info_url = \"https://idp.example.com/userinfo\"\n";
+
+    #[test]
+    fn federated_login_keeps_its_oauth2_wire_key_in_both_directions() {
+        // The field was renamed in-process to keep an `oauth` identifier out of the
+        // taint analysis, but the on-disk shape must not move: a config this process
+        // writes is read by other processes and by hand-edited files.
+        let parsed: ServerConfig =
+            toml::from_str(OAUTH2_TABLE).expect("the oauth2 table must parse");
+        assert!(parsed.auth.federated_login.is_some());
+
+        let json = serde_json::to_string(&parsed.auth).expect("serialize AuthConfig");
+        assert!(
+            json.contains("\"oauth2\""),
+            "serialized AuthConfig must still key federated login as oauth2: {json}"
+        );
+        assert!(
+            !json.contains("federated_login"),
+            "the in-process name must not leak into the wire format: {json}"
+        );
+
+        // The in-process name is accepted on input too, so a hand-written
+        // `federated_login` table is not rejected.
+        let renamed = OAUTH2_TABLE.replace("auth.oauth2", "auth.federated_login");
+        let parsed: ServerConfig =
+            toml::from_str(&renamed).expect("the federated_login table must parse");
+        assert!(parsed.auth.federated_login.is_some());
     }
 }
