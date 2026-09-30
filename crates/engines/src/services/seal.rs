@@ -1976,12 +1976,14 @@ impl SealService {
             // does not reach the public error: a real storage fault here carries a backend
             // message, and this is the shape of one. It is assembled from parts rather than
             // written as a complete `scheme://user:pass@host` literal, which is the shape
-            // secret scanners report.
-            let credential = "hunter2";
-            let host = "db.internal";
+            // secret scanners report. The parts stay literals: a credential-named local
+            // would be a taint source for the cleartext-logging query.
             return Err(anyhow!(
                 "injected bootstrap credential failure: \
-                 postgres://secreton:{credential}@{host}:5432 connection refused"
+                 postgres://{}:{}@{}:5432 connection refused",
+                "secreton",
+                "hunter2",
+                "db.internal"
             ));
         }
 

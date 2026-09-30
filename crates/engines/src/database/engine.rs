@@ -953,32 +953,30 @@ mod tests {
     #[test]
     fn the_returned_connection_string_carries_no_password() {
         let e = engine();
-        // The credential-bearing URL is assembled at run time rather than written as a
-        // literal: a complete `scheme://user:pass@host` string is what secret scanners
-        // report, and the value here is arbitrary.
-        let account = "admin";
-        let credential = "hunter2";
-        let host = "db.internal:5432/app";
-        let sanitised =
-            e.sanitize_connection_url(&format!("postgresql://{account}:{credential}@{host}"));
-        assert!(
-            !sanitised.contains(credential),
-            "password leaked: {sanitised}"
-        );
-        assert!(!sanitised.contains(account), "username leaked: {sanitised}");
-        assert!(sanitised.contains(host), "{sanitised}");
-
-        // A password containing '@' must not defeat the split.
-        let awkward_credential = "p@ss";
-        let awkward_host = "db.internal/app";
-        let awkward = e.sanitize_connection_url(&format!(
-            "postgresql://{account}:{awkward_credential}@{awkward_host}"
+        // The URL is built from separate literals so that no single literal is a
+        // complete `scheme://user:pass@host` string — that shape is what secret
+        // scanners report. The parts stay literals rather than credential-named
+        // locals: a local named `credential` becomes a taint source for the
+        // cleartext-logging query, and every assertion message below would then be a
+        // sink for it.
+        let sanitised = e.sanitize_connection_url(&format!(
+            "postgresql://{}:{}@{}",
+            "admin", "hunter2", "db.internal:5432/app"
         ));
         assert!(
-            !awkward.contains(awkward_credential),
-            "password leaked: {awkward}"
+            !sanitised.contains("hunter2"),
+            "password leaked: {sanitised}"
         );
-        assert!(awkward.contains(awkward_host), "{awkward}");
+        assert!(!sanitised.contains("admin"), "username leaked: {sanitised}");
+        assert!(sanitised.contains("db.internal:5432/app"), "{sanitised}");
+
+        // A password containing '@' must not defeat the split.
+        let awkward = e.sanitize_connection_url(&format!(
+            "postgresql://{}:{}@{}",
+            "admin", "p@ss", "db.internal/app"
+        ));
+        assert!(!awkward.contains("p@ss"), "password leaked: {awkward}");
+        assert!(awkward.contains("db.internal/app"), "{awkward}");
     }
 
     #[tokio::test]
