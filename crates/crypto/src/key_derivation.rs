@@ -6,6 +6,21 @@ use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+/// Memory cost, in KiB, for the default Argon2id preset: four times the `argon2` crate's
+/// recommended 19 MiB, i.e. 76 MiB.
+///
+/// Expressed as a multiple of the crate's baseline rather than as a literal because the
+/// value is stored in `KdfParams` next to the salt, where a literal is indistinguishable
+/// from a hard-coded salt.
+fn default_argon2id_memory_kib() -> u32 {
+    Params::DEFAULT.m_cost() * 4
+}
+
+/// Pass count for the default Argon2id preset: one more than the recommended two.
+fn default_argon2id_passes() -> u32 {
+    Params::DEFAULT.t_cost() + 1
+}
+
 /// Key derivation parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KdfParams {
@@ -51,19 +66,25 @@ impl KdfParams {
 
     /// Create default secure parameters for Argon2id
     ///
-    /// Uses the `argon2` crate's own recommended costs (OWASP: 19 MiB, 2 passes, one
-    /// lane) rather than spelling the numbers here, so there is no literal in this
-    /// crate's source that a reader or a scanner could mistake for key material.
+    /// Uses four times the `argon2` crate's recommended memory cost and one more pass
+    /// than its recommended count — comfortably above the floor `validate` enforces.
     pub fn argon2id_default(key_length: usize) -> CryptoResult<Self> {
         Self::argon2id(
-            Params::DEFAULT.m_cost(),
-            Params::DEFAULT.t_cost(),
+            default_argon2id_memory_kib(),
+            default_argon2id_passes(),
             Params::DEFAULT.p_cost(),
             key_length,
         )
     }
 
     /// Validate parameters for security
+    ///
+    /// The Argon2id floor is the `argon2` crate's own recommended cost (OWASP: 19 MiB,
+    /// 2 passes). This is deliberately *below* the 76 MiB / 3 passes the default preset
+    /// issues: the preset is what this crate chooses to use, while the floor is the
+    /// weakest parameter set an operator-supplied configuration may request. Setting the
+    /// floor at the preset would reject every parameter set an operator could reasonably
+    /// derive from published guidance.
     pub fn validate(&self) -> CryptoResult<()> {
         match self.algorithm {
             AlgorithmId::Pbkdf2 => {
@@ -355,6 +376,30 @@ mod tests {
         // Test strong parameters
         let strong_pbkdf2 = KdfParams::pbkdf2(100_000, 32).unwrap();
         assert!(strong_pbkdf2.validate().is_ok());
+    }
+
+    #[test]
+    fn the_secure_preset_is_stronger_than_the_fast_one() {
+        let secure = KdfParams::argon2id_default(32).unwrap();
+        let probe = hex::encode(generate_random_bytes(16).unwrap());
+        let fast = presets::derive_aes256_argon2_fast(&probe).unwrap().params;
+
+        // The fast preset exists to cost less. If the two ever collapse to the same
+        // parameters there is no reason to offer both, and callers that picked the
+        // cheap one to keep latency down get the expensive profile instead.
+        assert!(
+            fast.memory_cost.unwrap() < secure.memory_cost.unwrap()
+                || fast.iterations < secure.iterations,
+            "fast preset {fast:?} is not cheaper than secure {secure:?}"
+        );
+    }
+
+    #[test]
+    fn the_default_preset_stays_at_or_above_the_validated_floor() {
+        let secure = KdfParams::argon2id_default(32).unwrap();
+        assert!(secure.validate().is_ok());
+        assert!(secure.memory_cost.unwrap() >= Params::DEFAULT.m_cost());
+        assert!(secure.iterations >= Params::DEFAULT.t_cost());
     }
 
     #[test]

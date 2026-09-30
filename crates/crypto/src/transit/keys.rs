@@ -319,23 +319,20 @@ impl TransitKey {
                 let shared_secret = x25519(**private_key_bytes, ephemeral_public);
 
                 // Derive AES key from shared secret using HKDF, salted with the
-                // ephemeral public key. The salt is transmitted in the ciphertext,
-                // and using it removes the all-zero buffer that previously stood in
-                // for a key here.
+                // ephemeral public key. The salt is transmitted in the ciphertext, and
+                // using it replaces the constant, empty HKDF salt this path used before.
                 let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&ephemeral_public), &shared_secret);
-                let mut aes_key = crate::generate_random_bytes(32)?;
-                hkdf.expand(b"secreton-x25519-aes", &mut aes_key)
+                // `expand` overwrites every byte of the destination, so the buffer needs
+                // no initial value — and drawing one from the OS would only add a
+                // failure path to every encryption.
+                let mut aes_key = Key::<Aes256Gcm>::default();
+                hkdf.expand(b"secreton-x25519-aes", aes_key.as_mut())
                     .map_err(|_| {
                         CryptoError::KeyDerivationFailed("HKDF expansion failed".to_string())
                     })?;
 
                 // Encrypt with AES-GCM
-                let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|_| {
-                    CryptoError::InvalidKeyLength {
-                        expected: 32,
-                        actual: aes_key.len(),
-                    }
-                })?;
+                let cipher = Aes256Gcm::new(&aes_key);
 
                 let mut nonce_bytes = [0u8; 12];
                 rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -351,7 +348,14 @@ impl TransitKey {
                     .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
                 // Format: v<version>:<ephemeral_public_key>:<nonce>:<ciphertext>
-                let mut result = format!("v{}:", version);
+                //
+                // The `x25519:v1` segment is a derivation marker. The key version names
+                // the transit key material, not the ciphertext derivation scheme, so it
+                // cannot distinguish the salted derivation below from the unsalted one
+                // that earlier releases used. `decrypt` reads the marker to pick the
+                // matching derivation, which keeps ciphertext issued before the salt was
+                // introduced decryptable.
+                let mut result = format!("v{}:x25519:v1:", version);
                 result.push_str(&BASE64.encode(ephemeral_public));
                 result.push(':');
                 result.push_str(&BASE64.encode(nonce_bytes));
@@ -372,7 +376,9 @@ impl TransitKey {
 
     /// Decrypt data
     pub fn decrypt(&self, ciphertext: &str, context: Option<&[u8]>) -> CryptoResult<Vec<u8>> {
-        // Parse format: v<version>:<nonce>:<ciphertext> or v<version>:<ciphertext>
+        // Parse format: v<version>:<nonce>:<ciphertext> or v<version>:<ciphertext>.
+        // X25519 records additionally carry an ephemeral key and a derivation marker;
+        // see the `KeyMaterial::X25519` arm below.
         let parts: Vec<&str> = ciphertext.split(':').collect();
         if parts.len() < 2 {
             return Err(CryptoError::InvalidCiphertext("Invalid format".to_string()));
@@ -535,14 +541,36 @@ impl TransitKey {
             }
 
             KeyMaterial::X25519(private_key_bytes) => {
-                if parts.len() != 4 {
+                // Two layouts are accepted:
+                //
+                //   v<version>:x25519:v1:<ephemeral>:<nonce>:<ciphertext>   (salted)
+                //   v<version>:<ephemeral>:<nonce>:<ciphertext>             (legacy, unsalted)
+                //
+                // The `x25519` marker's presence is what separates them. It is never a
+                // valid base64 ephemeral key (base64 never emits ':'), so a legacy record
+                // can never be misread as a marked one. When the marker is absent the
+                // derivation must be the legacy unsalted one, or ciphertext issued before
+                // the salt was introduced stops authenticating.
+                let (salted, parts) = if parts.get(1) == Some(&"x25519") {
+                    let derivation = parts.get(2).copied().unwrap_or("");
+                    if derivation != "v1" {
+                        return Err(CryptoError::InvalidCiphertext(format!(
+                            "Unknown X25519 derivation version '{derivation}'"
+                        )));
+                    }
+                    (true, &parts[3..])
+                } else {
+                    (false, &parts[1..])
+                };
+
+                if parts.len() != 3 {
                     return Err(CryptoError::InvalidCiphertext(
                         "Invalid X25519 format".to_string(),
                     ));
                 }
 
                 // Decode ephemeral public key
-                let ephemeral_public_bytes = BASE64.decode(parts[1]).map_err(|_| {
+                let ephemeral_public_bytes = BASE64.decode(parts[0]).map_err(|_| {
                     CryptoError::InvalidCiphertext(
                         "Invalid ephemeral public key encoding".to_string(),
                     )
@@ -555,7 +583,7 @@ impl TransitKey {
                     })?;
 
                 // Decode nonce
-                let nonce_bytes = BASE64.decode(parts[2]).map_err(|_| {
+                let nonce_bytes = BASE64.decode(parts[1]).map_err(|_| {
                     CryptoError::InvalidCiphertext("Invalid nonce encoding".to_string())
                 })?;
                 let nonce_array: [u8; 12] = nonce_bytes.as_slice().try_into().map_err(|_| {
@@ -566,18 +594,22 @@ impl TransitKey {
                 let nonce = ChaChaNonce::from(nonce_array);
 
                 // Decode ciphertext
-                let encrypted_bytes = BASE64.decode(parts[3]).map_err(|_| {
+                let encrypted_bytes = BASE64.decode(parts[2]).map_err(|_| {
                     CryptoError::InvalidCiphertext("Invalid ciphertext encoding".to_string())
                 })?;
 
                 // Compute shared secret using our private key and ephemeral public key
                 let shared_secret = x25519(**private_key_bytes, ephemeral_public);
 
-                // Derive AES key from shared secret, salted with the ephemeral public
-                // key that came with the ciphertext — the same derivation the encryptor
-                // performed.
+                // Derive AES key from shared secret. A marked record was salted with the
+                // ephemeral public key by the encryptor; a legacy record used no salt.
                 let mut aes_key = Key::<Aes256Gcm>::default();
-                hkdf::Hkdf::<sha2::Sha256>::new(Some(&ephemeral_public), &shared_secret)
+                let salt: Option<&[u8]> = if salted {
+                    Some(ephemeral_public.as_slice())
+                } else {
+                    None
+                };
+                hkdf::Hkdf::<sha2::Sha256>::new(salt, &shared_secret)
                     .expand(b"secreton-x25519-aes", aes_key.as_mut())
                     .map_err(|_| {
                         CryptoError::KeyDerivationFailed("HKDF expansion failed".to_string())
@@ -907,4 +939,92 @@ pub struct KeyInfo {
     pub versions: Vec<u32>,
     pub usage: Vec<KeyUsage>,
     pub exportable: bool,
+}
+
+#[cfg(test)]
+mod x25519_ciphertext_tests {
+    use super::*;
+
+    /// Encrypt exactly the way releases did before the HKDF salt was introduced: an
+    /// unsalted derivation and a `v<version>:<ephemeral>:<nonce>:<ciphertext>` layout
+    /// with no derivation marker. The output is the shape a persisted record has.
+    fn legacy_ciphertext(private_key: &[u8; 32], plaintext: &[u8], version: u32) -> String {
+        let mut ephemeral_scalar = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut ephemeral_scalar);
+        let ephemeral_public = x25519(ephemeral_scalar, X25519_BASEPOINT_BYTES);
+        let shared_secret = x25519(*private_key, ephemeral_public);
+
+        let mut aes_key = Key::<Aes256Gcm>::default();
+        hkdf::Hkdf::<Sha256>::new(None, &shared_secret)
+            .expand(b"secreton-x25519-aes", aes_key.as_mut())
+            .expect("legacy HKDF expansion");
+        let cipher = Aes256Gcm::new(&aes_key);
+
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = ChaChaNonce::from(nonce_bytes);
+        let encrypted = cipher.encrypt(&nonce, plaintext).expect("legacy encrypt");
+
+        format!(
+            "v{}:{}:{}:{}",
+            version,
+            BASE64.encode(ephemeral_public),
+            BASE64.encode(nonce_bytes),
+            BASE64.encode(&encrypted)
+        )
+    }
+
+    fn x25519_key() -> TransitKey {
+        TransitKey::new("x".to_string(), KeyType::X25519, KeyOptions::default()).expect("new key")
+    }
+
+    fn private_bytes(key: &TransitKey) -> &[u8; 32] {
+        match &key.versions[&1].material {
+            KeyMaterial::X25519(bytes) => bytes,
+            other => panic!("expected an X25519 key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ciphertext_issued_before_the_salt_was_added_still_decrypts() {
+        let key = x25519_key();
+        let plaintext = b"persisted before the derivation changed";
+        let legacy = legacy_ciphertext(private_bytes(&key), plaintext, 1);
+
+        let recovered = key
+            .decrypt(&legacy, None)
+            .expect("legacy ciphertext must still authenticate");
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn new_encryptions_carry_a_derivation_marker_and_round_trip() {
+        let key = x25519_key();
+        let ciphertext = key
+            .encrypt(b"fresh plaintext", None, None)
+            .expect("encrypt");
+
+        assert!(
+            ciphertext.starts_with("v1:x25519:v1:"),
+            "expected the salted derivation marker, got {ciphertext}"
+        );
+        assert_eq!(
+            key.decrypt(&ciphertext, None).expect("decrypt"),
+            b"fresh plaintext"
+        );
+    }
+
+    #[test]
+    fn an_unknown_derivation_version_is_rejected() {
+        let key = x25519_key();
+        let ciphertext = key
+            .encrypt(b"fresh plaintext", None, None)
+            .expect("encrypt");
+        let tampered = ciphertext.replacen("x25519:v1:", "x25519:v9:", 1);
+
+        assert!(
+            key.decrypt(&tampered, None).is_err(),
+            "a derivation version this build does not implement must not be guessed at"
+        );
+    }
 }
