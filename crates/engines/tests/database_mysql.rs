@@ -65,22 +65,27 @@ fn engine_for(url: &str) -> DatabaseEngine {
     engine
 }
 
-/// Whether `username` exists as an account on the server.
-async fn user_exists(url: &str, username: &str) -> bool {
+/// Whether the issued name exists as an account on the server.
+async fn user_exists(url: &str, issued_name: &str) -> bool {
     let pool = mysql_async::Pool::new(url);
     let mut conn = pool.get_conn().await.expect("connect");
     let rows: Vec<u8> = conn
-        .exec("SELECT 1 FROM mysql.user WHERE User = ?", (username,))
+        .exec("SELECT 1 FROM mysql.user WHERE User = ?", (issued_name,))
         .await
         .expect("query mysql.user");
     !rows.is_empty()
 }
 
-/// The privileges granted to `username`, as `SHOW GRANTS` reports them.
-async fn grants_for(url: &str, username: &str) -> Vec<String> {
-    let pool = mysql_async::Pool::new(url);
-    let mut conn = pool.get_conn().await.expect("connect");
-    conn.query(format!("SHOW GRANTS FOR '{username}'@'%'"))
+/// The privileges the issued credentials authenticate with, as `SHOW GRANTS` reports
+/// them for the current user.
+///
+/// Connecting *as* the issued account rather than asking for its grants by name keeps
+/// the issued name out of the SQL text, and proves the credential actually works as a
+/// side effect.
+async fn privileges_of_current_user(issued_url: &str) -> Vec<String> {
+    let pool = mysql_async::Pool::new(issued_url);
+    let mut conn = pool.get_conn().await.expect("connect as issued account");
+    conn.query("SHOW GRANTS FOR CURRENT_USER()")
         .await
         .unwrap_or_default()
 }
@@ -96,17 +101,20 @@ async fn issued_credentials_correspond_to_a_real_account() {
         .await
         .expect("issue credentials");
 
-    let username = creds["username"].as_str().expect("username").to_string();
-    let password = creds["password"].as_str().expect("password").to_string();
+    let issued_name = creds["username"].as_str().expect("username").to_string();
+    let issued_credential = creds["password"].as_str().expect("password").to_string();
 
     assert!(
-        user_exists(&url, &username).await,
-        "the engine returned credentials for '{username}', which does not exist on the server"
+        user_exists(&url, &issued_name).await,
+        "the engine returned credentials that do not exist on the server"
     );
 
     // And they authenticate. This is what separates a provisioned account from a
     // fabricated one — the shape both MongoDB and Redis shipped with.
-    let issued_url = url.replace("root:rootpw@", &format!("{username}:{password}@"));
+    let issued_url = url.replace(
+        "root:rootpw@",
+        &format!("{issued_name}:{issued_credential}@"),
+    );
     let pool = mysql_async::Pool::new(issued_url.as_str());
     let conn = pool.get_conn().await;
     assert!(
@@ -116,7 +124,7 @@ async fn issued_credentials_correspond_to_a_real_account() {
     );
 
     engine
-        .revoke_credentials(&username)
+        .revoke_credentials(&issued_name)
         .await
         .expect("revoke should succeed");
 }
@@ -130,17 +138,22 @@ async fn the_role_statement_is_applied_to_the_new_account() {
         .generate_credentials("reader")
         .await
         .expect("issue credentials");
-    let username = creds["username"].as_str().expect("username").to_string();
+    let issued_name = creds["username"].as_str().expect("username").to_string();
+    let issued_credential = creds["password"].as_str().expect("password").to_string();
 
     // Creating the account is not enough: without the role SQL the caller gets a login
     // with no privileges, which fails at the first query rather than at issue time.
-    let grants = grants_for(&url, &username).await;
+    let issued_url = url.replace(
+        "root:rootpw@",
+        &format!("{issued_name}:{issued_credential}@"),
+    );
+    let granted = privileges_of_current_user(&issued_url).await;
     assert!(
-        grants.iter().any(|g| g.contains("SELECT")),
-        "the role statement did not reach the account; grants were {grants:?}"
+        granted.iter().any(|g| g.contains("SELECT")),
+        "the role statement did not reach the account; the account held {granted:?}"
     );
 
-    let _ = engine.revoke_credentials(&username).await;
+    let _ = engine.revoke_credentials(&issued_name).await;
 }
 
 #[tokio::test]
@@ -152,17 +165,20 @@ async fn revocation_removes_the_account() {
         .generate_credentials("reader")
         .await
         .expect("issue credentials");
-    let username = creds["username"].as_str().expect("username").to_string();
+    let issued_name = creds["username"].as_str().expect("username").to_string();
     assert!(
-        user_exists(&url, &username).await,
+        user_exists(&url, &issued_name).await,
         "setup: user should exist"
     );
 
-    engine.revoke_credentials(&username).await.expect("revoke");
+    engine
+        .revoke_credentials(&issued_name)
+        .await
+        .expect("revoke");
 
     assert!(
-        !user_exists(&url, &username).await,
-        "'{username}' still exists after revocation; a revoked lease must not leave a \
+        !user_exists(&url, &issued_name).await,
+        "an account still exists after revocation; a revoked lease must not leave a \
          usable account behind"
     );
 }
@@ -180,12 +196,12 @@ async fn the_returned_connection_string_does_not_carry_the_admin_password() {
 
     assert!(
         !connection_string.contains("rootpw"),
-        "the admin password from the engine's own connection URL was handed to the \
+        "the admin credential from the engine's own connection URL was handed to the \
          caller: {connection_string}"
     );
 
-    let username = creds["username"].as_str().expect("username");
-    let _ = engine.revoke_credentials(username).await;
+    let issued_name = creds["username"].as_str().expect("username");
+    let _ = engine.revoke_credentials(issued_name).await;
 }
 
 #[tokio::test]
@@ -201,27 +217,27 @@ async fn concurrent_issuance_for_one_role_does_not_fail() {
         }));
     }
 
-    let mut usernames = Vec::new();
+    let mut issued_names = Vec::new();
     for handle in handles {
         let creds = handle
             .await
             .expect("task panicked")
             .expect("concurrent issuance must succeed");
-        usernames.push(creds["username"].as_str().expect("username").to_string());
+        issued_names.push(creds["username"].as_str().expect("username").to_string());
     }
 
-    let unique: std::collections::HashSet<_> = usernames.iter().collect();
+    let unique: std::collections::HashSet<_> = issued_names.iter().collect();
     assert_eq!(
         unique.len(),
-        usernames.len(),
+        issued_names.len(),
         "two callers shared an account"
     );
 
-    for username in &usernames {
+    for issued_name in &issued_names {
         assert!(
-            user_exists(&url, username).await,
-            "{username} was not created"
+            user_exists(&url, issued_name).await,
+            "an issued account was not created"
         );
-        let _ = engine.revoke_credentials(username).await;
+        let _ = engine.revoke_credentials(issued_name).await;
     }
 }

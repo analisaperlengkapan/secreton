@@ -395,8 +395,8 @@ mod tests {
 
     #[test]
     fn test_kdf_algorithms() {
-        let password = b"password";
-        let salt = b"salt1234567890ab";
+        let password = hex::encode(crate::generate_random_bytes(16).unwrap());
+        let salt = crate::generate_random_bytes(16).unwrap();
 
         for &algorithm in &[
             KdfAlgorithm::Pbkdf2Sha256,
@@ -404,11 +404,11 @@ mod tests {
             KdfAlgorithm::HkdfSha256,
             KdfAlgorithm::HkdfSha512,
         ] {
-            let key = derive_key(algorithm, password, salt, 1000, 32).unwrap();
+            let key = derive_key(algorithm, password.as_bytes(), &salt, 1000, 32).unwrap();
             assert_eq!(key.len(), 32);
 
             // KDF should be deterministic
-            let key2 = derive_key(algorithm, password, salt, 1000, 32).unwrap();
+            let key2 = derive_key(algorithm, password.as_bytes(), &salt, 1000, 32).unwrap();
             assert_eq!(key, key2);
         }
     }

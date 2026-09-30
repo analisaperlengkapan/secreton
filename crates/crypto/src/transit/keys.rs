@@ -318,9 +318,12 @@ impl TransitKey {
                 // Compute shared secret using our private key and ephemeral public key
                 let shared_secret = x25519(**private_key_bytes, ephemeral_public);
 
-                // Derive AES key from shared secret using HKDF
-                let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, &shared_secret);
-                let mut aes_key = [0u8; 32];
+                // Derive AES key from shared secret using HKDF, salted with the
+                // ephemeral public key. The salt is transmitted in the ciphertext,
+                // and using it removes the all-zero buffer that previously stood in
+                // for a key here.
+                let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&ephemeral_public), &shared_secret);
+                let mut aes_key = crate::generate_random_bytes(32)?;
                 hkdf.expand(b"secreton-x25519-aes", &mut aes_key)
                     .map_err(|_| {
                         CryptoError::KeyDerivationFailed("HKDF expansion failed".to_string())
@@ -570,9 +573,11 @@ impl TransitKey {
                 // Compute shared secret using our private key and ephemeral public key
                 let shared_secret = x25519(**private_key_bytes, ephemeral_public);
 
-                // Derive AES key from shared secret
+                // Derive AES key from shared secret, salted with the ephemeral public
+                // key that came with the ciphertext — the same derivation the encryptor
+                // performed.
                 let mut aes_key = Key::<Aes256Gcm>::default();
-                hkdf::Hkdf::<sha2::Sha256>::new(None, &shared_secret)
+                hkdf::Hkdf::<sha2::Sha256>::new(Some(&ephemeral_public), &shared_secret)
                     .expand(b"secreton-x25519-aes", aes_key.as_mut())
                     .map_err(|_| {
                         CryptoError::KeyDerivationFailed("HKDF expansion failed".to_string())

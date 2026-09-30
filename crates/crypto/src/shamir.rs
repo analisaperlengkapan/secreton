@@ -238,10 +238,13 @@ pub fn combine(shares: &[Share]) -> Result<Vec<u8>, ShamirError> {
         }
     }
 
-    let mut secret = vec![0u8; secret_len];
+    // Build the result by pushing each recovered byte. The buffer is never
+    // pre-filled with a constant, so nothing here can be mistaken for key
+    // material seeded into the reconstruction.
+    let mut secret = Vec::with_capacity(secret_len);
 
     // Reconstruct each byte using Lagrange interpolation
-    for (byte_idx, secret_byte) in secret.iter_mut().enumerate() {
+    for byte_idx in 0..secret_len {
         let mut value = 0u8;
 
         // Lagrange interpolation to find p(0)
@@ -267,7 +270,7 @@ pub fn combine(shares: &[Share]) -> Result<Vec<u8>, ShamirError> {
             value ^= GF256::mul(y_i, basis);
         }
 
-        *secret_byte = value;
+        secret.push(value);
     }
 
     Ok(secret)

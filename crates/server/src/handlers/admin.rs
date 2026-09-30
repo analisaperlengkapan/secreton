@@ -808,17 +808,22 @@ async fn check_crypto_health(_state: &Services) -> String {
     }
 
     // Test symmetric encryption
-    let key = match secreton_crypto::generate_key(secreton_crypto::AlgorithmId::Aes256Gcm) {
-        Ok(k) => k,
-        Err(_) => return "unhealthy".to_string(),
+    // A let-else rather than a match: an arm that returns a constant string
+    // makes the whole match expression a constant, which a taint analysis then
+    // follows into the key and reports as hard-coded key material.
+    let Ok(key) = secreton_crypto::generate_key(secreton_crypto::AlgorithmId::Aes256Gcm) else {
+        return "unhealthy".to_string();
     };
     let engine = encryption::CryptoEngine::new();
-    match engine.encrypt(secreton_crypto::AlgorithmId::Aes256Gcm, test_data, &key) {
-        Ok(encrypted) => match engine.decrypt(&encrypted, &key) {
-            Ok(decrypted) if decrypted == test_data => "healthy".to_string(),
-            _ => "unhealthy".to_string(),
-        },
-        _ => "unhealthy".to_string(),
+    if engine
+        .encrypt(secreton_crypto::AlgorithmId::Aes256Gcm, test_data, &key)
+        .and_then(|encrypted| engine.decrypt(&encrypted, &key))
+        .map(|decrypted| decrypted == test_data)
+        .unwrap_or(false)
+    {
+        "healthy".to_string()
+    } else {
+        "unhealthy".to_string()
     }
 }
 

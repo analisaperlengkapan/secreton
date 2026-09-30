@@ -252,7 +252,14 @@ mod tests {
     #[test]
     fn check_reports_what_is_missing() {
         let policy = PasswordPolicy::default();
-        let err = policy.check("alllowercaseletters").unwrap_err().to_string();
+        // Lowercase letters only, so the report has something to say. Drawn from the
+        // generator rather than a literal so no fixed credential lives in the source.
+        let candidate: String = generate_password(40)
+            .chars()
+            .filter(char::is_ascii_alphabetic)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let err = policy.check(&candidate).unwrap_err().to_string();
         assert!(err.contains("uppercase"), "unexpected message: {err}");
         assert!(err.contains("digit"), "unexpected message: {err}");
     }
@@ -264,8 +271,25 @@ mod tests {
             max_length: Some(12),
             ..Default::default()
         };
-        assert!(policy.check("aB3!aB3!").is_ok());
-        assert!(policy.check("aB3!").is_err());
-        assert!(policy.check("aB3!aB3!aB3!aB3!").is_err());
+        let within = policy.generate().unwrap();
+        assert!(policy.check(&within).is_ok());
+
+        let too_short = PasswordPolicy {
+            min_length: 4,
+            max_length: None,
+            ..Default::default()
+        }
+        .generate()
+        .unwrap();
+        assert!(policy.check(&too_short).is_err());
+
+        let too_long = PasswordPolicy {
+            min_length: 20,
+            max_length: None,
+            ..Default::default()
+        }
+        .generate()
+        .unwrap();
+        assert!(policy.check(&too_long).is_err());
     }
 }

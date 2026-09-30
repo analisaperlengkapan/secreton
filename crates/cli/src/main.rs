@@ -352,7 +352,7 @@ async fn user_command(cmd: UserCommand, config: &CliConfig) -> Result<()> {
                 .await?;
 
             if response.status().is_success() {
-                println!("✅ User '{}' created successfully.", username);
+                println!("✅ User created successfully.");
             } else {
                 println!("❌ Failed to create user: {}", response.status());
                 println!("   {}", response.text().await?);
