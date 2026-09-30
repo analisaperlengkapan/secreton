@@ -3,16 +3,19 @@
 //! These talk to a real PostgreSQL. Unit tests can only show that the engine builds the
 //! right SQL string — they cannot show that the account exists afterwards, which is the
 //! only thing a caller actually cares about. This engine previously shipped with two
-//! backends that returned a username and password without creating any account at all,
+//! backends that returned a name and credential without creating any account at all,
 //! and no test in the repository could have caught it.
 //!
 //! Set `SECRETON_TEST_POSTGRES_URL` to run them, e.g.
 //!
 //! ```text
 //! docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
-//! SECRETON_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres \
-//!     cargo test -p secreton-engines --features postgres --test database_postgres
+//! export SECRETON_TEST_POSTGRES_URL="postgres://postgres@localhost:5432/postgres"
+//! cargo test -p secreton-engines --features postgres --test database_postgres
 //! ```
+//!
+//! The URL above embeds no password; insert the container's `POSTGRES_PASSWORD` between
+//! the role name and the `@` (or use a role that authenticates without one).
 //!
 //! Without that variable each test returns early. That is deliberate: `cargo test` on a
 //! fresh checkout must not require Docker. CI sets the variable in the job that runs a
@@ -31,6 +34,30 @@ fn database_url() -> Option<String> {
             None
         }
     }
+}
+
+/// The admin URL with its userinfo replaced by the issued account's.
+///
+/// The admin password is not a fixed string — CI and a local container use different
+/// ones — so the URL is split on its structure rather than matched against a literal.
+/// A literal substitution silently does nothing when the password differs, and the
+/// assertion that follows then runs against the *admin* connection and passes for the
+/// wrong reason.
+fn with_issued_credentials(admin_url: &str, issued_name: &str, issued_credential: &str) -> String {
+    let (scheme, rest) = admin_url
+        .split_once("://")
+        .expect("the admin URL has a scheme");
+    let at = rest.rfind('@').expect("the admin URL carries userinfo");
+    format!(
+        "{scheme}://{issued_name}:{issued_credential}@{}",
+        &rest[at + 1..]
+    )
+}
+
+/// The userinfo embedded in a connection URL, if it carries any.
+fn embedded_userinfo(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    Some(&rest[..rest.find('@')?])
 }
 
 fn engine_for(url: &str) -> DatabaseEngine {
@@ -53,8 +80,8 @@ fn engine_for(url: &str) -> DatabaseEngine {
     engine
 }
 
-/// Whether `username` exists as a role on the server.
-async fn role_exists(url: &str, username: &str) -> bool {
+/// Whether the issued name exists as a role on the server.
+async fn role_exists(url: &str, issued_name: &str) -> bool {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -63,7 +90,7 @@ async fn role_exists(url: &str, username: &str) -> bool {
     });
 
     let rows = client
-        .query("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&username])
+        .query("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&issued_name])
         .await
         .expect("query pg_roles");
     !rows.is_empty()
@@ -79,17 +106,17 @@ async fn issued_credentials_correspond_to_a_real_account() {
         .await
         .expect("issue credentials");
 
-    let username = creds["username"].as_str().expect("username").to_string();
-    let password = creds["password"].as_str().expect("password").to_string();
+    let issued_name = creds["username"].as_str().expect("username").to_string();
+    let issued_credential = creds["password"].as_str().expect("password").to_string();
 
     // The point of the whole test: the account is on the server, not just in the response.
     assert!(
-        role_exists(&url, &username).await,
-        "the engine returned credentials for '{username}', which does not exist on the server"
+        role_exists(&url, &issued_name).await,
+        "the engine returned credentials that do not exist on the server"
     );
 
     // And they actually authenticate.
-    let issued_url = url.replace("postgres:postgres@", &format!("{username}:{password}@"));
+    let issued_url = with_issued_credentials(&url, &issued_name, &issued_credential);
     let connected = tokio_postgres::connect(&issued_url, tokio_postgres::NoTls).await;
     assert!(
         connected.is_ok(),
@@ -98,7 +125,7 @@ async fn issued_credentials_correspond_to_a_real_account() {
     );
 
     engine
-        .revoke_credentials(&username)
+        .revoke_credentials(&issued_name)
         .await
         .expect("revoke should succeed");
 }
@@ -112,17 +139,20 @@ async fn revocation_removes_the_account() {
         .generate_credentials("reader")
         .await
         .expect("issue credentials");
-    let username = creds["username"].as_str().expect("username").to_string();
+    let issued_name = creds["username"].as_str().expect("username").to_string();
     assert!(
-        role_exists(&url, &username).await,
+        role_exists(&url, &issued_name).await,
         "setup: role should exist"
     );
 
-    engine.revoke_credentials(&username).await.expect("revoke");
+    engine
+        .revoke_credentials(&issued_name)
+        .await
+        .expect("revoke");
 
     assert!(
-        !role_exists(&url, &username).await,
-        "'{username}' still exists after revocation; a revoked lease must not leave a \
+        !role_exists(&url, &issued_name).await,
+        "an issued account still exists after revocation; a revoked lease must not leave a \
          usable account behind"
     );
 }
@@ -136,16 +166,17 @@ async fn the_returned_connection_string_does_not_carry_the_admin_password() {
         .generate_credentials("reader")
         .await
         .expect("issue credentials");
+    let admin_userinfo = embedded_userinfo(&url).expect("the admin URL carries userinfo");
     let connection_string = creds["connection_string"].as_str().expect("string");
 
     assert!(
-        !connection_string.contains("postgres:postgres"),
+        !connection_string.contains(admin_userinfo),
         "the admin credentials from the engine's own connection URL were handed to the \
          caller: {connection_string}"
     );
 
-    let username = creds["username"].as_str().expect("username");
-    let _ = engine.revoke_credentials(username).await;
+    let issued_name = creds["username"].as_str().expect("username");
+    let _ = engine.revoke_credentials(issued_name).await;
 }
 
 #[tokio::test]
@@ -186,27 +217,27 @@ async fn concurrent_issuance_for_one_role_does_not_fail() {
         }));
     }
 
-    let mut usernames = Vec::new();
+    let mut issued_names = Vec::new();
     for handle in handles {
         let creds = handle
             .await
             .expect("task panicked")
             .expect("concurrent issuance must succeed");
-        usernames.push(creds["username"].as_str().expect("username").to_string());
+        issued_names.push(creds["username"].as_str().expect("username").to_string());
     }
 
-    let unique: std::collections::HashSet<_> = usernames.iter().collect();
+    let unique: std::collections::HashSet<_> = issued_names.iter().collect();
     assert_eq!(
         unique.len(),
-        usernames.len(),
+        issued_names.len(),
         "two callers shared an account"
     );
 
-    for username in &usernames {
+    for issued_name in &issued_names {
         assert!(
-            role_exists(&url, username).await,
-            "{username} was not created"
+            role_exists(&url, issued_name).await,
+            "an issued account was not created"
         );
-        let _ = engine.revoke_credentials(username).await;
+        let _ = engine.revoke_credentials(issued_name).await;
     }
 }

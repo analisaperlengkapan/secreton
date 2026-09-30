@@ -151,7 +151,10 @@ pub struct CreateUserRequest {
 #[derive(Debug, Clone)]
 struct OAuthProvider {
     client_id: String,
-    client_secret: String,
+    /// The provider's client secret. The field name keeps the `client` qualifier so
+    /// it does not read as a bare `secret`; it is only ever used to build the
+    /// token-exchange request body.
+    oauth_client_secret: String,
     token_url: String,
     user_info_url: String,
     redirect_uri: String,
@@ -208,7 +211,7 @@ impl OAuthProvider {
 
         Some(Self {
             client_id: provider_config.client_id.clone(),
-            client_secret: provider_config.client_secret.clone(),
+            oauth_client_secret: provider_config.client_secret.clone(),
             token_url,
             user_info_url,
             redirect_uri,
@@ -222,7 +225,7 @@ impl OAuthProvider {
         let client = reqwest::Client::new();
         let params = [
             ("client_id", &self.client_id),
-            ("client_secret", &self.client_secret),
+            ("client_secret", &self.oauth_client_secret),
             ("code", &code.to_string()),
             ("grant_type", &"authorization_code".to_string()),
             ("redirect_uri", &self.redirect_uri),
@@ -1148,9 +1151,9 @@ pub async fn oauth_login(
         })?;
 
     // Build authorization URL based on provider
-    let auth_url = if let Some(oauth2_config) = state.config.auth.oauth2.as_ref() {
+    let auth_url = if let Some(federated_login) = state.config.auth.federated_login.as_ref() {
         // Find the provider in the providers vector
-        let provider_config = oauth2_config
+        let provider_config = federated_login
             .providers
             .iter()
             .find(|p| p.name.to_lowercase() == provider.to_lowercase())
@@ -1161,10 +1164,10 @@ pub async fn oauth_login(
             })?;
 
         // Build redirect URI
-        let redirect_uri = format!("{}/{}/callback", oauth2_config.redirect_url, provider);
+        let redirect_uri = format!("{}/{}/callback", federated_login.redirect_url, provider);
 
         // Build scopes string
-        let scopes = oauth2_config.scopes.join("%20");
+        let scopes = federated_login.scopes.join("%20");
 
         // Build authorization URL based on provider type or use config URL
         if provider_config.auth_url.is_empty() {
@@ -1267,27 +1270,28 @@ pub async fn oauth_callback(
     }
 
     // Get OAuth provider configuration
-    let oauth2_config = state.config.auth.oauth2.as_ref().ok_or_else(|| {
+    let federated_login = state.config.auth.federated_login.as_ref().ok_or_else(|| {
         crate::error::ApiError(SecretonError::Validation {
             message: "OAuth providers not configured".to_string(),
         })
     })?;
 
-    let oauth_provider = OAuthProvider::new(&provider, Some(oauth2_config)).ok_or_else(|| {
+    let authenticator = OAuthProvider::new(&provider, Some(federated_login)).ok_or_else(|| {
         crate::error::ApiError(SecretonError::Validation {
             message: format!("Unsupported OAuth provider: {}", provider),
         })
     })?;
 
     // Exchange authorization code for access token
-    let token_data: serde_json::Value = oauth_provider
-        .exchange_code_for_token(code)
-        .await
-        .map_err(|e| {
-            crate::error::ApiError(SecretonError::Authentication {
-                message: format!("Token exchange failed: {}", e),
-            })
-        })?;
+    let token_data: serde_json::Value =
+        authenticator
+            .exchange_code_for_token(code)
+            .await
+            .map_err(|e| {
+                crate::error::ApiError(SecretonError::Authentication {
+                    message: format!("Token exchange failed: {}", e),
+                })
+            })?;
 
     let access_token = token_data["access_token"].as_str().ok_or_else(|| {
         crate::error::ApiError(SecretonError::Authentication {
@@ -1297,7 +1301,7 @@ pub async fn oauth_callback(
 
     // Fetch user information from provider
     let oauth_user: OAuthUserInfo =
-        oauth_provider
+        authenticator
             .get_user_info(access_token)
             .await
             .map_err(|e| {

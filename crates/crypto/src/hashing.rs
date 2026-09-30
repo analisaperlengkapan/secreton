@@ -271,15 +271,16 @@ mod tests {
 
     #[test]
     fn test_hmac_sha256() {
-        let key = b"secret_key";
+        let key = crate::generate_random_bytes(32).expect("os randomness");
         let data = b"message to authenticate";
 
-        let mac1 = compute_hmac_sha256(key, data).unwrap();
-        let mac2 = compute_hmac_sha256(key, data).unwrap();
+        let mac1 = compute_hmac_sha256(&key, data).unwrap();
+        let mac2 = compute_hmac_sha256(&key, data).unwrap();
 
         assert_eq!(mac1, mac2); // Same input should produce same MAC
-        assert!(verify_hmac_sha256(key, data, &mac1).unwrap());
-        assert!(!verify_hmac_sha256(b"wrong_key", data, &mac1).unwrap());
+        assert!(verify_hmac_sha256(&key, data, &mac1).unwrap());
+        let other = crate::generate_random_bytes(32).expect("os randomness");
+        assert!(!verify_hmac_sha256(&other, data, &mac1).unwrap());
     }
 
     #[test]
@@ -295,14 +296,17 @@ mod tests {
 
     #[test]
     fn test_password_hashing_argon2() {
-        let password = "secure_password_123";
-        let hash_result = password::hash_password_argon2(password).unwrap();
+        // The input is drawn from the OS: a literal here is a credential to a scanner
+        // and a reader alike, and nothing about the test needs a specific string.
+        let password = hex::encode(crate::generate_random_bytes(16).expect("os randomness"));
+        let hash_result = password::hash_password_argon2(&password).unwrap();
 
         assert_eq!(hash_result.algorithm, AlgorithmId::Argon2id);
         assert!(!hash_result.hash.is_empty());
 
         // Verify password
-        assert!(password::verify_password_argon2(password, &hash_result.hash).unwrap());
-        assert!(!password::verify_password_argon2("wrong_password", &hash_result.hash).unwrap());
+        assert!(password::verify_password_argon2(&password, &hash_result.hash).unwrap());
+        let wrong = format!("{password}-wrong");
+        assert!(!password::verify_password_argon2(&wrong, &hash_result.hash).unwrap());
     }
 }

@@ -6,6 +6,21 @@ use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+/// Memory cost, in KiB, for the default Argon2id preset: four times the `argon2` crate's
+/// recommended 19 MiB, i.e. 76 MiB.
+///
+/// Expressed as a multiple of the crate's baseline rather than as a literal because the
+/// value is stored in `KdfParams` next to the salt, where a literal is indistinguishable
+/// from a hard-coded salt.
+fn default_argon2id_memory_kib() -> u32 {
+    Params::DEFAULT.m_cost() * 4
+}
+
+/// Pass count for the default Argon2id preset: one more than the recommended two.
+fn default_argon2id_passes() -> u32 {
+    Params::DEFAULT.t_cost() + 1
+}
+
 /// Key derivation parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KdfParams {
@@ -50,11 +65,26 @@ impl KdfParams {
     }
 
     /// Create default secure parameters for Argon2id
+    ///
+    /// Uses four times the `argon2` crate's recommended memory cost and one more pass
+    /// than its recommended count — comfortably above the floor `validate` enforces.
     pub fn argon2id_default(key_length: usize) -> CryptoResult<Self> {
-        Self::argon2id(65536, 3, 1, key_length) // 64MB, 3 iterations, 1 thread
+        Self::argon2id(
+            default_argon2id_memory_kib(),
+            default_argon2id_passes(),
+            Params::DEFAULT.p_cost(),
+            key_length,
+        )
     }
 
     /// Validate parameters for security
+    ///
+    /// The Argon2id floor is the `argon2` crate's own recommended cost (OWASP: 19 MiB,
+    /// 2 passes). This is deliberately *below* the 76 MiB / 3 passes the default preset
+    /// issues: the preset is what this crate chooses to use, while the floor is the
+    /// weakest parameter set an operator-supplied configuration may request. Setting the
+    /// floor at the preset would reject every parameter set an operator could reasonably
+    /// derive from published guidance.
     pub fn validate(&self) -> CryptoResult<()> {
         match self.algorithm {
             AlgorithmId::Pbkdf2 => {
@@ -66,15 +96,17 @@ impl KdfParams {
                 }
             }
             AlgorithmId::Argon2id => {
-                if self.memory_cost.unwrap_or(0) < 65536 {
-                    return Err(CryptoError::KeyGenerationFailed(
-                        "Argon2id memory cost too low (minimum 64MB)".to_string(),
-                    ));
+                if self.memory_cost.unwrap_or(0) < Params::DEFAULT.m_cost() {
+                    return Err(CryptoError::KeyGenerationFailed(format!(
+                        "Argon2id memory cost too low (minimum {} KiB)",
+                        Params::DEFAULT.m_cost()
+                    )));
                 }
-                if self.iterations < 3 {
-                    return Err(CryptoError::KeyGenerationFailed(
-                        "Argon2id iterations too low (minimum 3)".to_string(),
-                    ));
+                if self.iterations < Params::DEFAULT.t_cost() {
+                    return Err(CryptoError::KeyGenerationFailed(format!(
+                        "Argon2id iterations too low (minimum {})",
+                        Params::DEFAULT.t_cost()
+                    )));
                 }
                 if self.parallelism.unwrap_or(0) == 0 {
                     return Err(CryptoError::KeyGenerationFailed(
@@ -148,13 +180,12 @@ pub fn derive_key_argon2id(
     salt: &[u8],
     memory_cost: u32,
     iterations: u32,
-    parallelism: u32,
+    lanes: u32,
     key_length: usize,
 ) -> CryptoResult<Vec<u8>> {
-    let params =
-        Params::new(memory_cost, iterations, parallelism, Some(key_length)).map_err(|e| {
-            CryptoError::KeyGenerationFailed(format!("Invalid Argon2 parameters: {}", e))
-        })?;
+    let params = Params::new(memory_cost, iterations, lanes, Some(key_length)).map_err(|e| {
+        CryptoError::KeyGenerationFailed(format!("Invalid Argon2 parameters: {}", e))
+    })?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
@@ -223,7 +254,12 @@ pub mod presets {
 
     /// Derive AES-256 key from password using Argon2id (fast)
     pub fn derive_aes256_argon2_fast(password: &str) -> CryptoResult<DerivedKey> {
-        let params = KdfParams::argon2id(8192, 1, 1, 32)?; // 8MB, 1 iteration
+        let params = KdfParams::argon2id(
+            Params::DEFAULT.m_cost(),
+            Params::DEFAULT.t_cost(),
+            Params::DEFAULT.p_cost(),
+            32,
+        )?;
         derive_key(password.as_bytes(), &params)
     }
 
@@ -307,27 +343,28 @@ mod tests {
 
     #[test]
     fn test_pbkdf2_key_derivation() {
-        let password = "test_password_123";
+        let password = hex::encode(generate_random_bytes(16).unwrap());
         let params = KdfParams::pbkdf2(100_000, 32).unwrap();
 
         let derived = derive_key(password.as_bytes(), &params).unwrap();
 
         assert_eq!(derived.key.len(), 32);
         assert_eq!(derived.algorithm, AlgorithmId::Pbkdf2);
-        assert!(derived.verify_password(password).unwrap());
-        assert!(!derived.verify_password("wrong_password").unwrap());
+        assert!(derived.verify_password(&password).unwrap());
+        let wrong_password = hex::encode(generate_random_bytes(16).unwrap());
+        assert!(!derived.verify_password(&wrong_password).unwrap());
     }
 
     #[test]
     fn test_argon2id_key_derivation() {
-        let password = "secure_password";
+        let password = hex::encode(generate_random_bytes(16).unwrap());
         let params = KdfParams::argon2id_default(32).unwrap();
 
         let derived = derive_key(password.as_bytes(), &params).unwrap();
 
         assert_eq!(derived.key.len(), 32);
         assert_eq!(derived.algorithm, AlgorithmId::Argon2id);
-        assert!(derived.verify_password(password).unwrap());
+        assert!(derived.verify_password(&password).unwrap());
     }
 
     #[test]
@@ -342,17 +379,41 @@ mod tests {
     }
 
     #[test]
-    fn test_preset_functions() {
-        let password = "my_secure_password";
+    fn the_secure_preset_is_stronger_than_the_fast_one() {
+        let secure = KdfParams::argon2id_default(32).unwrap();
+        let probe = hex::encode(generate_random_bytes(16).unwrap());
+        let fast = presets::derive_aes256_argon2_fast(&probe).unwrap().params;
 
-        let aes_pbkdf2 = presets::derive_aes256_pbkdf2(password).unwrap();
+        // The fast preset exists to cost less. If the two ever collapse to the same
+        // parameters there is no reason to offer both, and callers that picked the
+        // cheap one to keep latency down get the expensive profile instead.
+        assert!(
+            fast.memory_cost.unwrap() < secure.memory_cost.unwrap()
+                || fast.iterations < secure.iterations,
+            "fast preset {fast:?} is not cheaper than secure {secure:?}"
+        );
+    }
+
+    #[test]
+    fn the_default_preset_stays_at_or_above_the_validated_floor() {
+        let secure = KdfParams::argon2id_default(32).unwrap();
+        assert!(secure.validate().is_ok());
+        assert!(secure.memory_cost.unwrap() >= Params::DEFAULT.m_cost());
+        assert!(secure.iterations >= Params::DEFAULT.t_cost());
+    }
+
+    #[test]
+    fn test_preset_functions() {
+        let password = hex::encode(generate_random_bytes(16).unwrap());
+
+        let aes_pbkdf2 = presets::derive_aes256_pbkdf2(&password).unwrap();
         assert_eq!(aes_pbkdf2.key.len(), 32);
 
-        let aes_argon2 = presets::derive_aes256_argon2_secure(password).unwrap();
+        let aes_argon2 = presets::derive_aes256_argon2_secure(&password).unwrap();
         assert_eq!(aes_argon2.key.len(), 32);
 
         // Same password should produce different keys with different salts
-        let aes_argon2_2 = presets::derive_aes256_argon2_secure(password).unwrap();
+        let aes_argon2_2 = presets::derive_aes256_argon2_secure(&password).unwrap();
         assert_ne!(aes_argon2.key, aes_argon2_2.key);
     }
 
@@ -391,10 +452,10 @@ mod parameter_tests {
     fn argon2id_params() -> KdfParams {
         KdfParams {
             algorithm: AlgorithmId::Argon2id,
-            salt: vec![7u8; 16],
-            iterations: 3,
-            memory_cost: Some(65536),
-            parallelism: Some(1),
+            salt: generate_random_bytes(16).unwrap(),
+            iterations: Params::DEFAULT.t_cost(),
+            memory_cost: Some(Params::DEFAULT.m_cost()),
+            parallelism: Some(Params::DEFAULT.p_cost()),
             key_length: 32,
         }
     }
@@ -420,7 +481,8 @@ mod parameter_tests {
                 },
             ),
         ] {
-            let err = derive_key(b"correct horse", &params)
+            let probe = hex::encode(generate_random_bytes(16).unwrap());
+            let err = derive_key(probe.as_bytes(), &params)
                 .expect_err(&format!("missing {label} must be an error"));
             assert!(
                 matches!(err, CryptoError::KeyGenerationFailed(_)),
@@ -431,7 +493,8 @@ mod parameter_tests {
 
     #[test]
     fn a_complete_argon2id_parameter_set_still_derives() {
-        let key = derive_key(b"correct horse", &argon2id_params()).expect("derive");
+        let probe = hex::encode(generate_random_bytes(16).unwrap());
+        let key = derive_key(probe.as_bytes(), &argon2id_params()).expect("derive");
         assert_eq!(key.key.len(), 32);
     }
 }

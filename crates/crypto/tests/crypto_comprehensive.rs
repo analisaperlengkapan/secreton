@@ -112,7 +112,7 @@ mod crypto_comprehensive_tests {
 
     #[tokio::test]
     async fn test_key_derivation_functions() -> Result<()> {
-        let password = "test_password_123";
+        let password = hex::encode(generate_random_bytes(16)?);
 
         // Test PBKDF2
         let salt = generate_random_bytes(16)?;

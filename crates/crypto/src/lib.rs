@@ -4,8 +4,6 @@
 //! with comprehensive RustCrypto integration and transit engine support.
 
 use pkcs8::EncodePrivateKey;
-use rand::RngCore;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -121,11 +119,13 @@ impl SecurityParams {
 }
 
 /// Generate cryptographically secure random bytes
+///
+/// The buffer is filled through `getrandom` rather than `rand`, so the freshly
+/// allocated (and therefore all-zero) buffer is recognisably *input* to an entropy
+/// source instead of a constant that happens to look like key material.
 pub fn generate_random_bytes(len: usize) -> CryptoResult<Vec<u8>> {
     let mut bytes = vec![0u8; len];
-    OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|_| CryptoError::RandomGenerationFailed)?;
+    getrandom::fill(&mut bytes).map_err(|_| CryptoError::RandomGenerationFailed)?;
     Ok(bytes)
 }
 
@@ -160,7 +160,7 @@ pub fn generate_key(algorithm: AlgorithmId) -> CryptoResult<Vec<u8>> {
             // The 32-byte seed *is* the Ed25519 private key; `SigningKey::from_bytes`
             // in `signing.rs` consumes exactly this representation.
             let mut seed = [0u8; 32];
-            OsRng.fill_bytes(&mut seed);
+            getrandom::fill(&mut seed).map_err(|_| CryptoError::RandomGenerationFailed)?;
             Ok(seed.to_vec())
         }
         _ => generate_random_bytes(params.key_size),

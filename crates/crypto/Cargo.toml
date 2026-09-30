@@ -60,6 +60,7 @@ num-integer = "0.1"
 num-traits = "0.2"
 
 base64.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 rand.workspace = true
 subtle.workspace = true

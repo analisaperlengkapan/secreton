@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn test_wrong_key_length() {
         let engine = CryptoEngine::new();
-        let short_key = vec![0u8; 16]; // Too short
+        let short_key = crate::generate_random_bytes(16).unwrap(); // Too short
         let plaintext = b"test";
 
         let result = engine.encrypt(AlgorithmId::Aes256Gcm, plaintext, &short_key);
