@@ -51,9 +51,10 @@ ed25519-dalek.workspace = true
 pem.workspace = true
 rcgen.workspace = true
 ssh-key = { version = "0.6", features = ["ed25519", "alloc", "std", "rand_core"] }
-const-oid = "0.9"
-der = "0.7"
 time = "0.3"
+# `der` is reached through `x509-cert::der`, which is the same version x509-cert
+# itself decodes with. Depending on `der` directly pinned 0.7 alongside x509-cert's
+# 0.8, and the two `Decode` traits are not interchangeable.
 x509-cert = "0.3"
 x509-parser.workspace = true
 

@@ -5101,9 +5101,7 @@ dependencies = [
  "base32",
  "base64",
  "chrono",
- "const-oid 0.9.6",
  "deadpool-postgres",
- "der 0.7.10",
  "ed25519-dalek 3.0.0",
  "futures",
  "hex",
@@ -6834,7 +6832,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
