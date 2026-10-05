@@ -158,7 +158,7 @@ p384 = { version = "0.14", features = ["getrandom"] }
 # `Validation::new(Algorithm::HS256)`, whose `algorithms` allowlist rejects every RS*
 # token before a key is ever constructed. See the test in crates/auth/src/jwt.rs and the
 # documented ignore in deny.toml.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 totp-rs = { version = "5.6", default-features = false, features = ["otpauth"] }
 
 # ---- Encoding --------------------------------------------------------------
