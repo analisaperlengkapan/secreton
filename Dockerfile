@@ -34,7 +34,7 @@
 # "error[E0658]: `if let` guards are experimental" while compiling cargo-leptos.
 # The builder stage still compiles the application itself with the rust-toolchain.toml
 # channel, which it downloads via rustup once the source is copied in.
-FROM rust:1.98.1-slim-bookworm AS chef
+FROM rust:1.99.0-slim-bookworm AS chef
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends perl make pkg-config cmake g++ \
