@@ -201,7 +201,7 @@ redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
 config = { version = "0.15", default-features = false, features = ["toml"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-comfy-table = "7"
+comfy-table = "8"
 dirs = "7"
 rpassword = "7"
 
