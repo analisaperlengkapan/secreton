@@ -1,10 +1,10 @@
-* @analisaperlengkapan
+* @adminypc
 
 # Cryptography, authentication and the storage layer carry the most risk;
 # they get an explicit owner so a change cannot merge without that review.
-/crates/crypto/  @analisaperlengkapan
-/crates/auth/    @analisaperlengkapan
-/crates/storage/ @analisaperlengkapan
-/.github/        @analisaperlengkapan
-/AGENTS.md       @analisaperlengkapan
-/SECURITY.md     @analisaperlengkapan
+/crates/crypto/  @adminypc
+/crates/auth/    @adminypc
+/crates/storage/ @adminypc
+/.github/        @adminypc
+/AGENTS.md       @adminypc
+/SECURITY.md     @adminypc
