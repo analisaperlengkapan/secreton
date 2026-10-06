@@ -126,7 +126,7 @@ protoc-bin-vendored = "3"
 # ---- OpenAPI ---------------------------------------------------------------
 # utoipa only. utoipa-swagger-ui is deliberately NOT used: its build script
 # downloads a zip over the network, which breaks hermetic and air-gapped builds.
-utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
 
 # ---- Cryptography (pure Rust, RustCrypto + ring) ---------------------------
 aes-gcm = "0.11"
