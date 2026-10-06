@@ -171,7 +171,7 @@ hex = "0.4"
 # and key identifier straight from an existing CA certificate.
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"
-pem = "3.0"
+pem = "4.0"
 
 # ---- TLS -------------------------------------------------------------------
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
